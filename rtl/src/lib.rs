@@ -3,6 +3,7 @@
 pub mod clock;
 pub mod clocks;
 pub mod crc32;
+pub mod eth_rx;
 pub mod formal_smoke;
 pub mod mii_rx;
 pub mod mii_tx;
