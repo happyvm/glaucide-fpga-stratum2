@@ -236,7 +236,10 @@ fn check_read(f: &Frame, phy: u8, reg: u8, data: u16) {
         assert_eq!(f.bits[i].1, hdr[i], "bit {i} of the header");
     }
     for i in 46..64 {
-        assert!(!f.bits[i].0, "bit {i}: released for the turnaround and data");
+        assert!(
+            !f.bits[i].0,
+            "bit {i}: released for the turnaround and data"
+        );
     }
     assert!(!f.bits[47].2, "the PHY's turnaround bit is zero");
     for i in 0..16 {
@@ -259,7 +262,11 @@ fn check_write(f: &Frame, phy: u8, reg: u8, data: u16) {
     assert!(f.bits[47].0 && !f.bits[47].1, "turnaround bit 0");
     for i in 0..16 {
         assert!(f.bits[48 + i].0, "data bit {i} is driven");
-        assert_eq!(f.bits[48 + i].1, (data >> (15 - i)) & 1 == 1, "data bit {i}");
+        assert_eq!(
+            f.bits[48 + i].1,
+            (data >> (15 - i)) & 1 == 1,
+            "data bit {i}"
+        );
     }
 }
 
@@ -277,8 +284,14 @@ fn id_reads_and_bmcr_write_are_bit_exact() {
     check_read(&phy.frames[0], 1, 2, 0x2000);
     check_read(&phy.frames[1], 1, 3, 0x5c91);
     check_write(&phy.frames[2], 1, 0, 0x1200);
-    assert_eq!(phy.bmcr, 0x1200, "BMCR holds auto-negotiation enable and restart");
-    assert!(phy.frames[3..].iter().all(|f| f.read && f.reg == 1), "then BMSR polls");
+    assert_eq!(
+        phy.bmcr, 0x1200,
+        "BMCR holds auto-negotiation enable and restart"
+    );
+    assert!(
+        phy.frames[3..].iter().all(|f| f.read && f.reg == 1),
+        "then BMSR polls"
+    );
     assert!(t.iter().any(|p| p.ready), "ready is reached");
     let first_ready = t.iter().position(|p| p.ready).unwrap();
     let write_end = frame_starts(&t)[2] + 6400;
@@ -295,7 +308,10 @@ fn mdc_is_one_megahertz_and_only_toggles_on_the_divider() {
         assert_eq!(w[1] - w[0], 50, "MDC half-period is 50 cycles");
     }
     let rises = (1..t.len()).filter(|&i| t[i].mdc && !t[i - 1].mdc).count();
-    assert!((99..=101).contains(&rises), "1 MHz: {rises} rises in 10 000 cycles");
+    assert!(
+        (99..=101).contains(&rises),
+        "1 MHz: {rises} rises in 10 000 cycles"
+    );
 }
 
 #[test]
@@ -306,7 +322,10 @@ fn reset_is_held_low_then_mdio_waits_for_the_post_reset_delay() {
     assert!(t[low..].iter().all(|p| p.rstn), "eth_rstn stays released");
     assert!(t[..low].iter().all(|p| !p.oe), "no MDIO during reset");
     let first = frame_starts(&t)[0];
-    assert!(first >= low + Sim::POST as usize, "MDIO waits for the post-reset delay");
+    assert!(
+        first >= low + Sim::POST as usize,
+        "MDIO waits for the post-reset delay"
+    );
 }
 
 #[test]
@@ -329,12 +348,18 @@ fn id_mismatch_is_retried_after_the_delay() {
     check_write(&phy.frames[4], 1, 0, 0x1200);
     let s = frame_starts(&t);
     let gap = s[2] - s[1] - 6400;
-    assert!(gap >= Sim::RETRY as usize, "the retry waits RETRY cycles (gap {gap})");
+    assert!(
+        gap >= Sim::RETRY as usize,
+        "the retry waits RETRY cycles (gap {gap})"
+    );
     assert!(
         t.iter().position(|p| p.idok).unwrap() > s[3],
         "id_ok only once both IDs match"
     );
-    assert!(!t[..s[3]].iter().any(|p| p.idok), "id_ok stays low through the mismatch");
+    assert!(
+        !t[..s[3]].iter().any(|p| p.idok),
+        "id_ok stays low through the mismatch"
+    );
 }
 
 #[test]
@@ -345,10 +370,19 @@ fn wrong_phy_address_gets_no_answer_and_id_stays_low() {
     for (i, f) in phy.frames.iter().take(4).enumerate() {
         let reg = if i % 2 == 0 { 2 } else { 3 };
         assert!(f.read && f.reg == reg && f.phy == 2, "ID read at address 2");
-        assert!(f.bits[48..].iter().all(|b| b.2), "no PHY drives: the pull-up reads ones");
+        assert!(
+            f.bits[48..].iter().all(|b| b.2),
+            "no PHY drives: the pull-up reads ones"
+        );
     }
-    assert!(t.iter().all(|p| !p.idok && !p.ready), "id_ok and ready stay low");
-    assert_eq!(phy.bmcr, 0, "nothing is written to a PHY that does not answer");
+    assert!(
+        t.iter().all(|p| !p.idok && !p.ready),
+        "id_ok and ready stay low"
+    );
+    assert_eq!(
+        phy.bmcr, 0,
+        "nothing is written to a PHY that does not answer"
+    );
     assert!(t.iter().all(|p| !p.link), "no link without an answer");
 }
 
@@ -362,10 +396,19 @@ fn link_goes_up_and_down_through_the_latched_status() {
             phy.set_link(false);
         }
     });
-    assert!(t[..40_000].iter().all(|p| !p.link), "link_up low before the link");
-    let up = t[40_000..].iter().position(|p| p.link).expect("link_up rises");
+    assert!(
+        t[..40_000].iter().all(|p| !p.link),
+        "link_up low before the link"
+    );
+    let up = t[40_000..]
+        .iter()
+        .position(|p| p.link)
+        .expect("link_up rises");
     assert!(up < 20_000, "seen within two polls ({up} cycles)");
-    let down = t[120_000..].iter().position(|p| !p.link).expect("link_up falls");
+    let down = t[120_000..]
+        .iter()
+        .position(|p| !p.link)
+        .expect("link_up falls");
     assert!(down < 20_000, "seen within two polls ({down} cycles)");
     assert!(t.last().unwrap().ready && t.last().unwrap().idok);
     let bmsr = phy.frames.iter().filter(|f| f.read && f.reg == 1).count();

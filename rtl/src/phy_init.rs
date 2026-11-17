@@ -59,10 +59,12 @@
 //!
 //! # Formal
 //!
-//! The `check!`/`cover!` statements below are the T1.8 row of
-//! `docs/formal.md`. They use no ghost state: every check is a property of
-//! the registers. No `assume!`: `mdio_i` and `phy_addr` are free, so the
-//! proof covers every possible PHY behaviour.
+//! The `check!`/`cover!` statements below follow the method of
+//! `docs/formal.md`: guarantees on the registers, no ghost state, no
+//! `assume!`. `mdio_i` and `phy_addr` are free, so the proof covers every
+//! possible PHY behaviour. The proof runs on [`Formal`]; the covers are
+//! reached in the simulation tests (`rtl/tests/phy_init.rs`) and in the
+//! bounded search described in the commit message.
 use std::marker::PhantomData;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Out, Reg, Unit};
 use txhdl::types::{Bit, U};
@@ -115,8 +117,8 @@ impl PhyTiming for Board {
     const POLL: u64 = 10_000_000;
 }
 
-/// The testbench: the real 1 MHz MDC, delays shortened by a factor of
-/// about 10^5 so that a run is a few 10^4 cycles.
+/// The testbench: the real 1 MHz MDC, with the delays cut to a few hundred
+/// cycles so that a run is a few 10^4 cycles.
 #[derive(Default)]
 pub struct Sim;
 impl PhyTiming for Sim {
@@ -286,15 +288,12 @@ impl<T: PhyTiming>
             let rst_last = in_rst & Bit::from(tmr == T::RST - 1);
             let post_last = in_post & Bit::from(tmr == T::POST - 1);
             let pause_last = in_pause
-                & ((s0 & Bit::from(tmr == T::RETRY - 1))
-                    | (!s0 & Bit::from(tmr == T::POLL - 1)));
+                & ((s0 & Bit::from(tmr == T::RETRY - 1)) | (!s0 & Bit::from(tmr == T::POLL - 1)));
             let set_go = in_set & div_end;
             let xfer_end = in_xfer & div_end & last_bit;
             let xfer_bit = in_xfer & div_end & !last_bit;
             // The PHY's bit is sampled at the end of its low half.
-            let sample = in_xfer
-                & Bit::from(tick == T::HALF - 1)
-                & Bit::from(bitn >= 48);
+            let sample = in_xfer & Bit::from(tick == T::HALF - 1) & Bit::from(bitn >= 48);
             // Read turnaround and data: the master lets go of MDIO.
             let rd_turn = in_xfer & !wr & Bit::from(bitn >= 46);
 
@@ -324,10 +323,16 @@ impl<T: PhyTiming>
                 check!(tmr < T::RST, "the reset counter stays within its period");
             }
             if in_post.to_bool() {
-                check!(tmr < T::POST, "the post-reset counter stays within its period");
+                check!(
+                    tmr < T::POST,
+                    "the post-reset counter stays within its period"
+                );
             }
             if in_pause.to_bool() {
-                check!(tmr < T::PAUSE_MAX, "the pause counter stays within its period");
+                check!(
+                    tmr < T::PAUSE_MAX,
+                    "the pause counter stays within its period"
+                );
             }
             check!(step <= S_BMSR2, "the step is one of the known transactions");
             if rd_turn.to_bool() {
