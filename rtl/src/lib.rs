@@ -22,6 +22,7 @@ pub mod ntp_types;
 pub mod mii_tx;
 pub mod ntp_server;
 pub mod phy_init;
+pub mod refid;
 pub mod rx_path;
 pub mod stream;
 pub mod tx_arb;
