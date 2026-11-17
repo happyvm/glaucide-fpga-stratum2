@@ -158,7 +158,7 @@ use crate::eth_rx::{EthMeta, EthRx};
 use crate::eth_tx::{EthHdr, EthTx};
 use crate::fcs_check::FcsCheck;
 use crate::icmp_echo::IcmpEcho;
-use crate::icmpv6::Icmpv6;
+use crate::icmpv6::{Icmpv6, NdLearn};
 use crate::ip_arb::{IpArb4, IpArb6};
 use crate::ipv4_rx::{IpMeta, Ipv4Rx};
 use crate::ipv4_tx::{IpTxReq, Ipv4Tx};
@@ -668,6 +668,8 @@ pub struct ArtyCore<R: Clock, T: Clock, C: ConfigSet, S: SyncSource> {
     pub idle_lookup: Idle<U<32>>,
     pub idle_h3: Idle<EthHdr>,
     pub idle_p3: Idle<FrameByte>,
+    pub idle_nd_resolve: Idle<U<128>>,
+    pub drain_nd_learn: Drain<NdLearn>,
     pub idle_samples: Idle<Sample>,
     pub idle_miss: Idle<U<2>>,
     pub drain_lookup: Drain<ArpEntry>,
@@ -708,6 +710,8 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource> Default for ArtyCore<R, T,
             idle_lookup: Default::default(),
             idle_h3: Default::default(),
             idle_p3: Default::default(),
+            idle_nd_resolve: Default::default(),
+            drain_nd_learn: Default::default(),
             idle_samples: Default::default(),
             idle_miss: Default::default(),
             drain_lookup: Default::default(),
@@ -840,6 +844,10 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
 
         // Unused ends and client hooks.
         let (res_tx, res_rx) = chan::<U<32>, DefaultClock>();
+        // IPv6 neighbor discovery hooks of `icmpv6` (T3.6): no resolver in the
+        // server-only top (Phase A), the learned neighbors are drained.
+        let (ndres_tx, ndres_rx) = chan::<U<128>, DefaultClock>();
+        let (ndl_tx, ndl_rx) = chan::<NdLearn, DefaultClock>();
         let (lk_tx, lk_rx) = chan::<U<32>, DefaultClock>();
         let (lr_tx, lr_rx) = chan::<ArpEntry, DefaultClock>();
         let (smp_tx, smp_rx) = chan::<Sample, DefaultClock>();
@@ -951,8 +959,9 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
                                     local_gua_b,
                                     gua_valid_b,
                                     local_mac_c,
+                                    ndres_rx,
                                 ),
-                                (ie6r_tx, ie6p_tx),
+                                (ie6r_tx, ie6p_tx, ndl_tx),
                             ),
                             self.udp6_rx.run((u6m_rx, u6p_rx), (n6m_tx, n6p_tx)),
                         ),
@@ -1030,8 +1039,14 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
                                     self.idle_miss.run((), miss_tx),
                                 ),
                                 join2(
-                                    self.drain_lookup.run(lr_rx, ()),
-                                    self.drain_stamps.run(st_rx, ()),
+                                    join2(
+                                        self.drain_lookup.run(lr_rx, ()),
+                                        self.drain_stamps.run(st_rx, ()),
+                                    ),
+                                    join2(
+                                        self.idle_nd_resolve.run((), ndres_tx),
+                                        self.drain_nd_learn.run(ndl_rx, ()),
+                                    ),
                                 ),
                             ),
                         ),
