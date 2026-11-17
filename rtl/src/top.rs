@@ -1148,19 +1148,15 @@ impl<C: ConfigSet, S: SyncSource, P: PhyTiming>
     }
 }
 
-/// Netlist fix-up for the board build (used by `top_gen`).
+/// Netlist guard for the board build (used by `top_gen`).
 ///
-/// `icmp_echo` and `icmpv6` name a local value `rst` (`let rst = end_in |
-/// end_out;`), and TxHDL lowers it to a `wire rst` in a module whose reset
-/// input is also `rst`: a redeclaration that Vivado rejects (yosys reports
-/// two drivers on one net). Until the units or TxHDL rename it
-/// (`docs/questions.md`), this renames the local wire to `rst_l` in every
-/// module that declares one: its declaration, its `assign`, and its reads,
-/// which TxHDL writes only as the `if (rst)` of the guarded update inside
-/// the `else` branch of the register block (indent 6); the reset itself is
-/// the outer `if (rst)` (indent 4) and the port. Any other occurrence of
-/// `rst` in such a module makes it panic rather than guess; it also panics
-/// unless exactly the two modules are fixed.
+/// A lowered unit that names a local value `rst` gets a `wire rst` in a module whose
+/// reset input is also `rst`: a redeclaration Vivado rejects. `icmp_echo` and
+/// `icmpv6` used to do so; they now call it `end_all`, so this finds NOTHING to fix.
+/// It is kept as a guard: if a unit reintroduces the clash, it renames the local wire
+/// to `rst_l` (its declaration, its `assign`, and the guarded `if (rst)` reads TxHDL
+/// writes at indent 6) and the build FAILS LOUDLY (assert) so the unit gets fixed at
+/// the source; any other use of `rst` in such a module panics rather than guesses.
 pub fn fix_rst_clash(v: &str) -> String {
     let mut out = String::with_capacity(v.len() + 64);
     let mut fixed = 0;
@@ -1195,8 +1191,8 @@ pub fn fix_rst_clash(v: &str) -> String {
         out.push_str(&m);
     }
     assert_eq!(
-        fixed, 2,
-        "expected the local rst of icmp_echo and icmpv6 only"
+        fixed, 0,
+        "a unit names a local value `rst`: rename it at the source (see fix_rst_clash)"
     );
     out
 }
