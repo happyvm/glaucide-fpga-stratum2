@@ -8,7 +8,7 @@ use ntp_fpga::eth_tx::EthHdr;
 use ntp_fpga::icmpv6::Icmpv6;
 use ntp_fpga::ipv6_rx::{Ip6Meta, Ipv6Rx};
 use ntp_fpga::ipv6_tx::{Ip6TxReq, Ipv6Tx};
-use ntp_fpga::stream::FrameByte;
+use ntp_fpga::stream::{FrameByte, Ts};
 use ntp_fpga::tx_arb::TxArb;
 use txhdl::comp::{chan, join2, signal, DefaultClock, Running, Unit};
 use txhdl::types::{Bit, U};
@@ -91,6 +91,8 @@ fn chain(
     let (p2_t, p2) = chan::<FrameByte, DefaultClock>();
     let (oh_t, oh) = chan::<EthHdr, DefaultClock>();
     let (opl_t, opl) = chan::<FrameByte, DefaultClock>();
+    // One receive stamp per input frame (T1.13); the values are not used here.
+    let (st_t, st_r) = chan::<Ts, DefaultClock>();
     let (mut d_eth, mut d_rx, mut d_icmp, mut d_tx, mut d_arb) = (
         EthRx::default(),
         Ipv6Rx::default(),
@@ -100,7 +102,7 @@ fn chain(
     );
     let mut sim = Running::new(join2(
         join2(
-            d_eth.run((in_r, mac1, sn1), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)),
+            d_eth.run((in_r, mac1, sn1, st_r), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)),
             d_rx.run((v6m, v6p, ll1, gua1, gv1, sn2), (im_t, i_t, um_t, u_t)),
         ),
         join2(
@@ -126,8 +128,13 @@ fn chain(
     let mut hdrs: Vec<(u64, u16)> = vec![];
     let mut open: Vec<FrameByte> = vec![];
     let mut next = 0;
+    let mut next_st = 0;
     let total = q.len() * 6 + 3000;
     for t in 0..total {
+        if next_st < frames.len() && st_t.ready().to_bool() {
+            st_t.send(Ts::from(next_st as u64 + 1));
+            next_st += 1;
+        }
         if next < q.len() {
             match q[next] {
                 None => next += 1,
