@@ -105,6 +105,9 @@ pub struct Meta {
     pub dport: U<16>,
     /// Length of the payload that follows, in bytes.
     pub len: U<16>,
+    /// Source MAC of the frame that carried the packet: where a reply goes
+    /// (the server keeps no ARP/NDP table to answer a request).
+    pub eth_src: U<48>,
     /// Hardware receive timestamp of the frame that carried the packet.
     pub rx_ts: U<64>,
 }
