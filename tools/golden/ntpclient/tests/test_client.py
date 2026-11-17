@@ -63,7 +63,7 @@ class ArithTest(unittest.TestCase):
         self.assertEqual(client.s64(off), -big)
 
     def test_era_wrap(self):
-        t1 = client.M64 - SEC // 2
+        t1 = client.M64 - SEC // 40
         x = SEC // 20
         t4 = (t1 + 2 * x) & client.M64
         t2 = (t1 + x) & client.M64
