@@ -24,7 +24,9 @@
 //!   continues after byte 1: echo to answer (below);
 //! * type 135, code 0, `meta.hop == 255` (rule M1), `meta.len >= 24`, message
 //!   continues: neighbor solicitation to examine (below);
-//! * anything else (other types, RA/NA/Redirect, code != 0, hop limit of an
+//! * type 136 (NA), code 0, `meta.hop == 255`, `meta.len >= 24`, message
+//!   continues: neighbor advertisement to learn from (T3.6, below);
+//! * anything else (other types, RA/Redirect, code != 0, hop limit of an
 //!   NS != 255, too short, echo to the solicited-node group): **nothing is
 //!   sent**, no `req`, no payload byte; the message is swallowed up to its
 //!   `last`.
@@ -92,6 +94,61 @@
 //!
 //! The seed `pseudo_v6` is a single-cycle path (19 chained 32-bit additions)
 //! from the registered `meta` to `acc`: a timing watch point.
+//!
+//! # Neighbor discovery as an initiator (task T3.6)
+//!
+//! Extra ports: `resolve` (`Rx<U<128>>`, input, last): an IPv6 address to
+//! resolve; `learn` (`Tx<NdLearn>`, output, last): `NdLearn { ip, mac }`, a
+//! neighbor learnt from the wire, for `NbrCache`. Learning never produces an
+//! output frame by itself. Rules in `tools/golden/responder.py` (`solicit`,
+//! `learn`, rules N1-N5).
+//!
+//! ## Solicitation (N1-N3)
+//!
+//! `resolve` is taken only when the unit is idle at a message boundary (state
+//! GATHER, byte 0 not yet taken); while a message is being read, an echo reply
+//! or an NA is being sent, it waits in its channel (replies first). A pending
+//! `resolve` also holds back the start of the next incoming message (its meta
+//! and bytes stay in the `ipv6_rx` channels), so it cannot starve. One cycle
+//! after it is taken (state RS1, from registers):
+//!
+//! * target equal to `local_ll`, or to `local_gua` with `gua_valid`: dropped,
+//!   nothing is sent (N3);
+//! * else one NS is sent: `Ip6TxReq { dst_mac = 33:33:ff:T[2]:T[1]:T[0]` (low
+//!   24 bits of the target), `dst_ip = ff02::1:ffT[2]T[1]T[0]`, `src_ip` =
+//!   `local_ll` if the target is in `fe80::/10`, else `local_gua` if
+//!   `gua_valid`, else `local_ll` (N2), `next` 58, `len` 32, `hop` 255 }
+//!   followed by the 32 bytes: type 135, code 0, checksum, 4 zero bytes
+//!   (reserved), target, option 1 (SLLA) / length 1 / `local_mac`. Same
+//!   output path and request-then-32-bytes contract as the NA; `err` never set.
+//!
+//! Checksum (same two registered adder stages as the NA): CK2 sums the
+//! pseudo-header `pseudo_v6(src_ip, dst_ip, 58, 32)` (the NS reuses the
+//! `msrc`/`mdst` registers: addition commutes, so the order of the two
+//! addresses is irrelevant); CK3 adds `pseudo_v6(target, mac << 80, 0,
+//! 0x8700_0101)`, i.e. the target words, the three MAC words and the words
+//! `0x8700` (type, code), `0x0000` (reserved), `0x0000`, `0x0101` (option
+//! type, length); the checksum word itself is zero. The checksum is the
+//! complement of the fold, in `0..=0xFFFE`. The NS starts about 6 cycles after
+//! `resolve` is taken. Retransmission, timeouts and duplicate suppression are
+//! the caller's job (no state is kept per target).
+//!
+//! ## Learning (N4, N5): state CK1
+//!
+//! * NA: type 136, code 0, `hop == 255`, `len >= 24`, checksum good, input
+//!   `err` clear, options well formed (as for the NS: length 0 or overrun
+//!   rejects the message), target not multicast (first byte != 0xFF), at most
+//!   one Target LLA option (type 2) and then of length 1, else nothing is
+//!   learnt (S/O/R flags are ignored). `learn{ ip = target, mac = TLLA if
+//!   present, else meta.eth_src }`. No frame is sent. Whatever destination
+//!   `ipv6_rx` lets through is accepted (the unit does not look at it). Other
+//!   options, including a Source LLA, are skipped.
+//! * NS that the unit answers (rules M1-M6 above, i.e. after the NA decision
+//!   is positive) with a source other than `::` and a Source LLA option:
+//!   `learn{ ip = meta.src, mac = SLLA }` (the same value the NA is addressed
+//!   to). Not for DAD probes, not without the option (the Ethernet source is
+//!   not used for an NS). The `learn` is sent before the NA is built; if
+//!   `learn` has no room the unit waits in CK1 (the cache always drains).
 //!
 //! # Integration
 //!
