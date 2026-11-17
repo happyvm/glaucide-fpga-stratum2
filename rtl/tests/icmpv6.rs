@@ -5,7 +5,7 @@
 //! echo / NDP cases built here (references written independently of the RTL).
 use ntp_fpga::eth_rx::{EthMeta, EthRx};
 use ntp_fpga::eth_tx::EthHdr;
-use ntp_fpga::icmpv6::Icmpv6;
+use ntp_fpga::icmpv6::{Icmpv6, NdLearn};
 use ntp_fpga::ipv6_rx::{Ip6Meta, Ipv6Rx};
 use ntp_fpga::ipv6_tx::{Ip6TxReq, Ipv6Tx};
 use ntp_fpga::stream::{FrameByte, Ts};
@@ -91,6 +91,9 @@ fn chain(
     let (p2_t, p2) = chan::<FrameByte, DefaultClock>();
     let (oh_t, oh) = chan::<EthHdr, DefaultClock>();
     let (opl_t, opl) = chan::<FrameByte, DefaultClock>();
+    // Neighbor learning is tied off here (drained below); no resolve requests.
+    let (rs_t, rs_r) = chan::<U<128>, DefaultClock>();
+    let (ln_t, ln_r) = chan::<NdLearn, DefaultClock>();
     // One receive stamp per input frame (T1.13); the values are not used here.
     let (st_t, st_r) = chan::<Ts, DefaultClock>();
     let (mut d_eth, mut d_rx, mut d_icmp, mut d_tx, mut d_arb) = (
@@ -107,13 +110,13 @@ fn chain(
         ),
         join2(
             join2(
-                d_icmp.run((im, i, ll2, gua2, gv2, mac2), (rq_t, op_t)),
+                d_icmp.run((im, i, ll2, gua2, gv2, mac2, rs_r), (rq_t, op_t, ln_t)),
                 d_tx.run((rq, op), (h3_t, p3_t)),
             ),
             d_arb.run((h0, p0, h1, p1, h2, p2, h3, p3), (oh_t, opl_t)),
         ),
     ));
-    let _keep = (&h0_t, &p0_t, &h1_t, &p1_t, &h2_t, &p2_t);
+    let _keep = (&rs_t, &h0_t, &p0_t, &h1_t, &p1_t, &h2_t, &p2_t);
     let mut q: Vec<Option<FrameByte>> = vec![];
     for (f, err) in frames {
         for (k, b) in f.iter().enumerate() {
@@ -147,7 +150,7 @@ fn chain(
             }
         }
         let _ = (am.recv(), ap.recv(), v4m.recv(), v4p.recv());
-        let _ = (um.recv(), u.recv());
+        let _ = (um.recv(), u.recv(), ln_r.recv());
         if take(t) {
             if let Some(h) = oh.recv() {
                 hdrs.push((h.dst.raw() as u64, h.ethertype.raw() as u16));
