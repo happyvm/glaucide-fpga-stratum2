@@ -15,6 +15,7 @@ fn main() {
         Some("eth_rx") => print!("{}", EthRx::verilog("eth_rx")),
         Some("eth_tx") => print!("{}", EthTx::verilog("eth_tx")),
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
+        Some("tx_path") => print!("{}", ntp_fpga::tx_path::TxPathFormal::verilog("tx_path")),
         other => {
             eprintln!("unknown unit {other:?}");
             std::process::exit(1);

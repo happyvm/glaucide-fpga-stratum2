@@ -10,3 +10,4 @@ pub mod formal_smoke;
 pub mod mii_rx;
 pub mod mii_tx;
 pub mod stream;
+pub mod tx_path;
