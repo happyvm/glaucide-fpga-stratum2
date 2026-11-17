@@ -3,4 +3,5 @@
 pub mod clock;
 pub mod clocks;
 pub mod formal_smoke;
+pub mod mii_rx;
 pub mod stream;
