@@ -43,7 +43,10 @@
 //! | `miss` | `Tx<U<2>>` | slot index of a poll counted as unanswered |
 //!
 //! All channels must be registered channels or FIFOs (netlist note of
-//! `stream.rs`).
+//! `stream.rs`). The neighbor units must answer every lookup (exactly one
+//! `ArpEntry` per `arp_lookup` / `nd_lookup`, as `arp.rs` does): `LWT`
+//! waits for it without a timeout. `samples`, `miss`, `req*` and `pay*`
+//! may stall at any time (the unit waits, nothing is lost).
 //!
 //! # Structure
 //!
