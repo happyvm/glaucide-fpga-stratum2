@@ -15,7 +15,7 @@
 mod security_common;
 
 use ntp_fpga::config::{ConfigSet, Test};
-use ntp_fpga::ntp_server::{rl_index, NtpReplyMeta, NtpServer, KOD_RATE, RL_ENTRIES, RL_LEAK_Q16};
+use ntp_fpga::ntp_server::{rl_index, rl_mult, NtpReplyMeta, NtpServer, KOD_RATE, RL_ENTRIES, RL_LEAK_Q16};
 use ntp_fpga::stream::{FrameByte, Meta};
 use ntp_fpga::top::FixedSync;
 use security_common::*;
@@ -173,7 +173,8 @@ fn only_client_mode_is_answered() {
     // spoofed request from another NTP server's port 123): mode 4, dropped.
     let sent0 = {
         let mut b0 = PinBench::new();
-        b0.frame(&ntp4_frame(PEER_MAC, src_k(1), 7, &ntp_payload(0x23, 48, 5)), 100, false);
+        // Port 8 (not 7: an echo service's port is itself filtered, F8).
+        b0.frame(&ntp4_frame(PEER_MAC, src_k(1), 8, &ntp_payload(0x23, 48, 5)), 100, false);
         b0.run::<FixedSync>(1500)
     };
     let echoed = ntp_replies(&sent0)[0].udp.as_ref().unwrap().5.clone();
@@ -308,7 +309,7 @@ fn run_server_leak(reqs: &[UReq], rate: u16, kod: bool, leak: u16) -> Vec<(NtpRe
             tie(U::<64>::from(0u64)),
             tie(U::<16>::from(rate)),
             tie(Bit::from_bool(kod)),
-            tie(U::<64>::from(Test::RATE_SECRET)),
+            tie(U::<64>::from(rl_mult(Test::RATE_SECRET))),
             tie(U::<16>::from(leak)),
         ),
         (om_t, ob_t),

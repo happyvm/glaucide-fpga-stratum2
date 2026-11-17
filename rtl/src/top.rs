@@ -176,7 +176,7 @@ use crate::ipv6_tx::{Ip6TxReq, Ipv6Tx};
 use crate::mii_rx::MiiRxG;
 use crate::mii_tx::MiiTxG;
 use crate::ntp_reply_route::NtpReplyRoute;
-use crate::ntp_server::{NtpReplyMeta, NtpServer, RL_LEAK_Q16};
+use crate::ntp_server::{NtpReplyMeta, NtpServer, rl_mult, RL_LEAK_Q16};
 use crate::ntp_types::{PeerStat, Sample, Selected};
 use crate::phy_init::{PhyInit, PhyTiming};
 use crate::refid::{refid_ipv4, refid_ipv6};
@@ -1001,7 +1001,7 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
                                 tx_latency,
                                 rate_limit,
                                 tie(Bit::Zero),
-                                tie(U::<64>::new(C::RATE_SECRET as u128)),
+                                tie(U::<64>::new(rl_mult(C::RATE_SECRET) as u128)),
                                 tie(U::<16>::from(RL_LEAK_Q16)),
                             ),
                             (rm_tx, rp_tx),

@@ -308,26 +308,41 @@ pub struct NtpReplyMeta {
 /// (2^64 / golden ratio, odd).
 pub const RNG_WEYL: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// The multiplier of the rate-limiter hash for a secret: the secret made odd.
-pub const fn rl_mult(secret: u64) -> u64 {
-    secret | 1
+/// SplitMix64 finaliser (Steele, Lea, Flood): a bijective, well mixing
+/// function of 64 bits, used at elaboration time only.
+pub const fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(RNG_WEYL);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
-/// The additive constant of the rate-limiter hash for a secret: the secret
-/// rotated by 32 bits, xor [`RNG_WEYL`] (so that it differs from the
-/// multiplier even for a symmetric secret).
-pub const fn rl_add(secret: u64) -> u64 {
-    secret.rotate_left(32) ^ RNG_WEYL
+/// The multiplier of the rate-limiter hash for a secret: SplitMix64 of the
+/// secret, made odd. It is what the integration puts on the `hash_key`
+/// wire (a constant: the mixing costs no hardware). Mixing it at build time
+/// makes the quality of the hash independent of the structure of the
+/// secret (a multiply-shift hash is poor for a multiplier such as
+/// 0x1111...).
+pub const fn rl_mult(secret: u64) -> u64 {
+    splitmix64(secret) | 1
+}
+
+/// The additive constant of the rate-limiter hash for a multiplier: the
+/// multiplier rotated by 32 bits, xor [`RNG_WEYL`] (computed in hardware
+/// from the `hash_key` wire).
+pub const fn rl_add(mult: u64) -> u64 {
+    mult.rotate_left(32) ^ RNG_WEYL
 }
 
 /// Rate-limiter bucket of a 64-bit source key under a 64-bit secret: the
-/// top [`RL_IDX_BITS`] bits of `(rl_mult(secret) * key + rl_add(secret))
-/// mod 2^64` (multiply-shift hashing, Dietzfelbinger et al.). This is the
-/// exact function the unit computes serially (see « Rate limiter »); the
-/// key is the IPv4 address zero extended, or the /64 prefix of an IPv6
-/// address.
+/// top [`RL_IDX_BITS`] bits of `(m * key + rl_add(m)) mod 2^64` with
+/// `m = rl_mult(secret)` (multiply-shift hashing, Dietzfelbinger et al.).
+/// This is the exact function the unit computes serially (see « Rate
+/// limiter »); the key is the IPv4 address zero extended, or the /64
+/// prefix of an IPv6 address.
 pub const fn rl_index(key: u64, secret: u64) -> usize {
-    (rl_mult(secret).wrapping_mul(key).wrapping_add(rl_add(secret)) >> (64 - RL_IDX_BITS)) as usize
+    let m = rl_mult(secret);
+    (m.wrapping_mul(key).wrapping_add(rl_add(m)) >> (64 - RL_IDX_BITS)) as usize
 }
 
 /// UDP source ports a request is never answered from (rule N1 extended,
@@ -500,7 +515,7 @@ impl
                 n_src.slice::<0, 32>().zext::<64>(),
             );
             // Rate-limiter hash: loaded here, computed serially during RECV.
-            let sec_k = hash_key.get();
+            let sec_k = hash_key.get(); // the multiplier `rl_mult(secret)`
             let h_a = sec_k | U::<64>::from(1u64);
             let h_b = ((sec_k << 32u32) | (sec_k >> 32u32)) ^ U::<64>::from(RNG_WEYL);
 

@@ -12,7 +12,7 @@ use ntp_fpga::ipv4_rx::IpMeta;
 use ntp_fpga::ipv4_tx::{IpTxReq, Ipv4Tx};
 use ntp_fpga::ipv6_tx::{Ip6TxReq, Ipv6Tx};
 use ntp_fpga::ntp_server::{
-    rl_index, src_port_denied, NtpReplyMeta, NtpServer, DEFAULT_PRECISION, KOD_RATE, RL_ENTRIES,
+    rl_index, rl_mult, src_port_denied, NtpReplyMeta, NtpServer, DEFAULT_PRECISION, KOD_RATE, RL_ENTRIES,
     RL_LEAK_Q16, TX_CYCLES_V4, TX_CYCLES_V6, TX_LATENCY_V4, TX_LATENCY_V6,
 };
 use ntp_fpga::config::{ConfigSet, Test};
@@ -196,7 +196,7 @@ fn cfg_wires(c: &Cfg) -> Wires {
         tie(U::<64>::from(c.tx_latency)),
         tie(U::<16>::from(c.rate_limit)),
         tie(Bit::from_bool(c.kod)),
-        tie(U::<64>::from(c.secret)),
+        tie(U::<64>::from(rl_mult(c.secret))),
         tie(U::<16>::from(c.leak)),
     )
 }
@@ -991,6 +991,182 @@ fn rate_limiter() {
     assert_eq!((in1, in2), (3, 3), "IPv6 limited per /64");
 }
 
+// ------------------------------------------------------------ F1 / F2 / F8
+
+/// A request from `src` with a unique Origin (`tag`) and source port `sport`.
+fn req_from(src: u128, sport: u16, tag: u64) -> Req {
+    let mut r = req4(ntp_req(0x23, 6, tag, 0), sport);
+    r.src = src;
+    r
+}
+
+fn org_of(o: &Out) -> u64 {
+    be(&o.data()[24..32]) as u64
+}
+
+#[test]
+fn table_size_and_hash_spread() {
+    assert_eq!(RL_ENTRIES, 4096);
+    // The model hash spreads IPv4 and /64 keys evenly: 100 000 keys in 4096
+    // buckets, mean 24.4 per bucket.
+    for secret in [Test::RATE_SECRET, 0, 1, u64::MAX, 0x1111_1111_1111_1111] {
+        let mut load = vec![0u32; RL_ENTRIES];
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        for i in 0..100_000u64 {
+            // Half sequential IPv4 addresses, half pseudo-random /64 prefixes.
+            let key = if i % 2 == 0 {
+                0xC000_0000 + i / 2
+            } else {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            load[rl_index(key, secret)] += 1;
+        }
+        let (mn, mx) = (*load.iter().min().unwrap(), *load.iter().max().unwrap());
+        assert!(mn >= 6 && mx <= 50, "secret {secret:#x}: load {mn}..{mx}");
+    }
+}
+
+/// F8 (server part): source ports 0, 7, 13, 17, 19, 37 get no answer and do
+/// not use up the source's allowance; every other port is served.
+#[test]
+fn source_port_filter() {
+    for p in 0..=u16::MAX {
+        assert_eq!(src_port_denied(p), matches!(p, 0 | 7 | 13 | 17 | 19 | 37));
+    }
+    // Hardware: ports 0..64 plus a few others, rate limit off.
+    let cfg = vcfg();
+    let mut ports: Vec<u16> = (0..64).collect();
+    ports.extend([123, 124, 1023, 1024, 32768, 40000, 65534, 65535]);
+    let reqs: Vec<Req> = ports
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| req_from(CLI4, p, 1000 + i as u64))
+        .collect();
+    let outs = run_simple(&reqs, &cfg);
+    let mut got: Vec<u16> = outs.iter().map(|o| o.meta.dport.raw() as u16).collect();
+    let want: Vec<u16> = ports.iter().copied().filter(|&p| !src_port_denied(p)).collect();
+    got.sort();
+    let mut want_s = want.clone();
+    want_s.sort();
+    assert_eq!(got, want_s);
+    // Replies are exact (the denied requests change nothing else).
+    for o in &outs {
+        let i = ports.iter().position(|&p| p == o.meta.dport.raw() as u16).unwrap();
+        check_meta(o, &reqs[i]);
+        assert_eq!(o.data(), expect(&reqs[i], &cfg, false, T_XMIT));
+    }
+    // A denied request neither gets a KoD nor counts against the limiter:
+    // limit 1, KoD on, five denied requests then one good one: one normal
+    // reply and nothing else.
+    let kcfg = Cfg { rate_limit: 1, kod: true, ..vcfg() };
+    let mut reqs: Vec<Req> = [0u16, 7, 13, 17, 19, 37]
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| req_from(CLI4, p, 2000 + i as u64))
+        .collect();
+    reqs.push(req_from(CLI4, 4000, 2100));
+    reqs.push(req_from(CLI4, 4001, 2101));
+    let outs = run_simple(&reqs, &kcfg);
+    assert_eq!(outs.len(), 2, "one normal reply, one KoD, no more");
+    assert_eq!(org_of(&outs[0]), 2100);
+    assert_eq!(outs[0].data()[1], 2, "normal reply");
+    assert_eq!(outs[1].data()[1], 0, "KoD for the limited one");
+    // Same over IPv6.
+    let mut r6 = req6(ntp_req(0x23, 6, 3000, 0), 19);
+    r6.src = CLI6;
+    assert!(run_simple(&[r6], &vcfg()).is_empty());
+}
+
+/// F2: over the limit a request is still answered with probability
+/// 2^-4 = 1/16 (`leak` = `RL_LEAK_Q16`). One source, 2000 requests in one
+/// second, limit 8: 8 allowed, then 1992 requests of which on average 124.5
+/// leak (sigma 10.8). Bound used: mean +- 5 sigma. Leaks are not counted
+/// against the allowance, and a leaked request gets a normal reply, not a KoD.
+#[test]
+fn leak_rate_over_the_limit() {
+    const N: usize = 2000;
+    let t0 = 0xECC5_8CC1_0000_0000u128 << 32;
+    let reqs: Vec<Req> = (0..N).map(|i| req_from(CLI4, 1000 + i as u16, 5000 + i as u64)).collect();
+    let n = cycles_for(&reqs, 0, 1);
+    let mean = (N - 8) as f64 / 16.0;
+    let sigma = ((N - 8) as f64 * (1.0 / 16.0) * (15.0 / 16.0)).sqrt();
+    for kod in [false, true] {
+        let cfg = Cfg { rate_limit: 8, leak: RL_LEAK_Q16, kod, ..vcfg() };
+        let outs = run(&reqs, &cfg, 0, move |_| t0, |_| true, |_| true, n).outs;
+        let normal: Vec<&Out> = outs.iter().filter(|o| o.data()[1] != 0).collect();
+        let leaked = normal.len() as f64 - 8.0;
+        println!("kod {kod}: {} normal replies ({} leaked, expected {mean:.1} +- {sigma:.1})", normal.len(), leaked);
+        assert!(leaked >= (mean - 5.0 * sigma).floor() && leaked <= (mean + 5.0 * sigma).ceil());
+        // The first 8 requests are the allowed ones.
+        let firsts: Vec<u64> = normal.iter().take(8).map(|o| org_of(o)).collect();
+        assert_eq!(firsts, (5000..5008).collect::<Vec<u64>>());
+        // The leaks are spread over the second, not bunched.
+        let half = |lo: u64, hi: u64| normal.iter().filter(|o| (lo..hi).contains(&org_of(o))).count();
+        let (a, b) = (half(5008, 6000), half(6000, 7000));
+        assert!(a > 30 && b > 30 && a < 100 && b < 100, "first half {a}, second {b}");
+        if kod {
+            assert_eq!(outs.len(), N, "every request answered, by a KoD or a leak");
+        } else {
+            assert_eq!(outs.len(), normal.len(), "silence otherwise");
+        }
+        // Replies never exceed requests, and per second never exceed
+        // limit + leak share (the formula of the module header).
+        assert!(normal.len() as f64 <= 8.0 + (N as f64) / 16.0 + 5.0 * sigma);
+    }
+    // Without leak: exactly the limit.
+    let cfg = Cfg { rate_limit: 8, leak: 0, ..vcfg() };
+    let outs = run(&reqs[..200], &cfg, 0, move |_| t0, |_| true, |_| true, cycles_for(&reqs[..200], 0, 1)).outs;
+    assert_eq!(outs.len(), 8);
+}
+
+/// F2, victim view: 400 independent victims, each with 8 forged requests
+/// (which exhaust its allowance) followed by its real request in the same
+/// second. The real request is answered about once in 16: 25 +- 4.8 expected
+/// (not never, as before: F2; not always: the limiter still works).
+#[test]
+fn leak_lets_a_spoofed_victim_through_sometimes() {
+    const V: usize = 400;
+    let t0 = 0xECC5_8CC1_0000_0000u128 << 32;
+    let mut reqs = vec![];
+    for v in 0..V {
+        let ip = 0x0A64_0000u128 + 0x101 * v as u128;
+        for j in 0..8 {
+            reqs.push(req_from(ip, 2000 + j as u16, 1_000_000 + (v * 10 + j) as u64));
+        }
+        reqs.push(req_from(ip, 3000, 2_000_000 + v as u64));
+    }
+    let cfg = Cfg { rate_limit: 8, leak: RL_LEAK_Q16, ..vcfg() };
+    let outs = run(&reqs, &cfg, 0, move |_| t0, |_| true, |_| true, cycles_for(&reqs, 0, 1)).outs;
+    let forged = outs.iter().filter(|o| org_of(o) < 2_000_000).count();
+    let real = outs.iter().filter(|o| org_of(o) >= 2_000_000).count();
+    println!("{V} victims: {forged} forged replies (800 allowed), {real} real requests answered (expected 25)");
+    assert_eq!(forged, 8 * V, "the forged ones use the allowance");
+    assert!((8..=50).contains(&real), "{real} of {V} answered");
+}
+
+/// F1 at unit level: a source flooding at 2000 requests/s cannot take the
+/// allowance of any other (they hash to other buckets), and the allowance
+/// of 64 unrelated sources, one request each after the flood, is intact.
+#[test]
+fn flood_does_not_affect_other_sources() {
+    let t0 = 0xECC5_8CC1_0000_0000u128 << 32;
+    let mut reqs: Vec<Req> = (0..300).map(|i| req_from(CLI4, 1000 + i as u16, 10 + i as u64)).collect();
+    let others: Vec<u128> = (0..64u128)
+        .map(|i| 0xC633_6400 + i)
+        .filter(|&x| hash4(x) != hash4(CLI4))
+        .collect();
+    for (i, &o) in others.iter().enumerate() {
+        reqs.push(req_from(o, 1000, 90_000 + i as u64));
+    }
+    let cfg = Cfg { rate_limit: 8, ..vcfg() };
+    let outs = run(&reqs, &cfg, 0, move |_| t0, |_| true, |_| true, cycles_for(&reqs, 0, 1)).outs;
+    assert_eq!(outs.iter().filter(|o| org_of(o) < 90_000).count(), 8);
+    assert_eq!(outs.iter().filter(|o| org_of(o) >= 90_000).count(), others.len());
+}
+
 // ------------------------------------------------------------ back-pressure
 
 #[test]
@@ -1055,7 +1231,7 @@ fn throughput_back_to_back() {
     let single = ro.outs[0].t_last;
     // 1000 back to back (IPv4), then the steady-state period.
     let reqs: Vec<Req> = (0..1000u32)
-        .map(|i| req4(ntp_req(0x23, 6, i as u64, 0), i as u16))
+        .map(|i| req4(ntp_req(0x23, 6, i as u64, 0), 100 + i as u16))
         .collect();
     let n = 1000 * 110 + 500;
     let ro = run(
@@ -1089,7 +1265,7 @@ fn throughput_back_to_back() {
     assert!(per * 109_000 < 100_000_000);
     // Extension fields: n + 50.
     let reqs: Vec<Req> = (0..20u32)
-        .map(|i| req4(ntp_req(0x23, 6, i as u64, 20), i as u16))
+        .map(|i| req4(ntp_req(0x23, 6, i as u64, 20), 100 + i as u16))
         .collect();
     let ro = run(
         &reqs,
