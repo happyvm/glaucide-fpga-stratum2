@@ -56,7 +56,9 @@ Le modèle est une recommandation, pas une contrainte. Si un agent bloque, il le
 | T2.2 | UDP IPv4 : parsing, démultiplexage port 123, checksum (ou 0 accepté en v4), construction de réponse | Sonnet | T1.10 | `rtl/src/udp4.rs` | Datagramme de référence → réponse correcte avec checksum valide |
 | T2.3 | Serveur NTP : paquet mode 3 → mode 4, 48 octets, T1/T2/T3 corrects, Reference ID, stratum, LI, root delay/dispersion, poll | Opus | T1.4, T2.1, T2.2, T0.3 | `rtl/src/ntp_server.rs` | Réponse conforme au modèle Python, Transmit ≥ Receive, Origin = Transmit client |
 | T2.4 | Politique : paquets non client ignorés, version 3/4 acceptées, KoD `RATE` si limite dépassée, `LI=3`/stratum 16 si non synchronisé | Sonnet | T2.3 | `rtl/src/ntp_policy.rs` | Table de cas testée |
+| T2.7 | Champ *precision* : valeur −24 par défaut (timestamp MII 40 ns), registre configurable ; décision tracée dans `docs/references.md` | Haiku | T2.3 | `rtl/src/ntp_server.rs` | Champ présent dans la réponse, testé |
 | T2.5 | Limiteur de débit par source (table hachée petite) | Sonnet | T2.4 | `rtl/src/ratelimit.rs` | Rafale d'une même source limitée, autres sources inchangées |
+| T2.8 | Test de débit : 100 000 requêtes IPv4 à pleine cadence ligne, aucune perte jusqu'au débit ligne, réponses toutes correctes | Sonnet | T2.3 | `rtl/tests/throughput.rs` | ≥ 109 000 paquets/s traités en simulation cycle par cycle (IPv6 : ≥ 93 000) |
 | T2.6 | Test d'interopérabilité : fixtures `ntpdate -q`/`chronyc` rejouées en simulation | Haiku | T2.3 | `rtl/tests/ntp_interop.rs` | Réponses acceptées par le parseur Python de référence |
 
 ## Phase 3 — IPv6
@@ -120,6 +122,10 @@ Voir `docs/formal.md` (méthode, catalogue de propriétés, règles anti-vacuit�
 `T0.1 → (T1.1, T1.2, T1.5, T1.6) → T1.4 → T1.11 → T2.3 → T3.6 → T4.2 → T4.5 → T4.7`
 
 Parallélisables dès T0.1 : T0.2, T0.3, T0.4, T1.3, T1.8 (Haiku) et T1.1, T1.2, T1.5, T1.6 (Sonnet).
+
+## Références
+
+Voir `docs/references.md` : Fakernet (NTP Arty A7, stratum 1, IPv4) et Netnod (NTP/NTS matériel en production). Inspiration uniquement, pas de copie de code.
 
 ## Risques à surveiller
 
