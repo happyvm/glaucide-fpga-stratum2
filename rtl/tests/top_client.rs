@@ -1559,3 +1559,98 @@ fn with_client_netlist_has_the_client_side() {
         "client hooks connected"
     );
 }
+
+// ------------------------------------------------------------ arbiter
+
+/// `UdpArb4` with both sources pending at once, twice each, and a consumer
+/// that stalls every third cycle: packets alternate, each request is
+/// followed by exactly its own payload, nothing is lost or interleaved.
+#[test]
+fn udp_arb_alternates_whole_packets() {
+    use ntp_fpga::udp4_tx::UdpTxReq;
+    use ntp_fpga::udp_arb::UdpArb4;
+    use txhdl::comp::DefaultClock;
+    let (r0_tx, r0_rx) = chan::<UdpTxReq, DefaultClock>();
+    let (p0_tx, p0_rx) = chan::<FrameByte, DefaultClock>();
+    let (r1_tx, r1_rx) = chan::<UdpTxReq, DefaultClock>();
+    let (p1_tx, p1_rx) = chan::<FrameByte, DefaultClock>();
+    let (q_tx, q_rx) = chan::<UdpTxReq, DefaultClock>();
+    let (y_tx, y_rx) = chan::<FrameByte, DefaultClock>();
+    let mut arb = UdpArb4::default();
+    let mut sim = Running::new(arb.run((r0_rx, p0_rx, r1_rx, p1_rx), (q_tx, y_tx)));
+    // Source s, packet k: sport = s, len = 3 + k, payload bytes 16 s + i.
+    let todo: Vec<Vec<(UdpTxReq, Vec<u8>)>> = (0..2u16)
+        .map(|s| {
+            (0..2u16)
+                .map(|k| {
+                    let req = UdpTxReq {
+                        sport: U::from(s),
+                        len: U::from(3 + k),
+                        ..Default::default()
+                    };
+                    (req, (0..3 + k).map(|i| (16 * s + i) as u8).collect())
+                })
+                .collect()
+        })
+        .collect();
+    let mut pos = [(0usize, None::<usize>), (0, None)];
+    let mut out: Vec<(u8, Vec<u8>)> = vec![];
+    let mut cur = 0;
+    for t in 0..200 {
+        for s in 0..2 {
+            let (rt, pt) = if s == 0 {
+                (&r0_tx, &p0_tx)
+            } else {
+                (&r1_tx, &p1_tx)
+            };
+            let (k, b) = pos[s];
+            if k >= todo[s].len() {
+                continue;
+            }
+            let (req, bytes) = &todo[s][k];
+            match b {
+                None => {
+                    if rt.ready().to_bool() {
+                        rt.send(*req);
+                        pos[s].1 = Some(0);
+                    }
+                }
+                Some(i) => {
+                    if pt.ready().to_bool() {
+                        let last = i + 1 == bytes.len();
+                        pt.send(FrameByte::new(bytes[i], last, false));
+                        pos[s] = if last {
+                            (k + 1, None)
+                        } else {
+                            (k, Some(i + 1))
+                        };
+                    }
+                }
+            }
+        }
+        if t % 3 != 2 {
+            if let Some(q) = q_rx.recv() {
+                out.push((q.sport.raw() as u8, vec![]));
+            }
+            if let Some(b) = y_rx.recv() {
+                assert!(cur < out.len(), "payload before its request");
+                out[cur].1.push(b.data.raw() as u8);
+                if b.last.to_bool() {
+                    cur += 1;
+                }
+            }
+        }
+        sim.cycle();
+    }
+    let sources: Vec<u8> = out.iter().map(|o| o.0).collect();
+    assert_eq!(
+        sources,
+        vec![1, 0, 1, 0],
+        "round robin, source 1 first after reset"
+    );
+    let want: Vec<Vec<u8>> = [(1, 0), (0, 0), (1, 1), (0, 1)]
+        .iter()
+        .map(|&(s, k)| todo[s][k].1.clone())
+        .collect();
+    assert_eq!(out.iter().map(|o| o.1.clone()).collect::<Vec<_>>(), want);
+}
