@@ -84,7 +84,7 @@ use crate::ipv6_rx::Ip6Meta;
 use crate::stream::{FrameByte, Meta};
 use txhdl::comp::{mux, Clock, DefaultClock, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{assume, check, cover, lower, with, Trace};
 
 /// The only UDP port served.
 pub const NTP_PORT: u16 = 123;
@@ -120,6 +120,9 @@ pub struct Udp6Rx {
     pub ets: Reg<U<64>>,
     pub sport: Reg<U<16>>,
     pub dport: Reg<U<16>>,
+    // Monitors (check!/cover! only): the UDP length field, and the payload bytes sent.
+    pub m_ulen: Reg<U<16>>,
+    pub m_cnt: Reg<U<16>>,
 }
 
 #[lower]
@@ -216,13 +219,44 @@ impl Unit<(Rx<Ip6Meta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp6Rx {
                     rx_ts: self.ets.get(),
                 });
             }
+            let err_o = endb & ((last & b.err) | (last ^ end_len) | !ck_good);
             if (take & is_f).to_bool() {
                 ntp.send(FrameByte {
                     data: b.data,
                     last: endb,
-                    err: endb & ((last & b.err) | (last ^ end_len) | !ck_good),
+                    err: err_o,
                 });
             }
+
+            // ---- formal properties (orchestrator; docs/formal.md, row "UDP") ----
+            assume!(!have | !b.err | last, "payload: err only together with last (stream contract 2)");
+            assume!(!(have & Bit::from(pos >= 1517)) | last, "a frame has at most 1518 bytes (stream contract 3)");
+            let m_ulen = self.m_ulen.get();
+            let m_cnt = self.m_cnt.get();
+            let dport = self.dport.get();
+            let meta_go = take & p7 & !last & !nock;
+            let pay_go = take & is_f;
+            // Header phase: the decision (byte 5) and what it implies for bytes 6 and 7.
+            check!(!is_h | Bit::from(pos < 8), "the header phase lasts 8 bytes");
+            check!(!(is_h & Bit::from(pos >= 6)) | (Bit::from(m_ulen == mlen) & Bit::from(mlen > 8) & Bit::from(dport == 123u16)), "accepted on byte 5: destination port 123, UDP length = IP length > 8 (U2)");
+            check!(!meta_go | (Bit::from(dport == 123u16) & Bit::from(m_ulen == mlen) & Bit::from(mlen > 8)), "a datagram is forwarded only to port 123, with UDP length = IP length > 8");
+            check!(!meta_go | Bit::from(mlen - 8 >= 1), "forwarded payload length is at least 1");
+            check!(!(take & p7 & last) | !meta_go, "a datagram ending inside its header emits nothing");
+            check!(!meta_go | Bit::from(hi != 0u8) | Bit::from(b.data != 0u8), "a zero UDP checksum is never forwarded over IPv6 (RFC 8200 8.1)");
+            // Forwarding.
+            check!(!is_f | (Bit::from(m_ulen == mlen) & Bit::from(mlen > 8) & Bit::from(dport == 123u16)), "forwarding implies the accepted header");
+            check!(!is_f | (Bit::from(pos >= 8) & Bit::from(pos < mlen)), "forwarding: past the header and before the end");
+            check!(!is_f | Bit::from(m_cnt + 8 == pos), "forwarding: the byte count follows the position");
+            check!(!pay_go | is_f, "a payload byte is sent only in the forwarding state");
+            check!(!(pay_go & endb & !err_o) | Bit::from(m_cnt + 1 == mlen - 8), "a datagram that ends without err carries exactly UDP length - 8 payload bytes");
+            check!(!(pay_go & err_o) | endb, "err only together with last (stream contract 2)");
+            check!(!(pay_go & endb) | (last | end_len), "the datagram ends at its last byte or at the announced length");
+            check!(!is_d | !(meta_go | pay_go), "a dropped datagram emits nothing");
+            cover!(meta_go, "a datagram is forwarded");
+            cover!(take & p5 & !accept & !last, "a datagram is rejected on byte 5");
+            cover!(pay_go & endb & !last, "a longer-than-announced input is cut at the UDP length");
+            cover!(pay_go & endb & last & Bit::from(end_len), "a datagram ends at the right byte");
+            cover!(pay_go & last & !end_len, "a datagram ends early");
 
             with!(self <= {
                 take ? {
@@ -239,6 +273,9 @@ impl Unit<(Rx<Ip6Meta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp6Rx {
                 },
                 take & p1 ? sport: w,
                 take & p3 ? dport: w,
+                take & p5 ? m_ulen: w,
+                meta_go ? m_cnt: U::<16>::from(0u16),
+                pay_go ? m_cnt: m_cnt + U::<16>::from(1u16),
                 take & p5 & !accept ? st: U::<2>::from(DROP),
                 take & p7 & !last ? st: mux(nock, U::<2>::from(DROP), U::<2>::from(FWD)),
                 take & is_f & endb ? st: U::<2>::from(DROP),
