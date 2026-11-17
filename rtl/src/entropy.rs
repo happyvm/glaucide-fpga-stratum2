@@ -88,7 +88,7 @@
 //! three output registers), two 64-bit adders.
 use txhdl::comp::{mux, Clock, DefaultClock, In, Out, Reg, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{check, cover, lower, with, Trace};
 
 /// Seeding constants (SplitMix64: the golden ratio and its two multipliers,
 /// and the `xorshift*` multiplier): nonzero, so the state never starts at 0.
@@ -119,6 +119,21 @@ pub struct Entropy {
     pub sum: Reg<U<64>>,
     pub s0d: Reg<U<64>>,
     pub out: Reg<U<64>>,
+    // Monitors (only read by check!/cover!; pruned in synthesis): the previous
+    // cycle (it exists, its state, its inputs), the `s0`/`s3` of two cycles
+    // ago, and whether a non-zero stirring word was ever mixed in.
+    pub m_v: Reg<Bit>,
+    pub m_ini: Reg<Bit>,
+    pub m_s0: Reg<U<64>>,
+    pub m_s1: Reg<U<64>>,
+    pub m_s2: Reg<U<64>>,
+    pub m_s3: Reg<U<64>>,
+    pub m_e: Reg<U<64>>,
+    pub m_t: Reg<U<64>>,
+    pub m_seed: Reg<U<64>>,
+    pub m2_s0: Reg<U<64>>,
+    pub m2_s3: Reg<U<64>>,
+    pub m_stir: Reg<Bit>,
 }
 
 #[lower]
@@ -143,7 +158,52 @@ impl Unit<(In<U<64>>, In<U<96>>, In<U<64>>), Out<U<64>>> for Entropy {
             let n1 = (s1 ^ a2) ^ e;
             let n2 = (a2 ^ t) ^ tt;
             let n3 = rotl45(a3);
+            // ---- formal properties (orchestrator; security finding F3) ----
+            // xoshiro256++ as published (Blackman and Vigna, `next()`), on the
+            // state of the previous cycle: t = s1 << 17; s2 ^= s0; s3 ^= s1;
+            // s1 ^= s2; s0 ^= s3; s2 ^= t; s3 = rotl(s3, 45).
+            let m_v = self.m_v.get();
+            let m_ini = self.m_ini.get();
+            let p0 = self.m_s0.get();
+            let p1 = self.m_s1.get();
+            let p2 = self.m_s2.get();
+            let p3 = self.m_s3.get();
+            let x_t = p1 << 17u32;
+            let x_s2 = p2 ^ p0;
+            let x_s3 = p3 ^ p1;
+            let x_s1 = p1 ^ x_s2;
+            let x_s0 = p0 ^ x_s3;
+            let x_s2b = x_s2 ^ x_t;
+            let x_s3b = (x_s3 << 45u32) | (x_s3 >> 19u32);
+            let zero = Bit::from(s0 == 0) & Bit::from(s1 == 0) & Bit::from(s2 == 0) & Bit::from(s3 == 0);
+            let q0 = self.m2_s0.get();
+            let q_sum = q0 + self.m2_s3.get();
+            let x_out = ((q_sum << 23u32) | (q_sum >> 41u32)) + q0;
+            check!(!ini | m_v, "the state is seeded in the first cycle after reset, not before");
+            check!(!m_v | ini, "the state is seeded after the first cycle");
+            check!(!(m_v & !m_ini) | (Bit::from(s0 == (self.m_seed.get() ^ 0x9E37_79B9_7F4A_7C15u64)) & Bit::from(s1 == (self.m_seed.get() ^ 0xBF58_476D_1CE4_E5B9u64)) & Bit::from(s2 == 0x94D0_49BB_1331_11EBu64) & Bit::from(s3 == 0x2545_F491_4F6C_DD1Du64)), "seeding: s0 = seed ^ K0, s1 = seed ^ K1, s2 = K2, s3 = K3 (never all zero)");
+            check!(!(m_v & m_ini) | (Bit::from(s0 == x_s0) & Bit::from(s3 == x_s3b)), "one xoshiro256++ step per cycle: s0 and s3");
+            check!(!(m_v & m_ini) | (Bit::from(s1 == (x_s1 ^ self.m_e.get())) & Bit::from(s2 == (x_s2b ^ self.m_t.get()))), "one xoshiro256++ step per cycle: s1 and s2, stirred by XOR with ev and time (the stirring cannot cancel the generator)");
+            check!(!(ini & !self.m_stir.get()) | !zero, "without stirring the state is never all zero (xoshiro256++ is a bijection of the non-zero states, seeded non-zero)");
+            check!(Bit::from(self.sum.get() == p0 + p3) & Bit::from(self.s0d.get() == p0), "output stage 1: s0 + s3 and s0 of the previous cycle");
+            check!(Bit::from(self.out.get() == x_out), "rnd = rotl(s0 + s3, 23) + s0 of the state two cycles earlier (xoshiro256++ output)");
+            cover!(ini & !zero & !Bit::from(self.out.get() == 0), "a non-zero output from a seeded state");
+            cover!(ini & zero, "an adversarial stirring can cancel the state (the inputs are not adversarial: see the header)");
+            cover!(ini & self.m_stir.get() & !zero, "a stirred state");
+
             with!(self <= {
+                m_v: Bit::One,
+                m_ini: ini,
+                m_s0: s0,
+                m_s1: s1,
+                m_s2: s2,
+                m_s3: s3,
+                m_e: e,
+                m_t: tt,
+                m_seed: sd,
+                m2_s0: p0,
+                m2_s3: p3,
+                m_stir: self.m_stir.get() | (ini & (!Bit::from(e == 0) | !Bit::from(tt == 0))),
                 s0: mux(ini, n0, sd ^ U::<64>::from(K0)),
                 s1: mux(ini, n1, sd ^ U::<64>::from(K1)),
                 s2: mux(ini, n2, U::<64>::from(K2)),

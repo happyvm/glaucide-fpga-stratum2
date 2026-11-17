@@ -26,6 +26,7 @@ fn main() {
         Some("udp6_tx") => print!("{}", ntp_fpga::udp6_tx::Udp6Tx::verilog("udp6_tx")),
         Some("clock_filter") => print!("{}", ntp_fpga::clock_filter::ClockFilter::verilog("clock_filter")),
         Some("sync_state") => print!("{}", ntp_fpga::sync_state::SyncState::verilog("sync_state")),
+        Some("entropy") => print!("{}", ntp_fpga::entropy::Entropy::verilog("entropy")),
         Some("selection") => print!("{}", ntp_fpga::selection::Selection::verilog("selection")),
         Some("servo") => print!("{}", ntp_fpga::servo::Servo::verilog("servo")),
         Some("ntp_demux") => print!("{}", ntp_fpga::ntp_demux::NtpDemux::verilog("ntp_demux")),
