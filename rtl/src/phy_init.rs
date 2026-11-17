@@ -156,7 +156,8 @@ fn frame_word(step: U<3>, phy: U<5>) -> U<64> {
             mux(is_id2, U::<5>::from(3u8), U::<5>::from(2u8)),
         ),
     );
-    let op = mux(is_w, U::<64>::from(1u8), U::<64>::from(2u8));
+    // Start `01` and operation: `0101` a write (`01`), `0110` a read (`10`).
+    let op = mux(is_w, U::<64>::from(0x5u8), U::<64>::from(0x6u8));
     // Turnaround `10` and the word 0x1200 (BMCR) for the write.
     let tail = mux(is_w, U::<64>::from(0x2_1200u32), U::<64>::from(0u8));
     (U::<64>::from(0xffff_ffffu32) << 32)
