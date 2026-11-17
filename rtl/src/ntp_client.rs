@@ -109,10 +109,10 @@
 //!    none; this interval is registered per slot in `pt<i>` every cycle, so
 //!    it follows `poll_log2` and `kx` one cycle late). The poll starts:
 //!    `last` := `now_t`, `pend` := 1, `tries` := 0, `arm` := 0, `burst` :=
-//!    min(burst + 1, 4). For a **dead** slot (`dd` = 1) the same, except
-//!    that `pend` stays 0 and the poll is counted as a miss at once (`cs`
-//!    := `sp`, `MISS`): no lookup, no request, and the clock filter sees an
-//!    unreachable peer every `2^poll` s.
+//!    min(burst + 1, 4). For a **dead** slot (`dd` = 1) the poll starts the
+//!    same way, then action 5 enters `LKP`, which abandons it at once
+//!    (`pend` := 0, `MISS`: one miss, no lookup, no request): the clock
+//!    filter sees an unreachable peer every `2^poll` s.
 //!
 //!    **Staggered schedule.** All slots of a freshly enabled (or reset)
 //!    unit are armed within a few cycles of one another, at `t0` (to a few
@@ -159,7 +159,8 @@
 //!   `fe80::/10` or (`gua_valid` and its upper 64 bits equal `local_gua`'s)
 //!   else `gateway6`.
 //! * `LKP`: sends `arp_lookup(next hop)` (IPv4) or `nd_lookup` (IPv6) when
-//!   the channel has room, then `LWT`.
+//!   the channel has room, then `LWT`; for a dead slot (KoD DENY / RSTR)
+//!   nothing is sent: `pend` := 0 and `MISS`.
 //! * `LWT`: waits for the answer on `arp_rsp` / `nd_rsp` (one per lookup;
 //!   the other channel is not read). `found`: the MAC is kept, `REQ`.
 //!   Not found: `tries` += 1, `rt` := `now_t`, and `arp_resolve` /
@@ -354,6 +355,8 @@ pub const KOD_RSTR: u32 = 0x5253_5452; // "RSTR"
 pub const KOD_POLL_MAX: u8 = 10;
 
 const _: () = assert!(PEERS == 4);
+// The iburst tick mask (`ival_m`, all bits from 7 up) is 2 s = 2^7 ticks.
+const _: () = assert!(IBURST_GAP_S == 2);
 
 const S_SCAN: u8 = 0;
 const S_RX: u8 = 1;
@@ -462,14 +465,15 @@ pub struct NtpClient {
     pub kx2: Reg<U<4>>,
     pub kx3: Reg<U<4>>,
     /// Regular poll interval of slot i as a tick mask: the ticks count `T`
-    /// = `2^max(clamp(poll_log2), kx<i>) * 64` (a power of two) is stored as
-    /// `-T` mod 2^32 (the bits at and above log2 T), so that `since >= T`
-    /// is `since & pt != 0` (no carry chain); registered every cycle (one
-    /// cycle behind its inputs).
-    pub pt0: Reg<U<32>>,
-    pub pt1: Reg<U<32>>,
-    pub pt2: Reg<U<32>>,
-    pub pt3: Reg<U<32>>,
+    /// = `2^max(clamp(poll_log2), kx<i>) * 64` = 2^k with k in 10..=23 is
+    /// kept as bits 7..23 of `-T` mod 2^32 (the bits at and above k), so
+    /// that `since >= T` is `since[31:24] != 0 | (since[23:7] & pt) != 0`
+    /// (no carry chain); registered every cycle (one cycle behind its
+    /// inputs).
+    pub pt0: Reg<U<17>>,
+    pub pt1: Reg<U<17>>,
+    pub pt2: Reg<U<17>>,
+    pub pt3: Reg<U<17>>,
     /// The authentic reply checked in `CHK` was a RATE / a DENY or RSTR KoD
     /// (registered; its effect is applied in `MISS`, which follows).
     pub kr: Reg<Bit>,
@@ -733,12 +737,8 @@ impl
                 mux(c0, self.pt3.get(), self.pt2.get()),
                 mux(c0, self.pt1.get(), self.pt0.get()),
             );
-            // Iburst: 2 s = 2^7 ticks, mask -2^7.
-            let ival_m = mux(
-                in_burst,
-                U::<32>::from(0u8) - U::<32>::from(IBURST_GAP_S << 6),
-                pt_s,
-            );
+            // Iburst: 2 s = 2^7 ticks, every bit from 7 up.
+            let ival_m = mux(in_burst, U::<17>::from(0x1_FFFFu32), pt_s);
             let pcl = poll_clamp(poll_log2.get());
             let kxw = kx_s.zext::<8>();
             let ecur = mux(kxw > pcl, kxw, pcl);
@@ -754,7 +754,8 @@ impl
             let due = mux(
                 Bit::from(f_burst == U::<3>::from(0u8)),
                 f_arm & Bit::from(since >= stagger),
-                Bit::from((since & ival_m) != U::<32>::from(0u8)),
+                Bit::from(since.slice::<24, 8>() != U::<8>::from(0u8))
+                    | Bit::from((since.slice::<7, 17>() & ival_m) != U::<17>::from(0u8)),
             );
             let rt_ok = Bit::from(f_tries == U::<4>::from(0u8))
                 | Bit::from((now_t - m_rt) >= U::<32>::from(RETRY_TICKS));
@@ -905,8 +906,8 @@ impl
             }
 
             // ------------------------------------------- LKP / LWT
-            let send_l4 = is_lkp & !s_v6 & arp_lookup.ready();
-            let send_l6 = is_lkp & s_v6 & nd_lookup.ready();
+            let send_l4 = is_lkp & !dd_s & !s_v6 & arp_lookup.ready();
+            let send_l6 = is_lkp & !dd_s & s_v6 & nd_lookup.ready();
             if send_l4.to_bool() {
                 arp_lookup.send(nh4);
             }
@@ -999,10 +1000,13 @@ impl
             // ------------------------------------------- per-slot writes
             let burst_n = mux(in_burst, f_burst + U::<3>::from(1u8), f_burst);
             // fire: pend 1, tries 0, burst + 1, arm 0
-            // (a dead slot: pend stays 0, the poll is a miss at once)
             let fl_fire = (burst_n.zext::<11>() << 3u32)
                 | (fl & U::<11>::from(0b00000000101u16))
-                | mux(dd_s, U::<11>::from(0u8), U::<11>::from(0b10u8));
+                | U::<11>::from(0b10u8);
+            // dead slot in LKP: the poll is abandoned at once (pend 0) and
+            // counted as a miss, no lookup (off the SCAN path)
+            let w_dead = is_lkp & dd_s;
+            let fl_dead = fl & U::<11>::from(0b11111111101u16);
             // deadline / authentic reply: out 0
             let fl_noout = fl & U::<11>::from(0b11111111110u16);
             // authentic RATE / DENY / RSTR: out 0 and the iburst ends (burst 4)
@@ -1021,7 +1025,7 @@ impl
             let w_fire = do_sc & !sc_dis & !sc_dl & !sc_arm & sc_fire;
             let w_auth = is_chk & auth;
             let w_sent = send_p & p_last;
-            let fl_we = w_dis | w_dl | w_arm | w_fire | w_auth | w_kod | fail | w_sent;
+            let fl_we = w_dis | w_dl | w_arm | w_fire | w_auth | w_kod | w_dead | fail | w_sent;
             let fl_wd = mux(
                 w_dis,
                 U::<11>::from(0u8),
@@ -1034,7 +1038,11 @@ impl
                         mux(
                             fail,
                             fl_fail,
-                            mux(w_sent, fl_sent, mux(w_kod, fl_kod, fl_noout)),
+                            mux(
+                                w_sent,
+                                fl_sent,
+                                mux(w_kod, fl_kod, mux(w_dead, fl_dead, fl_noout)),
+                            ),
                         ),
                     ),
                 ),
@@ -1049,10 +1057,10 @@ impl
 
             // ------------------------------------------- next state
             let sc_next = mux(
-                sc_dis | (sc_fire & !dd_s),
+                sc_dis | sc_fire,
                 U::<4>::from(S_SCAN),
                 mux(
-                    sc_dl | sc_fire,
+                    sc_dl,
                     U::<4>::from(S_MISS),
                     mux(sc_lkp, U::<4>::from(S_LKP), U::<4>::from(S_SCAN)),
                 ),
@@ -1065,10 +1073,10 @@ impl
 
             with!(self <= {
                 oke: org_eq,
-                pt0: U::<32>::from(0u8) - (poll_secs(pe0) << 6u32),
-                pt1: U::<32>::from(0u8) - (poll_secs(pe1) << 6u32),
-                pt2: U::<32>::from(0u8) - (poll_secs(pe2) << 6u32),
-                pt3: U::<32>::from(0u8) - (poll_secs(pe3) << 6u32),
+                pt0: (U::<32>::from(0u8) - (poll_secs(pe0) << 6u32)).slice::<7, 17>(),
+                pt1: (U::<32>::from(0u8) - (poll_secs(pe1) << 6u32)).slice::<7, 17>(),
+                pt2: (U::<32>::from(0u8) - (poll_secs(pe2) << 6u32)).slice::<7, 17>(),
+                pt3: (U::<32>::from(0u8) - (poll_secs(pe3) << 6u32)).slice::<7, 17>(),
                 t1p: now.slice::<32, 64>() + mux(s_v6, tx_latency6.get(), tx_latency4.get()),
                 is_scan ? pri: !self.pri.get(),
                 take_m ? {
@@ -1109,6 +1117,7 @@ impl
                 },
                 send_s | send_x ? st: U::<4>::from(S_SCAN),
                 send_l4 | send_l6 ? st: U::<4>::from(S_LWT),
+                w_dead ? st: U::<4>::from(S_MISS),
                 got ? {
                     st: lwt_next,
                     mac: rmac,
