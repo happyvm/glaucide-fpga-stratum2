@@ -19,14 +19,16 @@ use ntp_fpga::icmpv6::{Icmpv6, NdLearn};
 use ntp_fpga::ipv6_rx::{Ip6Meta, Ipv6Rx};
 use ntp_fpga::ipv6_tx::Ip6TxReq;
 use ntp_fpga::nbr_cache::NbrCache;
+use ntp_fpga::entropy::Entropy;
 use ntp_fpga::ntp_client::NtpClient;
+use ntp_fpga::top_client::ENTROPY_SEED;
 use ntp_fpga::ntp_types::Sample;
 use ntp_fpga::stream::{FrameByte, Meta, Ts};
 use ntp_fpga::udp4_tx::UdpTxReq;
 use ntp_fpga::udp6_tx::Udp6TxReq;
 use std::collections::VecDeque;
 use std::future::Future;
-use txhdl::comp::{chan, join2, signal, DefaultClock, In, Out, Running, Rx, Tx, Unit};
+use txhdl::comp::{chan, join2, signal, tie, DefaultClock, Mem, Out, Running, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 
 const SEC: u64 = 1 << 32;
@@ -49,9 +51,14 @@ const INCR: u128 = ntp_fpga::clock::INCR;
 struct ReqOut {
     v6: bool,
     bytes: Vec<u8>,
+    /// Slot 0's clock reading T1 (`m_t1[0]`) once the request is complete:
+    /// the T1 of the request when it is slot 0's (every test here uses
+    /// slot 0).
+    clock: u64,
 }
 
 impl ReqOut {
+    /// The Transmit Timestamp sent: the Origin nonce (F3).
     fn t1(&self) -> u64 {
         u64::from_be_bytes(self.bytes[40..48].try_into().unwrap())
     }
@@ -73,10 +80,8 @@ struct Bench<F: Future<Output = ()>> {
     lat4: Out<U<64>>,
     lat6: Out<U<64>>,
     time: Out<U<96>>,
-    /// The entropy word (`rnd`); 0 unless a test sets it.
-    rnd: Out<U<64>>,
-    /// The client's `rx_stamp` output.
-    rx_stamp: In<U<64>>,
+    /// The client's per-slot clock reading T1 (`m_t1`), never sent since F3.
+    m_t1: Mem<U<64>, 4>,
     meta_t: Tx<Meta>,
     rep_t: Tx<FrameByte>,
     arp_rsp_t: Tx<ArpEntry>,
@@ -126,8 +131,9 @@ fn bench() -> Bench<impl Future<Output = ()>> {
     let (lat4, lat4_i) = signal::<U<64>, DefaultClock>();
     let (lat6, lat6_i) = signal::<U<64>, DefaultClock>();
     let (time, time_i) = signal::<U<96>, DefaultClock>();
-    let (rnd, rnd_i) = signal::<U<64>, DefaultClock>();
+    let (rnd_o, rnd_i) = signal::<U<64>, DefaultClock>();
     let (rxst_o, rx_stamp) = signal::<U<64>, DefaultClock>();
+    let time_e = time_i.clone();
     let (meta_t, meta_r) = chan::<Meta, DefaultClock>();
     let (rep_t, rep_r) = chan::<FrameByte, DefaultClock>();
     let (arp_rsp_t, arp_rsp_r) = chan::<ArpEntry, DefaultClock>();
@@ -142,20 +148,24 @@ fn bench() -> Bench<impl Future<Output = ()>> {
     let (p6_t, pay6) = chan::<FrameByte, DefaultClock>();
     let (s_t, samples) = chan::<Sample, DefaultClock>();
     let (m_t, miss) = chan::<U<2>, DefaultClock>();
+    // The client with the entropy unit of the board build (F3): the seed of
+    // `top_client.rs`, `time`, the client's `rx_stamp`.
     let c: &'static mut NtpClient = Box::leak(Box::default());
+    let ent: &'static mut Entropy = Box::leak(Box::default());
+    let m_t1 = c.m_t1.clone();
     let mut it = up_in.into_iter();
     let (a0, v0, e0) = it.next().unwrap();
     let (a1, v1, e1) = it.next().unwrap();
     let (a2, v2, e2) = it.next().unwrap();
     let (a3, v3, e3) = it.next().unwrap();
-    let sim = Running::new(c.run(
+    let sim = Running::new(join2(c.run(
         (
             a0, v0, e0, a1, v1, e1, a2, v2, e2, a3, v3, e3, lip_i, nm_i, gw_i, gw6_i, ll_i, gua_i,
             gv_i, mac_i, poll_i, prec_i, lat4_i, lat6_i, time_i, rnd_i, meta_r, rep_r, arp_rsp_r,
             nd_rsp_r,
         ),
         (al_t, ar_t, nl_t, nr_t, q4_t, p4_t, q6_t, p6_t, s_t, m_t, rxst_o),
-    ));
+    ), ent.run((tie(U::<64>::from(ENTROPY_SEED)), time_e, rx_stamp), rnd_o)));
     local_mac.set(U::<48>::from(OUR_MAC));
     local_ip4.set(U::<32>::from(LOCAL4));
     netmask.set(U::<32>::from(0xFFFF_FF00u32));
@@ -174,8 +184,7 @@ fn bench() -> Bench<impl Future<Output = ()>> {
         lat4,
         lat6,
         time,
-        rnd,
-        rx_stamp,
+        m_t1,
         meta_t,
         rep_t,
         arp_rsp_t,
@@ -226,10 +235,10 @@ impl<F: Future<Output = ()>> Bench<F> {
         }
         let _ = (self.arp_resolve.recv(), self.nd_resolve.recv());
         if self.req4.recv().is_some() {
-            self.open = Some(ReqOut { v6: false, bytes: vec![] });
+            self.open = Some(ReqOut { v6: false, bytes: vec![], clock: 0 });
         }
         if self.req6.recv().is_some() {
-            self.open = Some(ReqOut { v6: true, bytes: vec![] });
+            self.open = Some(ReqOut { v6: true, bytes: vec![], clock: 0 });
         }
         for v6 in [false, true] {
             let ch = if v6 { &self.pay6 } else { &self.pay4 };
@@ -237,7 +246,9 @@ impl<F: Future<Output = ()>> Bench<F> {
                 let o = self.open.as_mut().expect("payload byte before its request");
                 o.bytes.push(b.data.raw() as u8);
                 if b.last.to_bool() {
-                    self.reqs.push(self.open.take().unwrap());
+                    let mut q = self.open.take().unwrap();
+                    q.clock = self.m_t1.read(0usize).raw() as u64;
+                    self.reqs.push(q);
                 }
             }
         }
@@ -329,9 +340,10 @@ fn reply_bytes(li: u8, vn: u8, mode: u8, stratum: u8, org: u64, t2: u64, t3: u64
     v
 }
 
-/// A reply to `q` from `src` claiming the server is `off` ahead.
+/// A reply to `q` from `src` claiming the server is `off` ahead: Origin =
+/// the nonce sent, T2 / T3 / T4 from the real T1.
 fn reply(q: &ReqOut, src: u128, off: u64) -> Reply {
-    let t1 = q.t1();
+    let t1 = q.clock;
     let ms = SEC / 1000;
     let t2 = t1.wrapping_add(ms).wrapping_add(off);
     Reply {
@@ -339,7 +351,7 @@ fn reply(q: &ReqOut, src: u128, off: u64) -> Reply {
         src,
         sport: 123,
         rx_ts: t1.wrapping_add(3 * ms),
-        pay: reply_bytes(0, 4, 4, 1, t1, t2, t2.wrapping_add(ms)),
+        pay: reply_bytes(0, 4, 4, 1, q.t1(), t2, t2.wrapping_add(ms)),
         err: false,
     }
 }
@@ -457,17 +469,21 @@ fn replayed_reply_is_rejected() {
     assert_eq!(b.samples_got.len(), 2);
 }
 
-/// What a forged KoD can do once its Origin is right (on-path, or a lucky
-/// guess): count one miss for that poll, no sample. The client neither
-/// stops polling nor backs off (no denial of service by KoD), and it does
-/// not honour a genuine RATE/DENY either (finding F9: politeness).
+/// What a KoD can do once its Origin is right (on-path, or a guess of the
+/// 32-bit nonce, F3): one miss for that poll, no sample. A kiss code other
+/// than RATE / DENY / RSTR changes nothing else (the iburst continues).
+/// Since F9 a genuine RATE / DENY is honoured (see
+/// `kod_rate_and_deny_are_honoured`), so a forged one can slow down or
+/// silence one upstream slot: the price is the same Origin guess as for a
+/// forged reply, and with three or more upstreams the selection keeps a
+/// majority.
 #[test]
 fn kod_with_right_origin_costs_one_poll() {
     let (mut b, q1, peer) = one_request(false);
     let mut kod = reply(&q1, peer, 0);
     kod.pay[0] = (3 << 6) | (4 << 3) | 4;
     kod.pay[1] = 0;
-    kod.pay[12..16].copy_from_slice(b"DENY");
+    kod.pay[12..16].copy_from_slice(b"INIT");
     b.feed(kod);
     assert!(b.samples_got.is_empty());
     assert_eq!(b.misses, vec![0], "a KoD is one miss");
@@ -478,24 +494,67 @@ fn kod_with_right_origin_costs_one_poll() {
     assert_eq!(b.samples_got.len(), 1, "polling resumed normally");
 }
 
+/// F9 fixed: an authentic RATE ends the iburst and doubles the slot's
+/// interval (poll 6: the next request 2^7 s after the previous poll start
+/// instead of 2 s); an authentic DENY (or RSTR) stops the slot's requests
+/// for good (until reset), each later poll counting as a miss. A KoD with
+/// a wrong Origin does neither.
+#[test]
+fn kod_rate_and_deny_are_honoured() {
+    let kod = |q: &ReqOut, peer: u128, code: &[u8; 4], org: u64| {
+        let mut r = reply(q, peer, 0);
+        r.pay[0] = (3 << 6) | (4 << 3) | 4;
+        r.pay[1] = 0;
+        r.pay[12..16].copy_from_slice(code);
+        r.pay[24..32].copy_from_slice(&org.to_be_bytes());
+        r
+    };
+    // RATE
+    let (mut b, q1, peer) = one_request(false);
+    b.feed(kod(&q1, peer, b"RATE", q1.t1() ^ (1 << 7)));
+    assert!(b.misses.is_empty(), "wrong Origin: nothing");
+    b.feed(kod(&q1, peer, b"RATE", q1.t1()));
+    assert_eq!(b.misses, vec![0]);
+    let t0 = (b.now >> 64) as u64;
+    for _ in 0..(130 * 4) {
+        b.now += ((SEC / 4) as u128) << 32;
+        b.run(40);
+        if b.reqs.len() > 1 {
+            break;
+        }
+    }
+    assert_eq!(b.reqs.len(), 2);
+    let dt = ((b.now >> 64) as u64).wrapping_sub(t0);
+    assert!((127..=129).contains(&dt), "next request {dt} s later");
+    // DENY
+    let (mut b, q1, peer) = one_request(true);
+    b.feed(kod(&q1, peer, b"DENY", q1.t1() ^ (1 << 40)));
+    assert!(b.misses.is_empty(), "wrong Origin: nothing");
+    b.feed(kod(&q1, peer, b"DENY", q1.t1()));
+    assert_eq!(b.misses, vec![0]);
+    for _ in 0..(200 * 4) {
+        b.now += ((SEC / 4) as u128) << 32;
+        b.run(40);
+    }
+    assert_eq!(b.reqs.len(), 1, "no request after DENY");
+    assert!(b.misses.len() >= 3, "later polls are misses: {:?}", b.misses);
+}
+
 // ------------------------------------------------------------ T1 entropy
 
-/// How predictable is our Origin (T1)? The client starts a poll at the
-/// first scheduler examination after the poll tick (2^-6 s grid) is
-/// crossed, and samples T1 a fixed number of cycles later; T1 is our clock
-/// reading plus the constant latency. With the clock running at its real
-/// rate, sub-cycle phase chosen at random, and 40 polls of one slot
-/// (iburst then regular), T1 - (poll tick boundary) - latency takes values
-/// in a window of a few cycles: about 8 bits of uncertainty for someone who
-/// knows our clock (our own server tells it) and the poll tick (our server's
-/// Reference Timestamp follows each update; the poll period is fixed).
-/// Finding F3: an off-path attacker must guess about 2^8 Origin values,
-/// not 2^32 or 2^64.
+/// One poll of `t1_offsets`: the Transmit Timestamp sent and the clock
+/// reading T1, both minus the latency and the poll tick boundary.
+struct PollT1 {
+    sent: u64,
+    clock: u64,
+}
+
 /// Runs one IPv4 slot for 41 polls (iburst then regular, poll 6) with the
-/// clock at its real rate; returns T1 - (poll tick boundary) - latency of
-/// polls 1..=40 (the first poll is not tick aligned: it starts when the
-/// slot is armed).
-fn t1_offsets() -> Vec<u64> {
+/// clock at its real rate and the board's entropy unit; returns, for polls
+/// 1..=40 (the first poll is not tick aligned: it starts when the slot is
+/// armed), the Transmit Timestamp sent and the clock reading T1, both
+/// minus the poll tick boundary and the latency.
+fn t1_offsets() -> Vec<PollT1> {
     let mut b = bench();
     b.slot(0, PEER4 as u128, false, true);
     b.lat4.set(U::<64>::from(8032u64));
@@ -507,13 +566,13 @@ fn t1_offsets() -> Vec<u64> {
         rng ^= rng << 17;
         rng
     };
-    let mut offs: Vec<u64> = vec![];
+    let mut offs = vec![];
     b.until_reqs(1, 2000);
     b.feed(reply(&b.reqs[0].clone(), PEER4 as u128, 0));
     for k in 1..=40usize {
         // The poll tick: `last` was the 2^-6 s tick of the previous poll start
         // (its T1 minus the latency, a few cycles after the tick).
-        let prev = b.reqs[k - 1].t1() - 8032;
+        let prev = b.reqs[k - 1].clock - 8032;
         let last_tick = prev >> 26;
         let period_ticks = if k < 4 { 2 * 64 } else { 64 * 64 };
         let boundary = (last_tick + period_ticks) << 26; // 32.32
@@ -524,34 +583,38 @@ fn t1_offsets() -> Vec<u64> {
         b.now = ((boundary as u128) << 32) - before * INCR - phase;
         b.until_reqs(k + 1, 2000);
         let q = b.reqs[k].clone();
-        offs.push(q.t1().wrapping_sub(8032).wrapping_sub(boundary));
+        offs.push(PollT1 {
+            sent: q.t1().wrapping_sub(8032).wrapping_sub(boundary),
+            clock: q.clock.wrapping_sub(8032).wrapping_sub(boundary),
+        });
         b.feed(reply(&q, PEER4 as u128, 0));
     }
     assert_eq!(b.samples_got.len(), 41);
     offs
 }
 
-/// How predictable is our Origin (T1)? The client starts a poll at the
-/// first scheduler examination after the poll tick (2^-6 s grid) is
-/// crossed, and samples T1 a fixed number of cycles later; T1 is our clock
-/// reading plus the constant latency. With the clock running at its real
-/// rate, sub-cycle phase chosen at random, over 40 polls of one slot,
-/// T1 - (poll tick boundary) - latency takes values in a window of a few
-/// cycles: about 7 to 8 bits of uncertainty for someone who knows our clock
-/// (our own server tells it to anyone) and the poll tick (our server's
-/// Reference Timestamp follows each update; the poll period is fixed).
-/// Finding F3: an off-path attacker must guess about 2^8 Origin values,
-/// not 2^32 or 2^64.
+/// Why F3 needed a nonce: our clock reading T1 is predictable. The client
+/// starts a poll at the first scheduler examination after the poll tick
+/// (2^-6 s grid) is crossed, and reads the clock a fixed number of cycles
+/// later. With the clock running at its real rate, sub-cycle phase chosen
+/// at random, over 40 polls of one slot, T1 - (poll tick boundary) -
+/// latency takes values in a window of a few cycles: about 7 to 8 bits of
+/// uncertainty for someone who knows our clock (our own server tells it to
+/// anyone) and the poll tick (our server's Reference Timestamp follows each
+/// update; the poll period is fixed). Before F3 this T1 was the Origin; it
+/// is now only kept for the arithmetic (`m_t1`) and never sent: the
+/// Transmit Timestamp sent shares only its seconds.
 #[test]
 fn t1_is_predictable_from_the_poll_tick() {
     let offs = t1_offsets();
-    let (lo, hi) = (*offs.iter().min().unwrap(), *offs.iter().max().unwrap());
+    let c: Vec<u64> = offs.iter().map(|o| o.clock).collect();
+    let (lo, hi) = (*c.iter().min().unwrap(), *c.iter().max().unwrap());
     let ns = |x: u64| x as f64 * 1e9 / SEC as f64;
-    let mut distinct = offs.clone();
+    let mut distinct = c.clone();
     distinct.sort();
     distinct.dedup();
     println!(
-        "T1 - tick - latency over 40 polls: {:.1} .. {:.1} ns ({} 2^-32 s units wide, {} distinct values, {:.1} bits)",
+        "clock T1 - tick - latency over 40 polls: {:.1} .. {:.1} ns ({} 2^-32 s units wide, {} distinct values, {:.1} bits)",
         ns(lo),
         ns(hi),
         hi - lo + 1,
@@ -562,23 +625,35 @@ fn t1_is_predictable_from_the_poll_tick() {
     // 2^-32 s (120 ns), i.e. < 9 bits of uncertainty given the tick.
     assert!(hi - lo < 512, "spread {} units", hi - lo);
     assert!(ns(hi) < 1000.0, "a fixed number of cycles after the tick");
+    // It is not what goes on the wire (only its seconds are).
+    for o in &offs {
+        assert_ne!(o.sent, o.clock);
+        assert_eq!(
+            (o.sent.wrapping_add(8032)) >> 32,
+            (o.clock.wrapping_add(8032)) >> 32
+        );
+    }
 }
 
-/// The desired property behind F3: the Transmit timestamp of a request (our
-/// Origin) is unpredictable from our clock and schedule, i.e. its offset to
-/// the poll tick is spread over at least 2^20 values (with a random 64-bit
-/// nonce, as chrony sends and RFC 9109 / the data-minimisation draft
-/// recommend, over the whole range).
+/// F3 fixed: the Transmit Timestamp of a request (our Origin) is
+/// unpredictable from our clock and schedule: its 32 fraction bits come
+/// from the entropy unit, so its offset to the poll tick is spread over the
+/// whole second (at least 2^20 values here, no repeat, every fraction bit
+/// both 0 and 1 over the 40 polls); its seconds are T1's.
 #[test]
-#[ignore = "FINDING F3: the client's Origin (T1) is predictable to ~8 bits (docs/security.md)"]
 fn t1_is_unpredictable() {
     let offs = t1_offsets();
-    let mut distinct = offs.clone();
+    let sent: Vec<u64> = offs.iter().map(|o| o.sent).collect();
+    let mut distinct = sent.clone();
     distinct.sort();
     distinct.dedup();
-    assert_eq!(distinct.len(), offs.len(), "no repeated value");
-    let (lo, hi) = (offs.iter().min().unwrap(), offs.iter().max().unwrap());
+    assert_eq!(distinct.len(), sent.len(), "no repeated value");
+    let fr: Vec<u32> = sent.iter().map(|&x| x.wrapping_add(8032) as u32).collect();
+    let (lo, hi) = (fr.iter().min().unwrap(), fr.iter().max().unwrap());
     assert!(hi - lo >= 1 << 20, "spread {} units only", hi - lo);
+    let or = fr.iter().fold(0u32, |a, &x| a | x);
+    let and = fr.iter().fold(u32::MAX, |a, &x| a & x);
+    assert_eq!((or, and), (u32::MAX, 0), "a fraction bit is stuck");
 }
 
 // ------------------------------------------------------------ ARP cache
