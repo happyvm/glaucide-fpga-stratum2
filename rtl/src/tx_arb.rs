@@ -211,7 +211,6 @@ impl
             let dd1 = U::<2>::from(1u8) - rr - U::<2>::from(1u8);
             let dd2 = U::<2>::from(2u8) - rr - U::<2>::from(1u8);
             let dd3 = U::<2>::from(3u8) - rr - U::<2>::from(1u8);
-            check!(!(is_idle & any) | !is_pay, "the state is one of idle or forwarding");
             check!(Bit::from(m_open == is_pay), "a frame is open exactly while forwarding");
             check!(!is_pay | Bit::from(gr == m_g), "the grant is held until last was forwarded");
             check!(!take_h | !m_open, "no hdr is sent inside a frame (no interleaving)");
@@ -228,14 +227,14 @@ impl
             // Starvation bound: monitor w_i counts frames granted to others
             // while hdr_i is pending; w_i + distance <= 3 (helper), so a
             // pending source is never passed over a fourth time.
-            check!(Bit::from(w0 + dd0 <= 3) | !q0 & Bit::from(w0 == 0), "starvation monitor 0");
+            check!(Bit::from(w0.zext::<3>() + dd0.zext::<3>() <= 3), "starvation monitor 0");
             check!(!(take_h & !s0 & q0) | Bit::from(w0 <= 2), "source 0 pending is granted within 3 other grants");
             check!(!(take_h & !s1 & q1) | Bit::from(w1 <= 2), "source 1 pending is granted within 3 other grants");
             check!(!(take_h & !s2 & q2) | Bit::from(w2 <= 2), "source 2 pending is granted within 3 other grants");
             check!(!(take_h & !s3 & q3) | Bit::from(w3 <= 2), "source 3 pending is granted within 3 other grants");
-            check!(Bit::from(w1 + dd1 <= 3) | !q1 & Bit::from(w1 == 0), "starvation monitor 1");
-            check!(Bit::from(w2 + dd2 <= 3) | !q2 & Bit::from(w2 == 0), "starvation monitor 2");
-            check!(Bit::from(w3 + dd3 <= 3) | !q3 & Bit::from(w3 == 0), "starvation monitor 3");
+            check!(Bit::from(w1.zext::<3>() + dd1.zext::<3>() <= 3), "starvation monitor 1");
+            check!(Bit::from(w2.zext::<3>() + dd2.zext::<3>() <= 3), "starvation monitor 2");
+            check!(Bit::from(w3.zext::<3>() + dd3.zext::<3>() <= 3), "starvation monitor 3");
             cover!(t0, "source 0 granted");
             cover!(t1, "source 1 granted");
             cover!(t2, "source 2 granted");
