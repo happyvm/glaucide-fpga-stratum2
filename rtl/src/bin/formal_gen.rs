@@ -2,7 +2,6 @@
 //! `formal_gen <unit>`: print the Verilog of a unit that carries
 //! `check!`/`assume!`/`cover!` statements (under `ifdef FORMAL`).
 use ntp_fpga::formal_smoke::Digit;
-use txhdl::comp::Unit;
 
 fn main() {
     match std::env::args().nth(1).as_deref() {

@@ -18,13 +18,14 @@ Le modèle est une recommandation, pas une contrainte. Si un agent bloque, il le
 5. **Référence** : tout comportement protocolaire est comparé au modèle Python `tools/golden/` (tâche T0.3) ou à un vecteur de test réel (pcap hexadécimal).
 6. **Pas de secrets, pas d'adresses réelles** dans les fixtures : utiliser `192.0.2.0/24`, `2001:db8::/32`, MAC `02:00:00:00:00:xx`.
 7. **Horloges** : `clk_sys` 100 MHz, `clk_rx` 25 MHz (PHY), `clk_tx` 25 MHz (PHY). Tout passage entre domaines passe par `ChanCdc` de TxHDL ou un module de la tâche T1.4.
-8. **Bloqué ?** Écrire la question en tête du fichier `docs/questions.md` (une entrée par tâche) et s'arrêter.
+8. **Canaux** : deux modules ne se connectent jamais port à port en Verilog (boucle combinatoire valid/ready) : passer par un canal registré, voir la note « Netlist » de `rtl/src/stream.rs`.
+9. **Bloqué ?** Écrire la question en tête du fichier `docs/questions.md` (une entrée par tâche) et s'arrêter.
 
 ## Phase 0 — Fondations
 
 | ID | Tâche | Modèle | Dépend de | Livrable | Critère d'acceptation |
 |---|---|---|---|---|---|
-| T0.1 | Types d'interface : flux d'octets de trame (`data: U<8>`, `valid`, `last`, `err`), timestamp (`U<64>`), métadonnées de paquet | Opus | — | `rtl/src/stream.rs` | Compile, exemple d'un producteur/consommateur en simulation, documenté en tête du fichier |
+| T0.1 ✅ | Types d'interface : flux d'octets de trame (`data: U<8>`, `valid`, `last`, `err`), timestamp (`U<64>`), métadonnées de paquet | Opus | — | `rtl/src/stream.rs` | Compile, exemple d'un producteur/consommateur en simulation, documenté en tête du fichier |
 | T0.2 | Vérifier le XDC contre le XDC maître Digilent Arty A7-100 (broches PHY, horloge), corriger, ajouter contraintes I/O MII (input/output delay, `IOB`) | Haiku | — | `constraints/arty_a7_100.xdc` | Diff expliqué ligne par ligne dans le message de commit, broches identiques au XDC officiel |
 | T0.3 | Modèle de référence Python : construction/analyse Ethernet, ARP, IPv4, IPv6, ICMP/ICMPv6, UDP, NTP v4 (checksums inclus) + générateur de vecteurs hexadécimaux | Sonnet | — | `tools/golden/*.py`, `tools/golden/vectors/*.hex` | `python3 -m unittest` passe ; vecteurs vérifiés avec `scapy` ou comparaison manuelle RFC |
 | T0.4 | CI : `cargo fmt --check`, `clippy`, `cargo test`, `python3 -m unittest` | Haiku | — | `.github/workflows/ci.yml` | Workflow vert sur la branche |

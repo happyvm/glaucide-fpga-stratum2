@@ -2,3 +2,4 @@
 //! NTP server on Arty A7-100T, written in TxHDL.
 pub mod clock;
 pub mod formal_smoke;
+pub mod stream;

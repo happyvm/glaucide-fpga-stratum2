@@ -24,6 +24,16 @@ Validé : `formal_smoke` donne `successful proof by k-induction (PASS)`, et une 
 
 Pour qu'une unité soit prouvable, il faut la déclarer dans `rtl/src/bin/formal_gen.rs`.
 
+## Décision : où écrire les propriétés
+
+**Les propriétés s'écrivent en Rust (`check!`/`assume!`/`cover!` dans l'unité) et se prouvent sur le Verilog généré.** Jamais à la main dans le Verilog ou le VHDL : ces fichiers sont regénérés et les modifications seraient perdues.
+
+- En simulation Rust, `check!`/`assume!` sont contrôlés à chaque cycle sur les entrées simulées : détection, pas preuve.
+- La preuve (SymbiYosys + z3) porte sur le Verilog émis avec `` `ifdef FORMAL ``. Le VHDL émis par TxHDL ne sert qu'à la simulation (nvc) dans ce flux.
+- **Point de confiance 1** : la preuve porte sur le netlist, pas sur le Rust ; on fait confiance à la génération de TxHDL. Atténuation : comparer simulation Rust et simulation du netlist sur les mêmes vecteurs (tâche à ajouter dans F0.4).
+- **Point de confiance 2** : les modèles de référence d'équivalence (CRC, checksum) sont des unités TxHDL simples et lentes, écrites en Rust ; on prouve que la version rapide leur est égale (F1.1, F2.1). Leur exactitude se valide contre les vecteurs normatifs (`123456789` → `0xCBF43926`, RFC 1071).
+- Non retenu : preuve directe du Rust (type Kani), car la sémantique prouvée serait celle du Rust et non du circuit ; fichiers SystemVerilog externes liés par `bind`, remplacés par les moniteurs Rust (F0.5).
+
 ## Méthode : garantie/hypothèse
 
 1. **Chaque module prouve ses garanties** (`check!`) sous des hypothèses sur ses entrées (`assume!`).
