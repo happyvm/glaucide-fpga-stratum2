@@ -258,6 +258,8 @@ pub struct ClockFilter {
     pub st: Reg<U<4>>,
     /// Peer being processed.
     pub cp: Reg<U<2>>,
+    /// Head pointer of peer `cp` (copy of `p_head[cp]`, written at the intake).
+    pub hd: Reg<U<3>>,
     /// Age counter (0..=8) of the ageing pass and of the scan.
     pub jj: Reg<U<4>>,
     /// Remaining reach bits (shifted right) during the ageing pass.
@@ -410,7 +412,9 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
                 | sh.root_disp.zext::<106>();
 
             // ------------------------------------------------ per-peer reads (peer cp)
-            let head = self.p_head.read(cp);
+            // `hd` = `p_head[cp]` during the run (both written at the intake):
+            // a register instead of the memory read (task T5.3).
+            let head = self.hd.get();
             let tnow = self.p_tnow.read(cp);
             let tlast = self.p_tlast.read(cp);
             let hv = self.p_hv.read(cp).bit(0);
@@ -474,7 +478,10 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
             let div_last = Bit::from(it == 74);
 
             // ------------------------------------------------ S_SQ
-            let sq_t = sres + sbit;
+            // `sres` is a multiple of `2 sbit` (it is shifted right by one when
+            // `sbit` is shifted by two, and only `sbit` is ever added), so
+            // `sres + sbit` has no carry: an OR (task T5.3, same value).
+            let sq_t = sres | sbit;
             let sq_ge = Bit::from(q >= sq_t);
             let sq_last = Bit::from(it == 37);
 
@@ -520,6 +527,7 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
                 take ? {
                     st: U::<4>::from(S_AGE),
                     cp: ep,
+                    hd: hd_n,
                     jj: U::<4>::from(0u8),
                     rm: rc_n,
                     um: U::<8>::from(0u8),
@@ -636,7 +644,7 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
                 },
                 s_sq ? {
                     q: mux(sq_ge, q - sq_t, q),
-                    sres: (sres >> 1u32) + mux(sq_ge, sbit, U::<80>::from(0u8)),
+                    sres: (sres >> 1u32) | mux(sq_ge, sbit, U::<80>::from(0u8)),
                     sbit: sbit >> 2u32,
                     it: it + U::<7>::from(1u8),
                 },

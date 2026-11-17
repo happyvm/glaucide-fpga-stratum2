@@ -65,8 +65,11 @@
 //!
 //! The pseudo-header sum is not computed in one cycle (19 chained 32-bit
 //! additions): it is spread over the header bytes, see [`words8_into`]
-//! (byte 0: source, byte 2: destination, byte 4: length and next header; at
-//! most 9 chained additions per cycle). This adds no latency: the forwarded
+//! (byte 0: source, byte 2: destination, byte 4: length and next header;
+//! each address is summed as a balanced tree, 4 additions deep). The
+//! checksum verdict of a forwarded byte is computed from `acc` alone (the
+//! pseudo-header pieces are only added in the header), so the chain from
+//! the meta channel never reaches the payload output. This adds no latency: the forwarded
 //! datagram timing is that of `udp4_rx`.
 //!
 //! # Integration
@@ -76,7 +79,7 @@
 //! exactly when the output it feeds has room (byte 7 waits for room on
 //! `ntp_meta`, payload bytes for room on `ntp`). `ntp_meta` must be popped
 //! by the consumer independently of the payload.
-use crate::csum::{csum_add, csum_fold};
+use crate::csum::{csum_add, csum_ok, sum8};
 use crate::ipv6_rx::Ip6Meta;
 use crate::stream::{FrameByte, Meta};
 use txhdl::comp::{mux, Clock, DefaultClock, Reg, Rx, Tx, Unit};
@@ -88,18 +91,12 @@ pub const NTP_PORT: u16 = 123;
 /// Next header value of UDP.
 pub const PROTO_UDP: u8 = 17;
 
-/// Sums the eight 16-bit words of a 128-bit address into `acc` (8 chained
-/// additions). Shared with `udp6_tx`.
+/// Sums the eight 16-bit words of a 128-bit address into `acc`: `acc` plus
+/// the balanced tree [`sum8`] (4 additions deep instead of a chain of 8,
+/// task T5.3; same integer, no partial sum wraps). Shared with `udp6_tx`.
 #[lower]
 pub fn words8_into(acc: U<32>, x: U<128>) -> U<32> {
-    let a0 = csum_add(acc, x.slice::<0, 16>());
-    let a1 = csum_add(a0, x.slice::<16, 16>());
-    let a2 = csum_add(a1, x.slice::<32, 16>());
-    let a3 = csum_add(a2, x.slice::<48, 16>());
-    let a4 = csum_add(a3, x.slice::<64, 16>());
-    let a5 = csum_add(a4, x.slice::<80, 16>());
-    let a6 = csum_add(a5, x.slice::<96, 16>());
-    csum_add(a6, x.slice::<112, 16>())
+    acc + sum8(x)
 }
 
 const HDR: u8 = 0;
@@ -142,13 +139,17 @@ impl Unit<(Rx<Ip6Meta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp6Rx {
             let is_h = Bit::from(st == HDR);
             let is_f = Bit::from(st == FWD);
             let is_d = Bit::from(st == DROP);
-            let p0 = is_h & Bit::from(pos == 0);
-            let p1 = is_h & Bit::from(pos == 1);
-            let p2 = is_h & Bit::from(pos == 2);
-            let p3 = is_h & Bit::from(pos == 3);
-            let p4 = is_h & Bit::from(pos == 4);
-            let p5 = is_h & Bit::from(pos == 5);
-            let p7 = is_h & Bit::from(pos == 7);
+            // In HDR `pos` is at most 7 (HDR is left at byte 7, or `pos`
+            // returns to 0 on a `last`): its low 3 bits decode the header
+            // position (shorter than a 16-bit compare, task T5.3).
+            let ph = pos.slice::<0, 3>();
+            let p0 = is_h & Bit::from(ph == 0);
+            let p1 = is_h & Bit::from(ph == 1);
+            let p2 = is_h & Bit::from(ph == 2);
+            let p3 = is_h & Bit::from(ph == 3);
+            let p4 = is_h & Bit::from(ph == 4);
+            let p5 = is_h & Bit::from(ph == 5);
+            let p7 = is_h & Bit::from(ph == 7);
 
             let have = Bit::from(payload.peek().is_some());
             let b = payload.head();
@@ -195,8 +196,13 @@ impl Unit<(Rx<Ip6Meta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp6Rx {
             let lo = b.data.zext::<16>();
             let word = mux(odd, (hi.zext::<16>() << 8u32) | lo, lo << 8u32);
             let add = odd | endb;
-            let next = csum_add(base + ext, mux(add, word, U::<16>::from(0u16)));
-            let ck_good = Bit::from(csum_fold(next) == U::<16>::from(0xFFFFu16));
+            let wadd = mux(add, word, U::<16>::from(0u16));
+            let next = csum_add(base + ext, wadd);
+            // The verdict is only used on a forwarded byte (state FWD), where
+            // `ext` is 0 and `base` is `acc`: it is computed from `acc`
+            // directly, which keeps the pseudo-header additions off its path
+            // (task T5.3; same value wherever it is used).
+            let ck_good = csum_ok(csum_add(acc, wadd));
 
             if (take & p7 & !last & !nock).to_bool() {
                 ntp_meta.send(Meta {

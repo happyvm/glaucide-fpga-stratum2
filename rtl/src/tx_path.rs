@@ -43,7 +43,10 @@
 //!   therefore always a frame boundary, at or behind `cptr`.
 //! * The read pointer `rptr` crosses back as Gray code (`rgray`, two
 //!   flops, `rg1`/`rg2`): it moves by one per `ClkTx` cycle at most, the
-//!   textbook case.
+//!   textbook case. Its binary form is registered once more (`rb`, one
+//!   `clk_sys` cycle; task T5.3, so the Gray decode is not on the path of
+//!   the input handshake): the writer sees free space one cycle later,
+//!   which only makes `full` more conservative.
 //! * Release: the `ClkTx` side starts a frame only when `rptr != cpt`, so
 //!   every byte of it, up to the `last` stored in the memory, is already
 //!   there: once started, a frame goes out one byte per cycle when
@@ -218,6 +221,8 @@ pub struct TxPathG<const ADDR: usize, const DEPTH: usize, const PTRS: usize, S: 
     pub rg1: Reg<U<PTRS>, S>,
     #[async_reg]
     pub rg2: Reg<U<PTRS>, S>,
+    /// `rg2` back to binary, registered.
+    pub rb: Reg<U<PTRS>, S>,
     #[async_reg]
     pub sf1: Reg<Bit, S>,
     #[async_reg]
@@ -290,6 +295,7 @@ impl<const A: usize, const D: usize, const P: usize, S: Clock, C: Clock> Default
             ha2: Reg::default(),
             rg1: Reg::default(),
             rg2: Reg::default(),
+            rb: Reg::default(),
             sf1: Reg::default(),
             sf2: Reg::default(),
             sf3: Reg::default(),
@@ -348,8 +354,9 @@ impl<const A: usize, const D: usize, const P: usize, S: Clock, C: Clock>
                     let cx = self.cx.get();
                     let hreq = self.hreq.get();
                     let g = self.rg2.get();
-                    // The read pointer as seen here, back to binary.
-                    let rs = g
+                    // The read pointer as seen here, back to binary (`rb`
+                    // registers it; `rs` is the registered value).
+                    let rs_n = g
                         ^ (g >> 1u32)
                         ^ (g >> 2u32)
                         ^ (g >> 3u32)
@@ -365,6 +372,7 @@ impl<const A: usize, const D: usize, const P: usize, S: Clock, C: Clock>
                         ^ (g >> 13u32)
                         ^ (g >> 14u32)
                         ^ (g >> 15u32);
+                    let rs = self.rb.get();
                     let used = wptr - rs;
                     let full = Bit::from(used == D);
 
@@ -481,6 +489,7 @@ impl<const A: usize, const D: usize, const P: usize, S: Clock, C: Clock>
                             ha2: self.ha1.get(),
                             rg1: self.rgray.get(),
                             rg2: self.rg1.get(),
+                            rb: rs_n,
                             sf1: self.t_sfd.get(),
                             sf2: self.sf1.get(),
                             sf3: self.sf2.get(),

@@ -73,7 +73,7 @@
 //! `meta` and `payload` come from `eth_rx` through registered channels
 //! (never port to port); each output must feed a registered channel or FIFO.
 //! One input byte is taken exactly when the output it feeds has room.
-use crate::csum::{csum_add, csum_fold};
+use crate::csum::{csum_add, csum_ok};
 use crate::eth_rx::EthMeta;
 use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
@@ -177,7 +177,7 @@ impl
             // Verdict on byte 20 (index 19).
             let word = (hi.zext::<16>() << 8u32) | b.data.zext::<16>();
             let sum_fin = csum_add(acc, word);
-            let ck_ok = Bit::from(csum_fold(sum_fin) == U::<16>::from(0xFFFFu16));
+            let ck_ok = csum_ok(sum_fin);
             let src = self.src.get();
             let dst_fin = (self.dst.get() << 8u32) | b.data.zext::<32>();
             let src_ok = Bit::from(src != U::<32>::from(0u32))

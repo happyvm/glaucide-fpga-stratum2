@@ -69,7 +69,10 @@
 //! link-layer option (type 1) is recorded (at most one, length 1, else it is
 //! "bad"). On the last byte the NS is accepted only if: checksum good,
 //! message well formed, input `err` clear. Then, **all from registers, a few
-//! cycles later** (states CK1..), it is answered only if: the target is
+//! cycles later** (states CK0, CK1..; CK0 acts on the registered verdict of
+//! the last byte and registers the address comparisons used in CK1, task
+//! T5.3; a rejected NS returns to GATHER from CK0), it is answered only if:
+//! the target is
 //! `local_ll`, or `local_gua` with `gua_valid`, and is not multicast (M2); the
 //! destination is the target or the solicited-node address of the target
 //! (`ff02::1:ffXX:XXXX` with the target's low 24 bits, M3); and:
@@ -88,7 +91,7 @@
 //! byte: `pseudo_v6(target, dst, 58, 32)`, plus words type/flags/option and
 //! the MAC words (two registered adder stages), complemented. The request
 //! and the 32 bytes are always sent together (`req` only when the payload
-//! follows); `err` is never set on an NA. The NA starts about 6 cycles after
+//! follows); `err` is never set on an NA. The NA starts about 7 cycles after
 //! the NS's last byte is taken; the input is not read while the NA is built
 //! and sent (the `ipv6_rx` channels buffer it).
 //!
@@ -109,8 +112,9 @@
 //! GATHER, byte 0 not yet taken); while a message is being read, an echo reply
 //! or an NA is being sent, it waits in its channel (replies first). A pending
 //! `resolve` also holds back the start of the next incoming message (its meta
-//! and bytes stay in the `ipv6_rx` channels), so it cannot starve. One cycle
-//! after it is taken (state RS1, from registers):
+//! and bytes stay in the `ipv6_rx` channels), so it cannot starve. Two cycles
+//! after it is taken (state RS0 registers the address comparisons, task
+//! T5.3; state RS1 decides, from registers):
 //!
 //! * target equal to `local_ll`, or to `local_gua` with `gua_valid`: dropped,
 //!   nothing is sent (N3);
@@ -129,7 +133,7 @@
 //! 0x8700_0101)`, i.e. the target words, the three MAC words and the words
 //! `0x8700` (type, code), `0x0000` (reserved), `0x0000`, `0x0101` (option
 //! type, length); the checksum word itself is zero. The checksum is the
-//! complement of the fold, in `0..=0xFFFE`. The NS starts about 6 cycles after
+//! complement of the fold, in `0..=0xFFFE`. The NS starts about 7 cycles after
 //! `resolve` is taken. Retransmission, timeouts and duplicate suppression are
 //! the caller's job (no state is kept per target).
 //!
@@ -157,7 +161,7 @@
 //! one `req` is followed by exactly one frame on `out_payload`. The input
 //! meta is not needed before byte 0 (do not make its availability depend on
 //! this unit's payload progress).
-use crate::csum::{csum_add, csum_fold, pseudo_v6};
+use crate::csum::{csum_add, csum_fold, csum_ok, pseudo_v6};
 use crate::ipv6_rx::Ip6Meta;
 use crate::ipv6_tx::Ip6TxReq;
 use crate::stream::FrameByte;
@@ -193,6 +197,8 @@ const CK3: u8 = 7;
 const REQ: u8 = 8;
 const NAO: u8 = 9;
 const RS1: u8 = 10;
+const CK0: u8 = 11;
+const RS0: u8 = 12;
 
 #[derive(Trace, Default)]
 pub struct Icmpv6 {
@@ -231,6 +237,20 @@ pub struct Icmpv6 {
     pub isna: Reg<Bit>,
     /// The frame being built is a solicitation we generate (else an NA).
     pub gsol: Reg<Bit>,
+    /// Address comparisons of the NS check and of the solicitation,
+    /// registered every cycle (read in CK1 / RS1, one cycle after CK0 / RS0,
+    /// when their inputs have been stable for a cycle).
+    pub own_r: Reg<Bit>,
+    pub to_tgt_r: Reg<Bit>,
+    pub m3_r: Reg<Bit>,
+    pub unspec_r: Reg<Bit>,
+    pub notmc_r: Reg<Bit>,
+    /// The NS/NA just read passed its checks (written with its last byte,
+    /// read in CK0).
+    pub gd: Reg<Bit>,
+    /// `mlen >= 8`, `mlen >= 24` (written with `mlen`).
+    pub ml8: Reg<Bit>,
+    pub ml24: Reg<Bit>,
 }
 
 #[lower]
@@ -297,10 +317,16 @@ impl
             let is_req = Bit::from(st == REQ);
             let is_nao = Bit::from(st == NAO);
             let is_rs1 = Bit::from(st == RS1);
-            let p0 = is_g & Bit::from(pos == 0);
-            let p1 = is_g & Bit::from(pos == 1);
-            let p2 = is_g & Bit::from(pos == 2);
-            let p3 = is_g & Bit::from(pos == 3);
+            let is_ck0 = Bit::from(st == CK0);
+            let is_rs0 = Bit::from(st == RS0);
+            // In GATHER `pos` is at most 3 (byte 3 leaves GATHER, every way
+            // back sets `pos` to 0): its low 2 bits decode the position
+            // (shorter than a 16-bit compare, task T5.3).
+            let pg = pos.slice::<0, 2>();
+            let p0 = is_g & Bit::from(pg == 0);
+            let p1 = is_g & Bit::from(pg == 1);
+            let p2 = is_g & Bit::from(pg == 2);
+            let p3 = is_g & Bit::from(pg == 3);
 
             let have = Bit::from(payload.peek().is_some());
             let b = payload.head();
@@ -312,18 +338,18 @@ impl
             let echo_acc = Bit::from(hi == U::<8>::from(TYPE_ECHO_REQUEST))
                 & Bit::from(b.data == U::<8>::from(0u8))
                 & !last
-                & Bit::from(mlen >= 8)
+                & self.ml8.get()
                 & !self.mmc.get();
             let ns_acc = Bit::from(hi == U::<8>::from(TYPE_NS))
                 & Bit::from(b.data == U::<8>::from(0u8))
                 & !last
-                & Bit::from(mlen >= 24)
+                & self.ml24.get()
                 & self.h255.get();
             let echo_go = p1 & echo_acc;
             let na_acc = Bit::from(hi == U::<8>::from(TYPE_NA))
                 & Bit::from(b.data == U::<8>::from(0u8))
                 & !last
-                & Bit::from(mlen >= 24)
+                & self.ml24.get()
                 & self.h255.get();
             let ns_go = p1 & (ns_acc | na_acc);
             // A pending resolve request starts a solicitation when idle, at the
@@ -347,7 +373,7 @@ impl
             let word = mux(odd, (hi.zext::<16>() << 8u32) | lo, lo << 8u32);
             let add = odd | last;
             let next = mux(add, csum_add(acc, word), acc);
-            let sum_ok = Bit::from(csum_fold(next) == U::<16>::from(0xFFFFu16));
+            let sum_ok = csum_ok(next);
             let seed = pseudo_v6(
                 m.src,
                 m.dst,
@@ -378,15 +404,21 @@ impl
             let good = is_nsi & last & sum_ok & !bad_n & !b.err;
             let ns_end = take & is_nsi & last;
 
-            // NA preparation, all from registers.
-            let own = Bit::from(tgt == local_ll.get())
+            // NA preparation, all from registers. The comparisons are
+            // registered (`*_r`) and read one cycle later (CK1, RS1).
+            let own_n = Bit::from(tgt == local_ll.get())
                 | (gua_valid.get() & Bit::from(tgt == local_gua.get()));
-            let notmc = Bit::from(tgt.slice::<120, 8>() != U::<8>::from(0xFFu8));
+            let notmc_n = Bit::from(tgt.slice::<120, 8>() != U::<8>::from(0xFFu8));
             let sn_tgt = U::<128>::from(0xff02_0000_0000_0000_0000_0001_ff00_0000u128)
                 | (tgt & U::<128>::from(0x00FF_FFFFu128));
-            let to_tgt = Bit::from(mdst == tgt);
-            let m3 = to_tgt | Bit::from(mdst == sn_tgt);
-            let unspec = Bit::from(msrc == U::<128>::from(0u128));
+            let to_tgt_n = Bit::from(mdst == tgt);
+            let m3_n = to_tgt_n | Bit::from(mdst == sn_tgt);
+            let unspec_n = Bit::from(msrc == U::<128>::from(0u128));
+            let own = self.own_r.get();
+            let notmc = self.notmc_r.get();
+            let to_tgt = self.to_tgt_r.get();
+            let m3 = self.m3_r.get();
+            let unspec = self.unspec_r.get();
             let ok_dad = !to_tgt & !sseen;
             let ok_ns = own & notmc & m3 & mux(unspec, ok_dad, !sbad);
             let all_nodes = U::<128>::from(0xff02_0000_0000_0000_0000_0000_0000_0001u128);
@@ -509,10 +541,17 @@ impl
                 },
                 take & p1 ? isna: na_acc,
                 // Solicitation to send: latch the target, check it next cycle.
+                own_r: own_n,
+                notmc_r: notmc_n,
+                to_tgt_r: to_tgt_n,
+                m3_r: m3_n,
+                unspec_r: unspec_n,
                 rs_take ? {
                     tgt: rt,
-                    st: U::<4>::from(RS1),
+                    st: U::<4>::from(RS0),
                 },
+                is_rs0 ? st: U::<4>::from(RS1),
+                is_ck0 ? st: mux(self.gd.get(), U::<4>::from(CK1), U::<4>::from(GATHER)),
                 rs_own ? st: U::<4>::from(GATHER),
                 rs_go ? {
                     st: U::<4>::from(CK2),
@@ -530,6 +569,8 @@ impl
                     msrc: m.src,
                     mdst: m.dst,
                     mlen: m.len,
+                    ml8: Bit::from(m.len >= 8),
+                    ml24: Bit::from(m.len >= 24),
                     mmc: m.multicast,
                     h255: Bit::from(m.hop == U::<8>::from(NDP_HOP)),
                 },
@@ -564,13 +605,16 @@ impl
                 },
                 take & o_b & Bit::from(ot == want_t) ? smac: (smac << 8u32) | b.data.zext::<48>(),
                 take & is_nsi ? bad: bad_n,
+                // The verdict of the last byte is registered (`gd`) and acted on
+                // in CK0 (task T5.3: the checksum is not on the path of `st`).
                 ns_end ? {
-                    st: mux(good, U::<4>::from(CK1), U::<4>::from(GATHER)),
+                    st: U::<4>::from(CK0),
+                    gd: good,
                     pos: U::<16>::from(0u16),
                     ost: U::<2>::from(0u8),
                     bad: Bit::Zero,
                 },
-                ns_end & !good ? {
+                is_ck0 & !self.gd.get() ? {
                     sseen: Bit::Zero,
                     sbad: Bit::Zero,
                 },

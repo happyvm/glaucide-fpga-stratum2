@@ -221,7 +221,10 @@
 //!   sum's bits 64..1, rounding toward minus infinity; always fits);
 //!   `delay = sext66(d1) - sext66(d2)`, 0 when negative (bit 65), else its
 //!   low 64 bits (always fits); `iv = d1` if `d1[63] = 0` else 0; `prod =
-//!   iv * PHI_Q32` (96 bits, < 2^80).
+//!   iv * PHI_Q32` (96 bits, < 2^80), registered as its two 32 x 16 partial
+//!   products `plo` = `iv[31:0] * PHI_Q32` and `phi` = `iv[63:32] * PHI_Q32`
+//!   (task T5.3: two DSP slices deep instead of four), so that
+//!   `(prod + 2^32 - 1) >> 32 = phi + ((plo + 2^32 - 1) >> 32)`.
 //! * `SMP`: `disp = pf(peer precision) + pf(precision) + ((prod + 2^32 - 1)
 //!   >> 32)` with `pf(p)` = 2^p in 32.32 = `1 << (32 + p)` for `p` in
 //!   -32..=-1, `1 << 32` for `p >= 0`, `1` for `p < -32` ([`prec_pow`], the
@@ -348,7 +351,8 @@ pub struct NtpClient {
     pub rb: Reg<U<64>>,
     pub rd1: Reg<U<64>>,
     pub rd2: Reg<U<64>>,
-    pub prod: Reg<U<96>>,
+    pub plo: Reg<U<48>>,
+    pub phi: Reg<U<48>>,
     // Request.
     pub mac: Reg<U<48>>,
     /// Payload bytes sent (0..=47).
@@ -678,11 +682,15 @@ impl
             let dd = rd1.sext::<66>() - rd2.sext::<66>();
             let dly = mux(dd.bit(65), U::<64>::from(0u8), dd.slice::<0, 64>());
             let iv = mux(rd1.bit(63), U::<64>::from(0u8), rd1);
-            let prd = iv.zext::<96>() * U::<96>::from(PHI_Q32);
+            let p_lo = iv.slice::<0, 32>().zext::<48>() * U::<48>::from(PHI_Q32);
+            let p_hi = iv.slice::<32, 32>().zext::<48>() * U::<48>::from(PHI_Q32);
 
             // ------------------------------------------- SMP
-            let phi = (self.prod.get() + U::<96>::from(0xFFFF_FFFFu32)).slice::<32, 64>();
-            let disp = prec_pow(r_prec) + prec_pow(precision.get()) + phi;
+            // (prod + 2^32 - 1) >> 32 from the two partial products (exact:
+            // the high one has 32 zero low bits once shifted).
+            let lo_up = ((self.plo.get().zext::<49>() + U::<49>::from(0xFFFF_FFFFu32)) >> 32u32).zext::<64>();
+            let phi = self.phi.get().zext::<64>() + lo_up;
+            let disp = (prec_pow(r_prec) + prec_pow(precision.get())) + phi;
             let send_s = is_smp & samples.ready();
             if send_s.to_bool() {
                 samples.send(Sample {
@@ -885,7 +893,8 @@ impl
                     st: U::<4>::from(S_SMP),
                     ra: off,
                     rb: dly,
-                    prod: prd,
+                    plo: p_lo,
+                    phi: p_hi,
                 },
                 send_s | send_x ? st: U::<4>::from(S_SCAN),
                 send_l4 | send_l6 ? st: U::<4>::from(S_LWT),

@@ -73,7 +73,7 @@
 //! when the output it feeds has room (byte 7 waits for room on `ntp_meta`,
 //! payload bytes for room on `ntp`). `ntp_meta` must be popped by the
 //! consumer independently of the payload.
-use crate::csum::{csum_add, csum_fold, pseudo_v4};
+use crate::csum::{csum_add, csum_fold, csum_ok, pseudo_v4};
 use crate::ipv4_rx::IpMeta;
 use crate::stream::{FrameByte, Meta};
 use txhdl::comp::{mux, Clock, DefaultClock, Reg, Rx, Tx, Unit};
@@ -127,11 +127,15 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp4Rx {
             let is_h = Bit::from(st == HDR);
             let is_f = Bit::from(st == FWD);
             let is_d = Bit::from(st == DROP);
-            let p0 = is_h & Bit::from(pos == 0);
-            let p1 = is_h & Bit::from(pos == 1);
-            let p3 = is_h & Bit::from(pos == 3);
-            let p5 = is_h & Bit::from(pos == 5);
-            let p7 = is_h & Bit::from(pos == 7);
+            // In HDR `pos` is at most 7 (HDR is left at byte 7, or `pos`
+            // returns to 0 on a `last`): its low 3 bits decode the header
+            // position (shorter than a 16-bit compare, task T5.3).
+            let ph = pos.slice::<0, 3>();
+            let p0 = is_h & Bit::from(ph == 0);
+            let p1 = is_h & Bit::from(ph == 1);
+            let p3 = is_h & Bit::from(ph == 3);
+            let p5 = is_h & Bit::from(ph == 5);
+            let p7 = is_h & Bit::from(ph == 7);
 
             let have = Bit::from(payload.peek().is_some());
             let b = payload.head();
@@ -162,7 +166,12 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp4Rx {
             let word = mux(odd, (hi.zext::<16>() << 8u32) | lo, lo << 8u32);
             let add = odd | endb;
             let next = mux(add, csum_add(base, word), base);
-            let sum_ok = Bit::from(csum_fold(next) == U::<16>::from(0xFFFFu16));
+            // The verdict is only used on a forwarded byte (state FWD), where
+            // `base` is `acc`: it is computed from `acc` directly, which keeps
+            // the pseudo-header seed off its path (task T5.3; same value
+            // wherever it is used).
+            let next_f = mux(add, csum_add(acc, word), acc);
+            let sum_ok = csum_ok(next_f);
             let ck_good = self.nock.get() | sum_ok;
 
             if (take & p7 & !last).to_bool() {
