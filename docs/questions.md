@@ -19,3 +19,12 @@
    de `clk_sys`. **Demande :** rendre `MiiRx<C: Clock>` et `MiiTx<C: Clock>` génériques (comme
    `RxPath<R, S>`, avec `pub type MiiRxPhy = MiiRx<ClkRx>`), ce qui permettrait des tests sur broches à
    25 MHz.
+
+## T1.15 — suite de la demande 2 (MII génériques)
+
+`MiiRxG<C>` / `MiiTxG<C>` sont génériques en l'horloge (alias `MiiRx`, `MiiTx` inchangés, netlists identiques) et
+`ArtyTopG<R, T, P, K>` / `ArtyTopClk` portent les horloges MII ; les tests `real_ratio_*` de `rtl/tests/top.rs`
+simulent le top complet à 25 MHz réels. Mesuré avec les vraies unités sur huit phases : erreur T2 0..+5 ns, T3
++5..+10 ns (modèle : T2 0..+5 ns, T3 -10..+10 ns). Point à noter : `mii_tx` écrit `txd.set(o_txd)`, donc en
+simulation la broche suit le registre avec un cycle `clk_tx` de retard (en netlist, `assign txd = o_txd`, pas de
+retard) ; le banc en tient compte pour l'instant SFD.

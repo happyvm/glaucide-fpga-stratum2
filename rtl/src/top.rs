@@ -39,10 +39,11 @@
 //!
 //! `ArtyCore` is generic in its two MII clocks so that the system tests can
 //! run it with MII clocks of any period (25 MHz = 4 `clk_sys` periods, or a
-//! slightly different ratio) against a model of the MII units: `MiiRx` and
-//! `MiiTx` are fixed to `ClkRx`/`ClkTx`, whose simulation period is that of
-//! `clk_sys` (see `docs/questions.md`). `ArtyTop` adds the two MII units and
-//! the PHY management: it is what the board wrapper instantiates.
+//! slightly different ratio). `ArtyTop` adds the two MII units and the PHY
+//! management: it is what the board wrapper instantiates, at `ClkRx`/`ClkTx`
+//! (simulation period of `clk_sys`); `ArtyTopClk`/`ArtyTopG` take the MII
+//! clocks as parameters (`ClkRx25`/`ClkTx25`, ... of `clocks.rs`) so the
+//! pin-level tests run the real `MiiRxG`/`MiiTxG` at the real 4:1 ratio.
 //!
 //! # Channels between units
 //!
