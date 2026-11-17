@@ -96,6 +96,8 @@ pub struct IpMeta {
     /// Source MAC of the frame (the reply goes there; no ARP table).
     pub eth_src: U<48>,
     pub ttl: U<8>,
+    /// Receive timestamp of the frame (copied from `EthMeta.ts`).
+    pub rx_ts: U<64>,
 }
 
 #[derive(Trace, Default)]
@@ -113,6 +115,8 @@ pub struct Ipv4Rx {
     pub src: Reg<U<32>>,
     pub dst: Reg<U<32>>,
     pub esrc: Reg<U<48>>,
+    /// Receive timestamp of the frame in progress (from `EthMeta.ts`).
+    pub ets: Reg<U<64>>,
     /// The packet is being forwarded to ICMP / UDP.
     pub f_icmp: Reg<Bit>,
     pub f_udp: Reg<Bit>,
@@ -211,6 +215,7 @@ impl
                 len: tl - U::<16>::from(20u16),
                 eth_src: self.esrc.get(),
                 ttl: self.ttl.get(),
+                rx_ts: self.ets.get(),
             };
             let m_icmp = take & dec_icmp;
             let m_udp = take & dec_udp;
@@ -245,7 +250,10 @@ impl
                 take & p3 ? tl: tl | b.data.zext::<16>(),
                 take & p8 ? ttl: b.data,
                 take & p9 ? proto: b.data,
-                take & p0 ? esrc: m.src,
+                take & p0 ? {
+                    esrc: m.src,
+                    ets: m.ts,
+                },
                 take & in_src ? src: (src << 8u32) | b.data.zext::<32>(),
                 take & in_dst ? dst: dst_fin,
                 take & in_h & !odd ? hi: b.data,

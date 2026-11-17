@@ -38,8 +38,8 @@
 //! (so before the first payload byte): `family = 0` (IPv4), `src`/`dst` =
 //! `IpMeta.src`/`dst` in the low 32 bits (upper bits 0), `sport`, `dport` from
 //! the UDP header, `len` = UDP length - 8 = the number of payload bytes that
-//! follow (1 to 1472), `eth_src` from `IpMeta`, `rx_ts` = 0 (the NTP server
-//! pairs the hardware timestamp with the frame itself). Then the UDP payload
+//! follow (1 to 1472), `eth_src` from `IpMeta`, `rx_ts` from `IpMeta.rx_ts` (the
+//! hardware receive timestamp of the frame, T1.13). Then the UDP payload
 //! (header stripped) is sent on `ntp`, one byte per cycle at best, one byte in
 //! the cycle its input byte is taken, `last` on the final byte. `meta` and
 //! `payload` are separate channels: a consumer must not make popping the
@@ -102,6 +102,8 @@ pub struct Udp4Rx {
     pub msrc: Reg<U<32>>,
     pub mdst: Reg<U<32>>,
     pub esrc: Reg<U<48>>,
+    /// Receive timestamp of the datagram's frame (from `IpMeta.rx_ts`).
+    pub ets: Reg<U<64>>,
     pub sport: Reg<U<16>>,
     pub dport: Reg<U<16>>,
     /// The checksum field is 0: no checksum.
@@ -172,7 +174,7 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp4Rx {
                     dport: self.dport.get(),
                     len: mlen - U::<16>::from(8u16),
                     eth_src: self.esrc.get(),
-                    rx_ts: U::<64>::from(0u64),
+                    rx_ts: self.ets.get(),
                 });
             }
             if (take & is_f).to_bool() {
@@ -191,6 +193,7 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp4Rx {
                 take & !is_d ? acc: next,
                 take & p0 ? {
                     esrc: m.eth_src,
+                    ets: m.rx_ts,
                     msrc: m.src,
                     mdst: m.dst,
                     mlen: m.len,

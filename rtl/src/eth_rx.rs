@@ -4,10 +4,21 @@
 //!
 //! Ports: `frames` (`Rx<FrameByte>`: a frame without FCS as `fcs_check`
 //! (T1.12) produces it, destination MAC through last payload byte, `err` on
-//! `last` = bad FCS or bad frame), `local_mac` and `sn_low` (wires), and
-//! six output channels, in this order: ARP meta, ARP payload, IPv4 meta,
+//! `last` = bad FCS or bad frame), `local_mac` and `sn_low` (wires),
+//! `stamps` (`Rx<Ts>`, the `stamps_out` of `fcs_check`: one receive
+//! timestamp per input frame, in frame order), and six output channels, in this order: ARP meta, ARP payload, IPv4 meta,
 //! IPv4 payload, IPv6 meta, IPv6 payload (the nested pair form is not
 //! accepted by `#[lower]`: ports must be names).
+//!
+//! # Receive timestamp (T1.13)
+//!
+//! Exactly one stamp is popped from `stamps` per input frame, in the cycle
+//! its first byte (byte 0 of the header) is taken, for every frame: accepted,
+//! dropped, or too short to reach byte 14. A forwarded frame carries its own
+//! stamp in [`EthMeta::ts`]. `fcs_check` forwards a stamp exactly for the
+//! frames it emits, so stamps and frames stay aligned. The stamp is expected
+//! with the first byte; if it is late the first byte waits (the input
+//! stalls), and if it never comes the unit waits forever.
 //!
 //! # Conventions
 //!
@@ -79,7 +90,7 @@
 //! the input stream contract (`err` only together with `last`) and the
 //! configuration (`local_mac` has its group bit clear, i.e. is a unicast
 //! address).
-use crate::stream::FrameByte;
+use crate::stream::{FrameByte, Ts};
 use txhdl::comp::{Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{
@@ -104,6 +115,8 @@ pub struct EthMeta {
     pub ethertype: U<16>,
     /// Group bit of the destination (multicast or broadcast).
     pub multicast: Bit,
+    /// Receive timestamp of the frame (NTP 32.32), popped from `stamps`.
+    pub ts: U<64>,
 }
 
 #[derive(Trace, Default)]
@@ -114,6 +127,8 @@ pub struct EthRx {
     pub dst: Reg<U<48>>,
     pub src: Reg<U<48>>,
     pub et_hi: Reg<U<8>>,
+    /// Stamp of the frame in progress, popped with its byte 0.
+    pub ts: Reg<Ts>,
     /// The frame is being forwarded to ARP / IPv4 / IPv6 (one-hot or all 0).
     pub f_arp: Reg<Bit>,
     pub f_v4: Reg<Bit>,
@@ -128,7 +143,7 @@ pub struct EthRx {
 #[lower]
 impl
     Unit<
-        (Rx<FrameByte>, In<U<48>>, In<U<24>>),
+        (Rx<FrameByte>, In<U<48>>, In<U<24>>, Rx<Ts>),
         (
             Tx<EthMeta>,
             Tx<FrameByte>,
@@ -141,7 +156,7 @@ impl
 {
     async fn run(
         &mut self,
-        (frames, local_mac, sn_low): (Rx<FrameByte>, In<U<48>>, In<U<24>>),
+        (frames, local_mac, sn_low): (Rx<FrameByte>, In<U<48>>, In<U<24>>, Rx<Ts>),
         (arp_m, arp_p, v4_m, v4_p, v6_m, v6_p): (
             Tx<EthMeta>,
             Tx<FrameByte>,
@@ -206,14 +221,19 @@ impl
                 (dec_arp & arp_m.ready()) | (dec_v4 & v4_m.ready()) | (dec_v6 & v6_m.ready());
             let pay_room = (f_arp & arp_p.ready()) | (f_v4 & v4_p.ready()) | (f_v6 & v6_p.ready());
             // One input byte is taken only when its output accepts it.
-            let take = have & (!dec_fwd | meta_room) & (!fwd | pay_room);
+            // Byte 0 also needs the frame's stamp.
+            let is_b0 = Bit::from(cnt == 0);
+            let st_ok = !is_b0 | Bit::from(stamps.peek().is_some());
+            let take = have & st_ok & (!dec_fwd | meta_room) & (!fwd | pay_room);
             let _ = frames.recv_if(take);
+            let new_ts = stamps.recv_if(take & is_b0).unwrap_or_default();
 
             let meta = EthMeta {
                 dst,
                 src,
                 ethertype: ety,
                 multicast: dst.bit(40),
+                ts: self.ts.get(),
             };
             let pay = FrameByte {
                 data: b.data,
@@ -344,6 +364,7 @@ impl
                 take & in_dst ? dst: (dst << 8u32) | b.data.zext::<48>(),
                 take & in_src ? src: (src << 8u32) | b.data.zext::<48>(),
                 take & is_hi ? et_hi: b.data,
+                take & is_b0 ? ts: new_ts,
                 take & is_dec ? m_ety: ety,
                 n_hdr ? cnt: cnt + 1,
                 take & dec_fwd ? {
