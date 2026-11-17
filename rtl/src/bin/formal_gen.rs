@@ -20,6 +20,7 @@ fn main() {
         Some("udp4_tx") => print!("{}", ntp_fpga::udp4_tx::Udp4Tx::verilog("udp4_tx")),
         Some("ipv6_rx") => print!("{}", ntp_fpga::ipv6_rx::Ipv6Rx::verilog("ipv6_rx")),
         Some("ipv6_tx") => print!("{}", ntp_fpga::ipv6_tx::Ipv6Tx::verilog("ipv6_tx")),
+        Some("icmpv6") => print!("{}", ntp_fpga::icmpv6::Icmpv6::verilog("icmpv6")),
         Some("formal_smoke") => print!("{}", Digit::verilog("formal_smoke")),
         Some("crc_equiv") => print!("{}", ntp_fpga::crc_equiv::CrcEquiv::verilog("crc_equiv")),
         Some("frame_crc") => print!("{}", FrameCrc::verilog("frame_crc")),

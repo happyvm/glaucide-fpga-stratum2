@@ -27,6 +27,7 @@ fn main() {
         Some("udp4_tx") => print!("{}", ntp_fpga::udp4_tx::Udp4Tx::verilog("udp4_tx")),
         Some("ipv6_rx") => print!("{}", ntp_fpga::ipv6_rx::Ipv6Rx::verilog("ipv6_rx")),
         Some("ipv6_tx") => print!("{}", ntp_fpga::ipv6_tx::Ipv6Tx::verilog("ipv6_tx")),
+        Some("icmpv6") => print!("{}", ntp_fpga::icmpv6::Icmpv6::verilog("icmpv6")),
         Some("ntp_clock") => print!("{}", NtpClock::verilog("ntp_clock")),
         Some("disciplined_clock") => print!("{}", DisciplinedClock::verilog("disciplined_clock")),
         Some("frame_counter") => print!("{}", FrameCounter::verilog("frame_counter")),
