@@ -499,7 +499,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: ntpperf_bridge --shim ntpperf_vtime.so --shm FILE [--sync fixed|standalone] \
          [--rate-limit 0|1|2|4|8|16 (0)] [--kod] [--queue-bytes N (65536)] [--log CSV] [--no-ff] \
-         [--idle-cycles N (1000)] [--status WALL_S (10)] [--max-wall WALL_S (3600)] \
+         [--idle-cycles N (400)] [--status WALL_S (10)] [--max-wall WALL_S (3600)] \
          [--max-virtual S (100)] [--t0 UNIX_NS] [--quantum-ns N (1000000)] [--iface NAME (sim0)] \
          -- NTPPERF ARGS..."
     );
@@ -516,7 +516,7 @@ fn opts() -> Opts {
         shim: String::new(),
         log: None,
         ff: true,
-        idle_cycles: 1000,
+        idle_cycles: 400,
         status_s: 10.0,
         max_wall_s: 3600.0,
         max_virtual_s: 100.0,
