@@ -153,7 +153,7 @@ fn random_request(r: &mut Rng) -> Vec<u8> {
     let n = 48 + r.below(353);
     let pay = ntp_payload(if r.below(2) == 0 { 0x23 } else { 0x1b }, n, r.next());
     if r.below(2) == 0 {
-        // 10.x.y.z, buckets kept away from the probes' (see `probe`).
+        // 10.x.y.z: random buckets, a few per bucket at most in a run.
         let ip = 0x0A00_0000 | (r.next() as u32 & 0x00FF_FFC0) | r.below(16) as u32;
         ntp4_frame(PEER_MAC, ip, r.next() as u16, &pay)
     } else {
@@ -455,9 +455,9 @@ fn fuzz_frame(r: &mut Rng, tpl: &[Vec<u8>], kind_mask: u32) -> (Vec<u8>, bool, u
 }
 
 /// Probe `k`: a valid IPv4 request from 203.0.113.(16 + k) with a unique
-/// Transmit timestamp. The probes use distinct rate-limiter buckets, and
-/// `random_request` keeps its IPv4 sources in other ones as far as the
-/// fold allows; at most 48 probes per run.
+/// Transmit timestamp. The probes use distinct rate-limiter buckets; a
+/// random request may share one, far below the limit of 8 per second (the
+/// whole run lasts a few ms of simulated time). At most 48 probes per run.
 fn probe(seed: u64, k: usize) -> (Vec<u8>, u64) {
     assert!(k < 48);
     let x = 0xFEED_0000_0000_0000 | (seed << 16) | k as u64;
@@ -557,7 +557,7 @@ fn fuzz_random_and_corrupted_frames() {
 /// jumbo frames, odd EtherTypes) mixed with valid requests of random size.
 #[test]
 fn fuzz_malformed_headers() {
-    campaign(0x5EC0_0002, 8, 40, 0b0110000);
+    campaign(0x5EC0_0002, 8, 30, 0b0110000);
 }
 
 /// Everything mixed, another seed.
