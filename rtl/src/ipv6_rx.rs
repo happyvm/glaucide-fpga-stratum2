@@ -112,7 +112,7 @@ use crate::eth_rx::EthMeta;
 use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
+use txhdl::{assume, check, cover, lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
 
 /// Next header values.
 pub const NH_ICMPV6: u8 = 58;
@@ -162,6 +162,16 @@ pub struct Ipv6Rx {
     /// The final packet byte is held, the padding is being swallowed.
     pub sw: Reg<Bit>,
     pub held: Reg<U<8>>,
+    // Monitors (check!/cover! only): the raw first header byte, the payload bytes sent for
+    // the packet in progress, and the previous cycle's configuration wires.
+    pub m_b0: Reg<U<8>>,
+    pub m_s8: Reg<U<8>>,
+    pub m_cnt: Reg<U<16>>,
+    pub m_ll: Reg<U<128>>,
+    pub m_gua: Reg<U<128>>,
+    pub m_gv: Reg<Bit>,
+    pub m_sn: Reg<U<24>>,
+    pub m_lv: Reg<Bit>,
 }
 
 #[lower]
@@ -305,8 +315,82 @@ impl
                 udp_p.send(ob);
             }
 
+            // ---- formal properties (orchestrator; docs/formal.md, rows "IPv6" and "Flux") ----
+            assume!(!have | !b.err | last, "payload: err only together with last (stream contract 2)");
+            assume!(!self.m_lv.get() | (Bit::from(local_ll.get() == self.m_ll.get()) & Bit::from(local_gua.get() == self.m_gua.get()) & (gua_valid.get() == self.m_gv.get()) & Bit::from(sn_low.get() == self.m_sn.get())), "local_ll, local_gua, gua_valid and sn_low are constant (configuration wires)");
+            let m_any = m_icmp | m_udp;
+            let m_dec = take & dec_fwd;
+            let local_sn = sn_low.get().zext::<128>();
+            let p_any = p_icmp | p_udp;
+            let m_cnt = self.m_cnt.get();
+            let fwd_any = f_icmp | f_udp;
+            let own_uni = Bit::from(dst_fin == local_ll.get()) | (gua_valid.get() & Bit::from(dst_fin == local_gua.get()));
+            let src_top96 = src.slice::<32, 96>();
+            // The verdict restated from raw bytes and wires (independent of ok, accept, usrc_ok_r).
+            check!(!m_any | p39, "a packet is forwarded on byte 40 of the header only");
+            check!(!m_any | (Bit::from(self.m_b0.get().slice::<4, 4>() == 6u8) & !self.esrc.get().bit(40)), "version 6, Ethernet source not group addressed (G1, E1)");
+            check!(!m_any | Bit::from(plen != 0u16), "payload length not 0 (G1)");
+            check!(!m_any | !last, "a packet has a byte after the header");
+            check!(!m_any | !Bit::from(self.hop.get() == 0u8), "hop limit not 0 (G3)");
+            check!(!m_any | !Bit::from(src.slice::<120, 8>() == 0xFFu8), "source not multicast (G4)");
+            check!(!m_icmp | Bit::from(nxt == 58u8), "ICMPv6 meta only for next header 58 (G2)");
+            check!(!m_udp | Bit::from(nxt == 17u8), "UDP meta only for next header 17 (G2)");
+            check!(!(m_icmp & m_udp), "a packet goes to one protocol");
+            check!(!(f_icmp & f_udp), "forwarding to one protocol at a time");
+            check!(!(m_any & fwd_any), "a new packet is not decided while one is being forwarded");
+            check!(!m_udp | (own_uni & !self.edst.get().bit(40)), "UDP only to our unicast addresses on our unicast MAC (G5, G8)");
+            check!(!m_icmp | ((own_uni & !self.edst.get().bit(40)) | (Bit::from(dst_fin == (U::<128>::from(0xff02_0000_0000_0000_0000_0001_ff00_0000u128) | local_sn)) & Bit::from(self.edst.get() == (U::<48>::from(0x3333_ff00_0000u64) | sn_low.get().zext::<48>())))), "ICMPv6 to our unicast addresses or to our solicited-node group with the matching MAC (G5, G6)");
+            check!(!m_udp | (!Bit::from(src == 0u8) & !Bit::from(src == 1u8) & !Bit::from(src_top96 == 0xFFFFu16) & !Bit::from(src == local_ll.get()) & !(gua_valid.get() & Bit::from(src == local_gua.get()))), "UDP source is not ::, ::1, IPv4-mapped or one of our own addresses (G9)");
+            check!(!fwd_any | Bit::from(pos == 40), "forwarding only past the 40-byte header");
+            // Invariants tying `ok` to the raw bytes (the induction needs them).
+            check!(!(ok & Bit::from(pos >= 1)) | (Bit::from(self.m_b0.get().slice::<4, 4>() == 6u8) & !self.esrc.get().bit(40)), "ok: byte 0 and the group bit were good");
+            check!(!(ok & Bit::from(pos >= 8)) | !Bit::from(self.hop.get() == 0u8), "ok: hop limit was not 0");
+            check!(!(ok & Bit::from(pos >= 9)) | !Bit::from(self.m_s8.get() == 0xFFu8), "ok: the first source byte was not 0xFF");
+            check!(!Bit::from(pos == 9) | Bit::from(src.slice::<0, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 0 after 1 bytes");
+            check!(!Bit::from(pos == 10) | Bit::from(src.slice::<8, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 1 after 2 bytes");
+            check!(!Bit::from(pos == 11) | Bit::from(src.slice::<16, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 2 after 3 bytes");
+            check!(!Bit::from(pos == 12) | Bit::from(src.slice::<24, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 3 after 4 bytes");
+            check!(!Bit::from(pos == 13) | Bit::from(src.slice::<32, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 4 after 5 bytes");
+            check!(!Bit::from(pos == 14) | Bit::from(src.slice::<40, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 5 after 6 bytes");
+            check!(!Bit::from(pos == 15) | Bit::from(src.slice::<48, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 6 after 7 bytes");
+            check!(!Bit::from(pos == 16) | Bit::from(src.slice::<56, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 7 after 8 bytes");
+            check!(!Bit::from(pos == 17) | Bit::from(src.slice::<64, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 8 after 9 bytes");
+            check!(!Bit::from(pos == 18) | Bit::from(src.slice::<72, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 9 after 10 bytes");
+            check!(!Bit::from(pos == 19) | Bit::from(src.slice::<80, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 10 after 11 bytes");
+            check!(!Bit::from(pos == 20) | Bit::from(src.slice::<88, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 11 after 12 bytes");
+            check!(!Bit::from(pos == 21) | Bit::from(src.slice::<96, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 12 after 13 bytes");
+            check!(!Bit::from(pos == 22) | Bit::from(src.slice::<104, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 13 after 14 bytes");
+            check!(!Bit::from(pos == 23) | Bit::from(src.slice::<112, 8>() == self.m_s8.get()), "source shift register: the first source byte is at byte 14 after 15 bytes");
+            check!(!Bit::from(pos >= 24) | Bit::from(src.slice::<120, 8>() == self.m_s8.get()), "the source register holds the first source byte on top once complete");
+            // Payload.
+            check!(!p_any | fwd_any, "a payload byte is sent only for a forwarded packet");
+            check!(!p_icmp | f_icmp, "ICMP payload only on the ICMP channel");
+            check!(!p_udp | f_udp, "UDP payload only on the UDP channel");
+            check!(!(p_icmp & p_udp), "one channel per byte");
+            check!(!p_any | !sw | last, "while the final byte is held only it is sent, with the frame's last");
+            check!(!(p_any & o_last) | last, "the packet ends with the frame (last of the input)");
+            check!(!(p_any & o_err) | o_last, "err only together with last (stream contract 2)");
+            check!(!(p_any & o_last & !o_err) | Bit::from(m_cnt + 1 == plen), "a good packet carries exactly the payload length bytes");
+            check!(!(fwd_any & !sw) | (Bit::from(rem >= 1) & Bit::from(m_cnt + rem == plen)), "forwarding: sent + remaining = payload length");
+            check!(!sw | (Bit::from(rem == 0) & Bit::from(m_cnt + 1 == plen)), "final byte held: all others were sent");
+            check!(!sw | fwd_any, "a held byte belongs to a forwarded packet");
+            cover!(m_icmp, "an ICMPv6 packet is forwarded");
+            cover!(m_udp, "a UDP packet is forwarded");
+            cover!(take & p39 & !accept & !last, "a header is rejected on byte 40");
+            cover!(send_held, "a held final byte is sent after the padding");
+            cover!(p_any & o_last & !o_err, "a good packet is completed");
+
             with!(self <= {
                 usrc_ok_r: usrc_n,
+                m_ll: local_ll.get(),
+                m_gua: local_gua.get(),
+                m_gv: gua_valid.get(),
+                m_sn: sn_low.get(),
+                m_lv: Bit::One,
+                m_dec ? m_cnt: U::<16>::from(0u16),
+                p_any ? m_cnt: m_cnt + U::<16>::from(1u16),
+                take & p0 ? m_b0: b.data,
+                take & p8 ? m_s8: b.data,
                 take & in_h ? pos: pos + U::<6>::from(1u8),
                 take ? ok: ok_n,
                 take & p0 ? {
