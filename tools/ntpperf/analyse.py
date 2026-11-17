@@ -27,6 +27,7 @@ Expectations checked:
     basic response: no loss, no 'invalid'.
 """
 import csv
+import random
 import math
 import os
 import re
@@ -36,6 +37,31 @@ LINE_RATE = 1e8 / (8 * (8 + 94 + 12))  # 90-byte frames, requests/s
 LIMIT = 8
 LEAK = 1 / 16
 WARMUP = 2
+
+MASK = (1 << 64) - 1
+TEST_SECRET = 0x1F2E_3D4C_5B6A_7988   # config::Test (the bridge's RATE_SECRET)
+BOARD_SECRET = 0xA5C3_9E27_4B1D_6F83  # config::Board
+NET = (172 << 24) | (18 << 16)        # ntpperf -s 172.18.0.0/16
+
+
+def splitmix64(x):
+    z = (x + 0x9E3779B97F4A7C15) & MASK
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK
+    return z ^ (z >> 31)
+
+
+def rl_index(key, secret):
+    """ntp_server.rs rl_index: top 12 bits of m * key + rotl32(m) ^ WEYL."""
+    m = splitmix64(secret) | 1
+    b = (((m << 32) | (m >> 32)) & MASK) ^ 0x9E3779B97F4A7C15
+    return ((m * key + b) & MASK) >> 52
+
+
+def ip_of(s):
+    a = [int(x) for x in s.split(".")]
+    return (a[0] << 24) | (a[1] << 16) | (a[2] << 8) | a[3]
+
 
 ROW = re.compile(
     r"^(\d+)\s+(\d+)\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)%\s+([\d.]+)%"
@@ -155,9 +181,10 @@ def fmt(s, d=1):
     return f"{s['min']:+.{d}f} / {s['mean']:+.{d}f} / {s['max']:+.{d}f} / {s['sd']:.{d}f}"
 
 
-def limiter_expectation(seg, lim=LIMIT, leak=LEAK):
+def limiter_expectation(seg, lim=LIMIT, leak=LEAK, bucket_of=None):
     """Expected answered fraction of the measured requests (and its sd),
-    from the instants, buckets and windows of every request of the point."""
+    from the instants, buckets and windows of every request of the point.
+    `bucket_of` (source ip -> bucket) replaces the design's buckets."""
     win = {}
     for r in seg:
         if r["qdrop"] == "1" or not r["rx_sfd_ns"]:
@@ -165,7 +192,8 @@ def limiter_expectation(seg, lim=LIMIT, leak=LEAK):
         # Decision ~1 us after the SFD; the design's clock is 10 ns behind
         # the true time; T0 is a whole second.
         w = (int(r["rx_sfd_ns"]) + 1000 - 10) // 1_000_000_000
-        win.setdefault((r["bucket"], w), []).append(r)
+        bk = bucket_of[r["src_ip"]] if bucket_of else r["bucket"]
+        win.setdefault((bk, w), []).append(r)
     p = {}
     for lst in win.values():
         lst.sort(key=lambda r: int(r["rx_sfd_ns"]))
@@ -287,6 +315,23 @@ def main():
             for i, row in enumerate(rows):
                 seg = segs[i] if i < len(segs) else []
                 e = limiter_expectation(seg)
+                srcs = sorted({r["src_ip"] for r in seg})
+                bad = [x for x in srcs[:50] if rl_index(ip_of(x), TEST_SECRET) != int(
+                    next(r["bucket"] for r in seg if r["src_ip"] == x))]
+                if bad:
+                    check(False, f"{j}: Python rl_index differs from the bridge's")
+                own = limiter_expectation(seg, bucket_of={x: i for i, x in enumerate(srcs)})
+                rnd = random.Random(12345)
+                draws = []
+                for _ in range(10):
+                    draws.append(limiter_expectation(
+                        seg, bucket_of={x: rnd.randrange(4096) for x in srcs})["expected"])
+                re_ = sum(draws) / len(draws)
+                lines.append(
+                    f"limiter, rate {row['rate']}: expected lost with the design's hash "
+                    f"{100.0 * (1 - e['expected'] / e['n']):.2f} %, with one bucket per source "
+                    f"{100.0 * (1 - own['expected'] / own['n']):.2f} %, with a uniformly random hash "
+                    f"{100.0 * (1 - re_ / e['n']):.2f} % (mean of 10 draws)")
                 lines.append(
                     f"limiter, rate {row['rate']}: {e['sources']} sources in {e['buckets']} buckets "
                     f"({e['shared']} sources share a bucket, at most {e['maxload']} per bucket); measured "
@@ -310,6 +355,16 @@ def main():
         for j, c, sp, sk, v, w in speed:
             lines.append(f"| {j} | {c:,} | {sp:,} | {sk:,} | {v:.3f} | {w:.0f} |")
         lines.append("")
+    lines += ["## Spread of the rate-limiter hash over consecutive sources", "",
+              "Distinct buckets (of 4096) used by N consecutive IPv4 sources 172.18.0.0 + i "
+              "(ntpperf's clients), design hash `rl_index` with the `Test` and `Board` secrets, "
+              "against a uniformly random function (expectation 4096 (1 - (1 - 1/4096)^N)).", "",
+              "| N | Test secret | Board secret | random function |", "|---|---|---|---|"]
+    for n in (100, 1000, 2500, 3000, 4096, 8000, 16384):
+        t = len({rl_index(NET + i, TEST_SECRET) for i in range(n)})
+        bd = len({rl_index(NET + i, BOARD_SECRET) for i in range(n)})
+        lines.append(f"| {n} | {t} | {bd} | {4096 * (1 - (1 - 1 / 4096) ** n):.0f} |")
+    lines.append("")
     lines += ["## Checks", ""]
     lines += [f"- FAIL: {f}" for f in fails] if fails else ["all checks passed"]
     out = "\n".join(lines) + "\n"
