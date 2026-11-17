@@ -375,6 +375,30 @@ pub struct ClockFilter {
     /// for every age (one symbolic age instead of eight copies: the solver
     /// does not finish on the eight copies together).
     pub m_w: Reg<U<3>>,
+    /// Witness memory address `{peer, slot}` of the frame properties (same
+    /// idle counter argument, 32 values), and what the memories held at the
+    /// witness address of the next cycle, with the only writes allowed.
+    pub m_wa: Reg<U<5>>,
+    pub q_off: Reg<U<64>>,
+    pub q_dly: Reg<U<64>>,
+    pub q_dsp: Reg<U<64>>,
+    pub q_t4: Reg<U<64>>,
+    pub q_head: Reg<U<3>>,
+    pub q_reach: Reg<U<8>>,
+    pub q_tnow: Reg<U<64>>,
+    pub q_meta: Reg<U<106>>,
+    pub q_hv: Reg<Bit>,
+    pub q_tlast: Reg<U<64>>,
+    pub q_roff: Reg<U<64>>,
+    pub q_rdly: Reg<U<64>>,
+    pub q_rdsp: Reg<U<64>>,
+    pub q_rjit: Reg<U<64>>,
+    pub q_ws: Reg<Bit>,
+    pub q_tk: Reg<Bit>,
+    pub q_tks: Reg<Bit>,
+    pub q_acc: Reg<Bit>,
+    /// The `q_*` monitors hold a snapshot (0 in the cycle after a reset: the memories are not reset).
+    pub q_v: Reg<Bit>,
     // Per stage storage, index {peer, slot}.
     #[distributed]
     pub m_off: Mem<U<64>, 32, DefaultClock>,
@@ -683,6 +707,22 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
             check!(!(send_o & !m_s & Bit::from((self.m_pr.get() & 0x7Fu8) == 0)) | !valid, "a miss that empties reach gives valid = 0");
             check!(!(send_o & m_acc) | (ub0 & Bit::from(o_dly == self.m_dly.read(sx_0)) & Bit::from(self.p_roff.read(cp) == self.m_off.read(sx_0)) & Bit::from(tlast == self.m_t4.read(sx_0))), "PeerStat after an accepted update: offset, delay and t4 of one usable stage");
             check!(!(send_o & m_acc & um_w) | Bit::from(o_dly <= dw), "PeerStat after an accepted update: its delay is the minimum of the usable stages (any age w)");
+            // Frame: what an event may write, for any memory address (witness `m_wa`).
+            let wa = self.m_wa.get();
+            let q_v = self.q_v.get();
+            let wp = wa.slice::<3, 2>();
+            let wa_n = mux(s_idle, wa + U::<5>::from(1u8), wa);
+            let wp_n = wa_n.slice::<3, 2>();
+            // The event of this cycle, from the raw channel heads.
+            let e_s = Bit::from(st == 0) & hs;
+            let e_m = Bit::from(st == 0) & !hs & hm;
+            let e_p = mux(hs, sh.peer, mh);
+            let e_slot = (e_p.zext::<5>() << 3u32) | (self.p_head.read(e_p) - U::<3>::from(1u8)).zext::<5>();
+            check!(!q_v | self.q_ws.get() | (Bit::from(self.m_off.read(wa) == self.q_off.get()) & Bit::from(self.m_dly.read(wa) == self.q_dly.get()) & Bit::from(self.m_dsp.read(wa) == self.q_dsp.get()) & Bit::from(self.m_t4.read(wa) == self.q_t4.get())), "a stage changes only when a sample is taken, and only the slot before the head of its peer");
+            check!(!q_v | self.q_tk.get() | (Bit::from(self.p_head.read(wp) == self.q_head.get()) & Bit::from(self.p_reach.read(wp) == self.q_reach.get())), "head and reach of a peer change only when an event of that peer is taken");
+            check!(!q_v | self.q_tks.get() | (Bit::from(self.p_tnow.read(wp) == self.q_tnow.get()) & Bit::from(self.p_meta.read(wp) == self.q_meta.get())), "tnow and the metadata of a peer change only when a sample of that peer is taken (a miss leaves them)");
+            check!(!q_v | self.q_acc.get() | (!(self.p_hv.read(wp).bit(0) ^ self.q_hv.get()) & Bit::from(self.p_tlast.read(wp) == self.q_tlast.get()) & Bit::from(self.p_roff.read(wp) == self.q_roff.get()) & Bit::from(self.p_rdly.read(wp) == self.q_rdly.get()) & Bit::from(self.p_rdsp.read(wp) == self.q_rdsp.get()) & Bit::from(self.p_rjit.read(wp) == self.q_rjit.get())), "the result of a peer changes only when an update of that peer is accepted");
+            check!(!self.q_acc.get() | (m_acc & Bit::from(cp == wp)), "a result is accepted only for the peer of the event");
             cover!(send_o & m_s & valid & m_acc, "a sample is accepted and reported valid");
             cover!(send_o & !m_s & !valid, "a miss is reported with valid = 0");
             cover!(send_o & m_s & !m_acc, "a sample that is not usable leaves the result unchanged");
@@ -862,6 +902,26 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
                 },
                 pick0 ? m_b0: bj,
                 s_idle ? m_w: w + U::<3>::from(1u8),
+                m_wa: wa_n,
+                q_v: Bit::One,
+                q_off: self.m_off.read(wa_n),
+                q_dly: self.m_dly.read(wa_n),
+                q_dsp: self.m_dsp.read(wa_n),
+                q_t4: self.m_t4.read(wa_n),
+                q_head: self.p_head.read(wp_n),
+                q_reach: self.p_reach.read(wp_n),
+                q_tnow: self.p_tnow.read(wp_n),
+                q_meta: self.p_meta.read(wp_n),
+                q_hv: self.p_hv.read(wp_n).bit(0),
+                q_tlast: self.p_tlast.read(wp_n),
+                q_roff: self.p_roff.read(wp_n),
+                q_rdly: self.p_rdly.read(wp_n),
+                q_rdsp: self.p_rdsp.read(wp_n),
+                q_rjit: self.p_rjit.read(wp_n),
+                q_ws: e_s & Bit::from(e_slot == wa_n),
+                q_tk: (e_s | e_m) & Bit::from(e_p == wp_n),
+                q_tks: e_s & Bit::from(e_p == wp_n),
+                q_acc: Bit::from(st == S_ACC) & Bit::from(cp == wp_n),
                 s_acc ? m_acc: Bit::One,
                 send_o ? {
                     m_busy: Bit::Zero,
