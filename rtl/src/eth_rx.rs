@@ -156,7 +156,7 @@ impl
 {
     async fn run(
         &mut self,
-        (frames, local_mac, sn_low): (Rx<FrameByte>, In<U<48>>, In<U<24>>, Rx<Ts>),
+        (frames, local_mac, sn_low, stamps): (Rx<FrameByte>, In<U<48>>, In<U<24>>, Rx<Ts>),
         (arp_m, arp_p, v4_m, v4_p, v6_m, v6_p): (
             Tx<EthMeta>,
             Tx<FrameByte>,
