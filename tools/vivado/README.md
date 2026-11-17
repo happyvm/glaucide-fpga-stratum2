@@ -38,6 +38,12 @@ Composant : `xc7a100tcsg324-1`. Top : `arty_top_board` (`rtl/hdl/arty_top_board.
 
 Le script échoue (code non nul) si WNS ou WHS est négatif.
 
+Précision : le bitstream est écrit **avant** le contrôle de WNS/WHS. Après un échec, `arty_ntp.bit` existe
+mais correspond à un design qui ne respecte pas le timing : ne le chargez pas sur la carte.
+
+La suite (programmation, lecture des rapports, vérifications sur la carte) est dans
+[../../docs/bringup.md](../../docs/bringup.md).
+
 ## Points à vérifier au premier passage (T5.3)
 
 - `IOB TRUE` sur les entrées MII : `mii_rx` n'a pas de bascule directement sur `eth_rxd`/`eth_rx_dv`/
