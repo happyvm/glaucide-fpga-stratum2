@@ -14,3 +14,4 @@ a frame has at most 1518 bytes (stream contract 3) # stream contract, F0.5 (rtl/
 the step is nought, one or two # toolchain smoke-test unit (formal_smoke): input constraint of a toy unit, no link with the NTP design (reviewed)
 a stream has at most 1518 bytes (stream contract 3) # stream contract, F0.5 (rtl/src/csum.rs; same rule as fcs_check, wording to harmonise)
 local_ip is constant (configuration wire) # static configuration: ConfigSet::LOCAL_IP4 is a constant (rtl/src/config.rs), wired as a constant by top.rs; the unit compares it with registered copies
+a channel holds its head until it is taken # channel protocol (valid/ready registered channel of TxHDL, rtl/src/stream.rs netlist note): a pending transaction is not withdrawn or changed

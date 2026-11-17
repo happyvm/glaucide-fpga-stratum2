@@ -61,7 +61,7 @@
 use crate::stream::{FrameByte, Meta};
 use txhdl::comp::{mux, Clock, DefaultClock, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{assume, check, cover, lower, with, Trace};
 
 /// NTP mode of a server reply (RFC 5905 section 7.3).
 pub const MODE_SERVER: u8 = 4;
@@ -72,6 +72,12 @@ pub struct NtpDemux {
     pub fwd: Reg<Bit>,
     /// Destination of the datagram in progress: 1 = `cli`, 0 = `srv`.
     pub to_cli: Reg<Bit>,
+    // Monitors (check!/cover! only): the first payload byte of the datagram is still to be
+    // taken, and the previous cycle's offered byte (for the channel-stability assumption).
+    pub m_first: Reg<Bit>,
+    pub m_pv: Reg<Bit>,
+    pub m_pt: Reg<Bit>,
+    pub m_pd: Reg<U<8>>,
 }
 
 #[lower]
@@ -121,9 +127,32 @@ impl
                 srv.send(out);
             }
 
+            // ---- formal properties (orchestrator; docs/formal.md, rows "NTP serveur" and "Client NTP") ----
+            assume!(!(self.m_pv.get() & !self.m_pt.get()) | (have & Bit::from(b.data == self.m_pd.get())), "a channel holds its head until it is taken");
+            let first = self.m_first.get();
+            check!(!go | !fwd, "a datagram is decided only between datagrams");
+            check!(!take | fwd, "payload bytes are forwarded only inside a datagram, after its meta");
+            check!(!first | (self.m_pv.get() & !self.m_pt.get()), "the first byte has been offered and not taken");
+            check!(!first | (Bit::from((self.m_pd.get() & 7u8) == MODE_SERVER) == sel), "the datagram's pair matches the mode of its first byte");
+            check!(!first | fwd, "the first byte is pending only inside a datagram");
+            check!(!(take & first) | (is4 == sel), "mode 4 goes to the client pair, every other mode to the server pair");
+            check!(!(go & is4 & !cli_meta.ready()), "the meta of a reply waits for room on the client pair");
+            check!(!(go & !is4 & !srv_meta.ready()), "the meta of a request waits for room on the server pair");
+            check!(!(take & first & !have), "the first byte is a real byte");
+            cover!(go & is4, "a server reply is routed to the client");
+            cover!(go & !is4, "a request is routed to the server");
+            cover!(take & b.last & sel, "a reply datagram is completed");
+            cover!(take & b.last & !sel, "a request datagram is completed");
+            cover!(!room_b & fwd & have, "back-pressure during a datagram");
+
             with!(self <= {
                 go ? { fwd: Bit::One, to_cli: is4 },
                 take & b.last ? fwd: Bit::Zero,
+                go ? m_first: Bit::One,
+                take ? m_first: Bit::Zero,
+                m_pv: have,
+                m_pt: take,
+                m_pd: b.data,
             });
         }
     }
