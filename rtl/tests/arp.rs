@@ -398,7 +398,11 @@ fn output_backpressure() {
     };
     for p in [2usize, 3, 7] {
         let o = run(&s, 1500, |t| t % p == 0);
-        assert_eq!(strip(&o), vec![expected_reply(), expected_reply(), request_frame(0xC000_0240)], "period {p}");
+        // The resolve (t = 5) is decided before the replies: only frame integrity
+        // and count are checked here, the order is covered by the priority test.
+        let mut got = strip(&o);
+        got.sort_by_key(|f| f.0);
+        assert_eq!(got, vec![expected_reply(), expected_reply(), request_frame(0xC000_0240)], "period {p}");
     }
 }
 
