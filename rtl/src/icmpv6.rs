@@ -188,7 +188,7 @@ use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use std::marker::PhantomData;
-use txhdl::{lower, with, Trace};
+use txhdl::{assume, check, cover, lower, with, Trace};
 use txhdl::{Transaction as TransactionDerive, Value as ValueDerive};
 
 /// A neighbor learnt from the wire (output `learn`): IPv6 address and the
@@ -285,6 +285,19 @@ pub struct Icmpv6With<T: ArpTiming> {
     /// Registered (CK0 -> CK1): target == `resolving` while waiting; source == target.
     pub rsv_r: Reg<Bit>,
     pub src_tgt_r: Reg<Bit>,
+    // Monitors (check!/cover! only): an echo reply outstanding, a generated NA/NS outstanding.
+    pub m_out: Reg<Bit>,
+    pub m_gen: Reg<Bit>,
+    pub m_ll: Reg<U<128>>,
+    pub m_gua: Reg<U<128>>,
+    pub m_gv: Reg<Bit>,
+    pub m_mac: Reg<U<48>>,
+    pub m_lv: Reg<Bit>,
+    // Previous-cycle copies (check!/cover! only) for the one-cycle registered comparisons.
+    pub m_rwp: Reg<Bit>,
+    pub m_tgt: Reg<U<128>>,
+    pub m_res: Reg<U<128>>,
+    pub m_tgt_s: Reg<Bit>,
     _t: PhantomData<T>,
 }
 
@@ -564,6 +577,61 @@ impl<T: ArpTiming>
                 });
             }
 
+            // ---- formal properties (orchestrator; docs/formal.md, rows "ICMPv6 / NDP" and "ICMP echo") ----
+            assume!(!have | !b.err | last, "payload: err only together with last (stream contract 2)");
+            assume!(!self.m_lv.get() | (Bit::from(local_ll.get() == self.m_ll.get()) & Bit::from(local_gua.get() == self.m_gua.get()) & (gua_valid.get() == self.m_gv.get()) & Bit::from(local_mac.get() == self.m_mac.get())), "local_ll, local_gua, gua_valid and local_mac are constant (configuration wires)");
+            let m_out = self.m_out.get();
+            let m_gen = self.m_gen.get();
+            let e_req = take & echo_go;
+            let sent_any = send_o | send_p | send_n;
+            // Echo (K1, K2).
+            check!(!(is_ck0 | is_ck1 | is_ck2 | is_ck3 | is_req | is_nao | is_rs0 | is_rs1) | Bit::from(pos == 0), "the message position is 0 outside the reading states");
+            check!(!is_g | Bit::from(pos <= 3), "the gather phase lasts 4 bytes");
+            check!(!(is_nsi | is_ck0 | is_ck1) | (self.h255.get() & self.ml24.get()), "reading or deciding an NS/NA: hop limit 255 and 24 bytes or more were checked on byte 1 (M1)");
+            check!(!is_out | Bit::from(oc <= 3), "the four held echo bytes are counted 0..3");
+            check!(!m_gen | is_nao, "a generated frame is outstanding only while it is output");
+            check!(!is_nao | m_gen, "NAO only with a generated frame outstanding");
+            check!(!m_out | is_g | is_out | is_pass, "an echo reply is outstanding only in the echo states");
+            check!(!(m_out & is_g) | Bit::from(pg == 2) | Bit::from(pg == 3), "gathering with an echo outstanding: bytes 2 or 3 are next");
+            check!(!(is_g & Bit::from(pos >= 2)) | m_out, "past byte 1 of a message in the gather phase, the echo was accepted");
+            check!(!e_req | !(m_out | m_gen), "no echo request while a reply is outstanding");
+            check!(!e_req | (Bit::from(hi == 128u8) & Bit::from(b.data == 0u8) & self.ml8.get() & !self.mmc.get()), "only an echo request with code 0, 8 bytes or more, not to a multicast group, is answered");
+            check!(!(send_o & Bit::from(oc == 0)) | Bit::from(data == 0x81u8), "echo reply type is 129");
+            check!(!(send_o & Bit::from(oc == 1)) | Bit::from(data == 0u8), "echo reply code is 0");
+            check!(!(is_out & Bit::from(oc == 0)) | (Bit::from(oreg.slice::<24, 8>() == 0x81u8) & Bit::from(oreg.slice::<16, 8>() == 0u8)), "held reply bytes: type 129, code 0");
+            check!(!(is_out & Bit::from(oc == 1)) | Bit::from(oreg.slice::<24, 8>() == 0u8), "held reply bytes: code 0");
+            // Sequencing: a request is followed by exactly one frame, no byte outside one.
+            check!(!sent_any | m_out | m_gen, "a payload byte is only sent for a request already sent");
+            check!(!(is_out | is_pass) | m_out, "echo states only with a reply outstanding");
+            check!(!is_nao | m_gen, "NA/NS output only with a generated frame outstanding");
+            check!(!req_go | !(m_out | m_gen), "no generated request while a frame is outstanding");
+            check!(!is_nao | Bit::from(oc <= 31), "a generated frame has 32 bytes");
+            check!(!(send_n & Bit::from(oc == 31)) | last_o, "last on the 32nd byte of a generated frame");
+            check!(!(send_n & last_o) | Bit::from(oc == 31), "last only on the 32nd byte of a generated frame");
+            check!(!(sent_any & err_o) | last_o, "err only together with last (stream contract 2)");
+            check!(!send_n | !err_o, "a generated frame never carries err");
+            // Neighbor advertisement (M1-M6): only for an NS that passed the checks, to our address.
+            check!(!is_ck1 | self.gd.get(), "CK1 only after a good verdict (checksum, well formed, no err)");
+            check!(!(is_ck1 & !isna & ok_ns) | (self.h255.get() & self.ml24.get() & own & notmc), "an NS is answered only with hop limit 255, 24 bytes or more, target ours and not multicast (M1, M2)");
+            check!(!((is_ck2 | is_ck3 | is_req) & !gsol) | (own_n & notmc_n), "while an NA is being built the target stays one of our addresses, not multicast");
+            check!(!(req_go & !gsol) | (own_n & notmc_n), "an NA is built only for one of our addresses, not multicast");
+            // Learning (F5/F6): only an NA that answers our outstanding solicitation.
+            check!(!lrn_go | (isna & self.h255.get() & self.ml24.get() & self.gd.get() & !sbad & notmc), "learn only from a well formed NA with hop limit 255 (N4)");
+            // `rsv_r` and `src_tgt_r` are registered one cycle before CK1 uses them: the target and
+            // the address being resolved cannot change in between, and the wait flag may have
+            // dropped (timeout) in that very cycle, so the learn is allowed one cycle after it.
+            check!(Bit::from(self.rsv_r.get() == (self.m_rwp.get() & Bit::from(self.m_tgt.get() == self.m_res.get()))), "rsv_r is the previous cycle's comparison");
+            check!(!is_ck1 | (Bit::from(tgt == self.m_tgt.get()) & Bit::from(self.resolving.get() == self.m_res.get())), "the target and the address being resolved are stable in CK1");
+            check!(Bit::from(self.src_tgt_r.get() == Bit::from(self.m_tgt_s.get())), "src_tgt_r is the previous cycle's comparison");
+            check!(!lrn_go | (self.na_s.get() & Bit::from(msrc == tgt) & Bit::from(tgt == self.resolving.get()) & (self.rs_wait.get() | self.m_rwp.get())), "learn only a solicited NA for the target being resolved, sent from the target, while waiting or in the cycle after the wait expired (F5)");
+            check!(!rs_go | !own, "never solicit one of our own addresses (N3)");
+            cover!(e_req, "an echo is answered");
+            cover!(req_go & !gsol, "an NA is built");
+            cover!(req_go & gsol, "an NS is generated");
+            cover!(lrn_go, "a neighbor is learned");
+            cover!(is_ck1 & isna & !need_na, "an unsolicited NA is not learned");
+            cover!(send_n & last_o, "a generated frame is completed");
+
             let to_out = take & ((p2 & last) | p3);
             let end_in = take
                 & last
@@ -572,6 +640,19 @@ impl<T: ArpTiming>
             let end_out = send_o & Bit::from(oc == 3) & abort;
             let end_all = end_in | end_out;
             with!(self <= {
+                m_rwp: self.rs_wait.get(),
+                m_tgt: tgt,
+                m_res: self.resolving.get(),
+                m_tgt_s: Bit::from(msrc == tgt),
+                m_ll: local_ll.get(),
+                m_gua: local_gua.get(),
+                m_gv: gua_valid.get(),
+                m_mac: local_mac.get(),
+                m_lv: Bit::One,
+                e_req ? m_out: Bit::One,
+                sent_any & last_o ? m_out: Bit::Zero,
+                req_go ? m_gen: Bit::One,
+                n_end ? m_gen: Bit::Zero,
                 take ? {
                     pos: pos + U::<16>::from(1u16),
                     hi: b.data,
