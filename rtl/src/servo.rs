@@ -99,7 +99,8 @@
 //! **Process** (sequential, see « Arithmetic »): in cycle P `tl = now_s`,
 //! `pl = pn`, `muv` = 1, `tr = freq` (the old slew stops at once), and the
 //! state registers are written as in the table. In cycle FIN the new `freq`
-//! and `tr` are written.
+//! is written, in cycle FIN2 the new `tr` (from the registered `freq`: the
+//! path `mp -> freq -> tr` is split over two cycles, task T5.3).
 //!
 //! # Arithmetic of « process » (bit exact with `Servo._process`)
 //!
@@ -152,14 +153,17 @@
 //!   clock shows the step in P+2 (its own one-cycle latency); `trim` =
 //!   `freq` from P+1. IDLE again in P+1.
 //! * process: phases MUL1 (30 cycles, P+1..P+30), SHR (`pn` cycles), MUL2
-//!   (17 cycles), FIN (1 cycle): `state` new in P+1, `trim` = old `freq` in
-//!   P+1 .. P+48+pn, the new `trim` from cycle **P + 49 + pn** (53..59
-//!   cycles), when the unit is IDLE again and may pop the next event. The
+//!   (17 cycles), FIN and FIN2 (1 cycle each): `state` new in P+1, `trim` =
+//!   old `freq` in P+1 .. P+49+pn, the new `trim` from cycle **P + 50 + pn**
+//!   (54..60 cycles), when the unit is IDLE again and may pop the next
+//!   event. (If the slew of the previous update has already expired in
+//!   FIN2, `trim` = `freq` shows the new `freq` one cycle earlier, from
+//!   P + 49 + pn.) The
 //!   clock applies a trim one cycle after it is driven (clock.rs).
 //!
 //! An event sent on the channel in cycle n (TxHDL `chan`) is popped in cycle
 //! n+1 at the earliest (tests `cycles_per_event`, `back_to_back_events_are_paced`).
-//! Bound: at most 59 cycles per event (poll 10), 1 cycle for an ignored one.
+//! Bound: at most 60 cycles per event (poll 10), 1 cycle for an ignored one.
 //!
 //! # Closed-loop behaviour
 //!
@@ -239,7 +243,7 @@ pub const POLL_MAX: u8 = 10;
 /// Cycles from the pop of a processed event to the first cycle showing the
 /// new trim (and the first cycle the unit can pop again).
 pub const fn process_cycles(poll: u8) -> u64 {
-    1 + MUL1_CYCLES as u64 + poll as u64 + MUL2_CYCLES as u64 + 1
+    1 + MUL1_CYCLES as u64 + poll as u64 + MUL2_CYCLES as u64 + 2
 }
 
 // Phases of the sequencer.
@@ -248,6 +252,7 @@ const MUL1: u8 = 1;
 const SHR: u8 = 2;
 const MUL2: u8 = 3;
 const FIN: u8 = 4;
+const FIN2: u8 = 5;
 
 const SIGN32: u32 = 1 << 31;
 const BIAS_HI: u32 = SIGN32 + MAXTRIM;
@@ -366,7 +371,7 @@ pub fn clamp_trim(x: U<32>) -> U<32> {
 pub struct Servo {
     /// Discipline state (NSET, SPIK, FREQ, SYNC, PANIC).
     pub st: Reg<U<3>>,
-    /// Sequencer phase (IDLE, MUL1, SHR, MUL2, FIN) and its counter.
+    /// Sequencer phase (IDLE, MUL1, SHR, MUL2, FIN, FIN2) and its counter.
     pub ph: Reg<U<3>>,
     pub cnt: Reg<U<5>>,
     /// Integrator (signed trim LSB) and the trim with the slew.
@@ -563,7 +568,9 @@ impl
                 f1,
             );
             let fnew = mux(sg_r, f_neg, f_pos);
-            let trn = clamp_trim(fnew + s);
+            // FIN2: the slew is added to the `freq` written in FIN.
+            let in_fin2 = Bit::from(ph == FIN2);
+            let trn = clamp_trim(freq + s);
 
             with!(self <= {
                 se: Bit::Zero,
@@ -622,6 +629,9 @@ impl
                 end_mul2 ? ph: U::<3>::from(FIN),
                 in_fin ? {
                     freq: fnew,
+                    ph: U::<3>::from(FIN2),
+                },
+                in_fin2 ? {
                     tr: trn,
                     ph: U::<3>::from(IDLE),
                 },

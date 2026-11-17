@@ -18,8 +18,8 @@
 //! 1. Idle: a `req` is taken (one per datagram, before its payload; payload
 //!    bytes are not taken before). Its fields are registered. Two
 //!    accumulators are seeded in that same cycle from the request, in two
-//!    independent chains of at most 10 additions each (a single
-//!    `pseudo_v6` would chain 19): `acc` = sum of `src_ip` + `sport` +
+//!    independent sums, each a balanced tree of additions (at most 4 deep,
+//!    task T5.3; a single `pseudo_v6` chain would be 19 long): `acc` = sum of `src_ip` + `sport` +
 //!    `dport`; `acc2` = sum of `dst_ip` + 33, where 33 = next header 17 +
 //!    16, the latter being the length (`8 + n`) counted twice (pseudo-header
 //!    and UDP header) without its variable part `2 n`.
@@ -174,10 +174,8 @@ impl Unit<(Rx<Udp6TxReq>, Rx<FrameByte>), (Tx<Ip6TxReq>, Tx<FrameByte>)> for Udp
             let r = req.head();
             let take_r = is_idle & Bit::from(req.peek().is_some());
             let _ = req.recv_if(take_r);
-            let seed_a = csum_add(
-                csum_add(words8_into(U::<32>::from(0u32), r.src_ip), r.sport),
-                r.dport,
-            );
+            // Balanced (task T5.3): the same integer as the chain.
+            let seed_a = words8_into(csum_add(r.sport.zext::<32>(), r.dport), r.src_ip);
             let seed_b = words8_into(U::<32>::from(PROTO_UDP as u32 + 16), r.dst_ip);
 
             // Collect: take every byte, buffer up to 128.

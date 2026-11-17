@@ -21,7 +21,8 @@ primitive.
 Delay model (an indicator, NOT a timing analysis; no placement, routing or fanout):
     delay = 1.0 ns (clock-to-q + setup) + 0.6 ns per LUT level (logic + average net)
             + 0.1 ns per CARRY4 + 0.3 ns per MUXF7/MUXF8
-            (+ 1.5 ns from a block-RAM output, + 3.0 ns through an unregistered DSP48E1)
+            (+ 1.5 ns from a block-RAM output; inside a DSP48E1: A/B -> M 2.0 ns,
+            M/C/PCIN -> P 1.3 ns, each stage cut by its AREG/BREG, MREG, PREG register)
 LUT-RAM / SRL read (address -> data) counts as one LUT level. Input ports start at 0 ns
 and output ports end paths (reported apart: in the full design they continue in the
 neighbouring module, which is why the board top is analysed too).
@@ -33,7 +34,8 @@ Usage: estimate_timing.py [-n N] [--json FILE] [files...]
 import argparse, glob, json, os, re, sys, tempfile
 from collections import defaultdict
 
-T_FIXED, T_LUT, T_CARRY, T_MUXF, T_BRAM, T_DSP = 1.0, 0.6, 0.1, 0.3, 1.5, 3.0
+T_FIXED, T_LUT, T_CARRY, T_MUXF, T_BRAM = 1.0, 0.6, 0.1, 0.3, 1.5
+T_DSP_MUL, T_DSP_ADD = 2.0, 1.3  # DSP48E1: A/B -> M (multiplier), M/C/PCIN -> P (post-adder)
 MACC = False  # --yosys-macc: let Yosys merge chained additions (optimistic vs Vivado)
 NEG = -1e9  # arrival of a startpoint that is not in the launching domain being analysed
 BUFS = ("BUFG", "BUFGCE", "BUFH", "BUFR", "IBUF", "IBUFG", "BUFIO", "BUFHCE", "BUFGCTRL")
@@ -108,7 +110,7 @@ def analyse(mod):
         out += paths
         path_of = path_of or {}
         path_of[d] = po
-    return out, lambda p: path_of[p["start_dom"]](p["bit"])
+    return out, lambda p: path_of[p["start_dom"]](p["node"])
 
 
 def _analyse(mod, active):
@@ -131,10 +133,15 @@ def _analyse(mod, active):
                     if not isinstance(b, str):
                         driver[b] = (cn, c)
 
+    CLKPINS = ("C", "CLK", "WCLK", "CLKARDCLK", "CLKBWRCLK")
+
     # Clock domain of every sequential cell: trace its clock pin back through buffers.
     def clk_of(c):
         conn = c["connections"]
-        pin = next((p for p in ("C", "CLK", "WCLK", "CLKARDCLK", "CLKBWRCLK") if p in conn), None)
+        k = kind(c["type"])
+        pins = {"ff": ("C",), "dsp": ("CLK",), "lutram": ("WCLK", "CLK"),
+                "bram": ("CLKARDCLK", "CLKBWRCLK")}.get(k, CLKPINS)
+        pin = next((p for p in pins if p in conn), None)
         if pin is None:
             return "?"
         b = conn[pin][0]
@@ -147,130 +154,162 @@ def _analyse(mod, active):
             b = next(x for p, x in dc["connections"].items() if dc["port_directions"][p] == "input")[0]
         return nm(b) if not isinstance(b, str) else b
 
-    # Startpoints: (arrival, luts, carries, muxf, start label, start domain)
+    def param(c, k):
+        v = str(c.get("parameters", {}).get(k, "0"))
+        return int(v, 2) if set(v) <= {"0", "1"} else int(v)
+
+    def bits_of(c, pins):
+        return [b for p in pins if p in c["connections"] for b in c["connections"][p]
+                if not isinstance(b, str)]
+
+    # Arrival of a node: (delay, luts, carry4, muxf, start label, start domain, predecessor).
+    # Nodes are netlist bits, plus ("A"|"Min"|"M"|"Pin", cell) inside a DSP48E1.
     arr = {}
     for pn, p in mod["ports"].items():
         if p["direction"] == "input":
-            for i, b in enumerate(p["bits"]):
+            for b in p["bits"]:
                 if not isinstance(b, str):
                     arr[b] = (0.0 if active == "port" else NEG, 0, 0, 0, f"in:{pn}", "port", None)
 
-    def startpoint(b, c, extra=0.0):
+    def start(c, label, extra=0.0):
         d = clk_of(c)
-        arr[b] = (extra if active == d else NEG, 0, 0, 0, nm(b), d, None)
+        return (extra if active == d else NEG, 0, 0, 0, label, d, None)
 
-    seq_cells = []
-    for cn, c in mod["cells"].items():
+    seq_cells = [(cn, c, kind(c["type"])) for cn, c in mod["cells"].items()
+                 if kind(c["type"]) in ("ff", "lutram", "bram", "dsp", "box")]
+    dsp_cells = {cn: c for cn, c, k in seq_cells if k == "dsp"}
+    DSP_AB = ("A", "B", "ACIN", "BCIN", "D")
+    DSP_PC = ("C", "PCIN", "CARRYIN", "CARRYCASCIN", "MULTSIGNIN")
+
+    def deps(x):
+        """(input nodes, extra delay, counter to bump, or a fixed arrival) of node x."""
+        if isinstance(x, tuple):
+            st, cn = x
+            if st == "W":
+                return start(mod["cells"][cn], f"{cn}(ram)")
+            c = dsp_cells[cn]
+            if st == "A":
+                if param(c, "AREG") or param(c, "BREG"):
+                    return start(c, f"{cn}.AREG")
+                return bits_of(c, DSP_AB), 0.0, None
+            if st == "Min":
+                return [("A", cn)], T_DSP_MUL, "dsp"
+            if st == "M":
+                return start(c, f"{cn}.MREG") if param(c, "MREG") else ([("Min", cn)], 0.0, None)
+            if st == "Pin":
+                return [("M", cn)] + bits_of(c, DSP_PC), T_DSP_ADD, None
+        if x not in driver:
+            return (NEG, 0, 0, 0, "const/undriven", "port", None)
+        cn, c = driver[x]
         k = kind(c["type"])
-        if k in ("ff", "lutram", "bram", "dsp", "box"):
-            seq_cells.append((cn, c, k))
-            for p, bits in c["connections"].items():
-                if c["port_directions"].get(p) != "output":
-                    continue
-                for b in bits:
-                    if isinstance(b, str):
-                        continue
-                    if k == "ff" or k == "box" or (k == "lutram" and p.startswith("Q") and c["type"].startswith("SRL")):
-                        startpoint(b, c)
-                    elif k == "bram":
-                        startpoint(b, c, T_BRAM)
-                    elif k == "dsp":
-                        pass  # handled below
-    # DSP48E1: registered if any of AREG/BREG/MREG/PREG is set; otherwise combinational.
-    def dsp_regd(c):
-        pr = c.get("parameters", {})
-        return any(int(str(pr.get(k, "0")), 2) if set(str(pr.get(k, "0"))) <= {"0", "1"} else int(pr.get(k, 0)) for k in ("MREG", "PREG"))
-    for cn, c, k in seq_cells:
-        if k == "dsp" and dsp_regd(c):
-            for p, bits in c["connections"].items():
-                if c["port_directions"].get(p) == "output":
-                    for b in bits:
-                        if not isinstance(b, str):
-                            startpoint(b, c)
-
-    sys.setrecursionlimit(1000000)
-
-    def comb_inputs(c, k, out_port):
-        conn, dirs = c["connections"], c["port_directions"]
-        ins = [p for p in conn if dirs.get(p) == "input"]
+        if k in ("ff", "bram", "box"):
+            return start(c, nm(x), T_BRAM if k == "bram" else 0.0)
         if k == "lutram":
-            # asynchronous read: address pins -> data out
-            ins = [p for p in ins if re.match(r"(A\d*|ADDR[A-D]|DPRA\d*)$", p)]
-        return [b for p in ins for b in conn[p] if not isinstance(b, str)]
+            if c["type"].startswith("SRL"):
+                return start(c, nm(x))
+            # Asynchronous read: the read address of this output -> data out, and the
+            # stored data, launched by the write clock (node ("W", cell)).
+            port = next(p for p, bs in c["connections"].items() if x in bs)
+            if re.fullmatch(r"DO[A-D]", port):
+                ins = ["ADDR" + port[2]]
+            elif port == "DPO":
+                ins = [p for p in c["connections"] if p.startswith("DPRA")]
+            else:  # SPO, O: the write address
+                ins = [p for p in c["connections"] if re.fullmatch(r"A\d*", p)]
+            return bits_of(c, ins) + [("W", cn)], T_LUT, "lut"
+        if k == "dsp":
+            port = next(p for p, bs in c["connections"].items() if x in bs)
+            if port.startswith(("ACOUT", "BCOUT")):
+                return [("A", cn)], 0.0, None
+            if param(c, "PREG"):
+                return start(c, nm(x))
+            return [("Pin", cn)], 0.0, None
+        ins = [p for p in c["connections"] if c["port_directions"].get(p) == "input"]
+        cost = {"lut": (T_LUT, "lut"), "carry": (T_CARRY, "carry"), "muxf": (T_MUXF, "muxf")}
+        d, ctr = cost.get(k, (0.0, None))
+        return bits_of(c, ins), d, ctr
 
     def get(b):
-        # iterative DFS to compute arrival of bit b
+        # Iterative DFS: arrival of node b.
         stack = [b]
         while stack:
             x = stack[-1]
             if x in arr:
                 stack.pop()
                 continue
-            if x not in driver:
-                arr[x] = (NEG, 0, 0, 0, "const/undriven", "port", None)
+            dp = deps(x)
+            if len(dp) == 7:
+                arr[x] = dp
                 stack.pop()
                 continue
-            cn, c = driver[x]
-            k = kind(c["type"])
-            if k in ("ff", "bram", "box") or (k == "dsp" and dsp_regd(c)):
-                d = clk_of(c)
-                arr[x] = (0.0 if active == d else NEG, 0, 0, 0, nm(x), d, None)
-                stack.pop()
-                continue
-            ins = comb_inputs(c, k, None)
+            ins, d, ctr = dp
             pend = [i for i in ins if i not in arr]
             if pend:
                 stack.extend(pend)
                 continue
             best = None
             for i in ins:
-                a = arr[i]
-                if best is None or (a[0], a[1]) > (best[0][0], best[0][1]):
-                    best = (a, i)
+                if best is None or (arr[i][0], arr[i][1]) > (arr[best][0], arr[best][1]):
+                    best = i
             if best is None:
-                a, i = (NEG, 0, 0, 0, "const", "port", None), None
+                arr[x] = (NEG, 0, 0, 0, "const", "port", None)
             else:
-                a, i = best
-            t, l, cy, mx = a[0], a[1], a[2], a[3]
-            if k in ("lut", "lutram"):
-                t, l = t + T_LUT, l + 1
-            elif k == "carry":
-                t, cy = t + T_CARRY, cy + 1
-            elif k == "muxf":
-                t, mx = t + T_MUXF, mx + 1
-            elif k == "dsp":
-                t = t + T_DSP
-            for ob in (bb for p, bits in c["connections"].items() if c["port_directions"].get(p) == "output" for bb in bits):
-                if not isinstance(ob, str):
-                    arr[ob] = (t, l, cy, mx, a[4], a[5], i)
+                t, l, cy, mx, s0, d0, _ = arr[best]
+                l += ctr == "lut"
+                cy += ctr == "carry"
+                mx += ctr == "muxf"
+                arr[x] = (t + d, l, cy, mx, s0, d0, best)
             stack.pop()
         return arr[b]
 
-    # Endpoints: every input pin of a sequential cell (except clocks), output ports.
-    ends = []  # (endpoint label, domain, bit)
+    # Endpoints: every input pin of a sequential cell (except clocks), the internal
+    # registers of a DSP48E1, output ports.
+    ends = []  # (endpoint label, domain, node)
     for cn, c, k in seq_cells:
         dom = clk_of(c)
+        q = next((x for pp, xs in c["connections"].items() if c["port_directions"].get(pp) == "output"
+                  for x in xs if not isinstance(x, str)), None)
+        label = nm(q) if q is not None else cn
+        if k == "lutram" and (q is None or names.get(q, (1,))[0]):
+            # anonymous LUT-RAM output: name it after the public net on its data input
+            di = next((b for p in ("DIA", "DI", "D") if p in c["connections"]
+                       for b in c["connections"][p] if not isinstance(b, str)
+                       and not names.get(b, (1,))[0]), None)
+            label = f"ram<-{nm(di)}" if di is not None else f"ram:{cn}"
+        if k == "dsp":
+            pins = [p for p in c["connections"] if c["port_directions"].get(p) == "input"
+                    and p not in CLKPINS and p not in DSP_AB + DSP_PC]
+            if param(c, "AREG") or param(c, "BREG"):
+                pins += [p for p in DSP_AB if p in c["connections"]]
+            for b in bits_of(c, pins):
+                ends.append((f"{label}.ctl", dom, b))
+            if param(c, "MREG"):
+                ends.append((f"{label}.MREG", dom, ("Min", cn)))
+            if param(c, "PREG"):
+                ends.append((f"{label}.PREG", dom, ("Pin", cn)))
+            continue
         for p, bits in c["connections"].items():
-            if c["port_directions"].get(p) != "input" or p in ("C", "CLK", "WCLK", "CLKARDCLK", "CLKBWRCLK"):
-                continue
-            if k == "dsp" and not dsp_regd(c):
+            if c["port_directions"].get(p) != "input" or p in CLKPINS:
                 continue
             for b in bits:
-                if isinstance(b, str):
-                    continue
-                q = next((x for pp, xs in c["connections"].items() if c["port_directions"].get(pp) == "output" for x in xs if not isinstance(x, str)), None)
-                label = nm(q) if q is not None else cn
-                ends.append((f"{label}.{p}" if k != "ff" else label, dom, b))
+                if not isinstance(b, str):
+                    ends.append((f"{label}.{p}" if k != "ff" else label, dom, b))
     for pn, p in mod["ports"].items():
         if p["direction"] == "output":
-            for i, b in enumerate(p["bits"]):
+            for b in p["bits"]:
                 if not isinstance(b, str):
                     ends.append((f"out:{pn}", "port", b))
 
     def path_of(b):
+        # Cell types along the path, with the public net names it goes through.
         out = []
         while b is not None:
-            out.append(nm(b))
+            if isinstance(b, tuple):
+                out.append("RAM" if b[0] == "W" else f"DSP48E1.{b[0]}")
+            else:
+                hidden, n = names.get(b, (1, ""))
+                t = driver[b][1]["type"] if b in driver and arr[b][6] is not None else ""
+                out.append((t + (f"({n})" if not hidden else "")) or n)
             b = arr[b][6]
         return out[::-1]
 
@@ -283,8 +322,16 @@ def _analyse(mod, active):
         if a[0] < 0:
             continue
         paths.append(dict(delay=round(a[0] + T_FIXED, 2), luts=a[1], carry=a[2], muxf=a[3],
-                          start=a[4], start_dom=a[5], end=label, end_dom=dom, bit=b))
+                          start=a[4], start_dom=a[5], end=label, end_dom=dom, node=b))
     return paths, path_of, doms
+
+
+def owner(end):
+    """Unit instance of an endpoint label: the hierarchical prefix of its register."""
+    n = re.sub(r"^ram<-", "", end)
+    n = re.sub(r"\[\d+\]", "", n)
+    n = re.sub(r"\.(PREG|MREG|ctl|[A-Z][A-Z0-9]*)$", "", n)
+    return n.rsplit(".", 1)[0] if "." in n else "(top)"
 
 
 def base(s):
@@ -357,6 +404,23 @@ def one_file(f, a):
         if a.end:
             for p in worst_per_end([p for p in lst if re.search(a.end, p["end"])], a.n):
                 out.append(f"{'':26}{'(--end)':10}{'':>6}  {fmt(p)}")
+                if a.path:
+                    out.append("      path: " + " > ".join(path_of(p)))
+    if label.startswith("top"):
+        # Board top: the worst path per unit instance (owner of the endpoint register).
+        for dom, lst in sorted(regs.items()):
+            seen = {}
+            for p in lst:
+                seen.setdefault(owner(p["end"]), p)
+            out.append(f"  per unit, domain {dom}:")
+            for o, p in sorted(seen.items(), key=lambda kv: -kv[1]["delay"]):
+                if p["delay"] < a.unit_min:
+                    break
+                out.append(f"    {o:34}{p['delay']:5.1f} ns {p['luts']:3} LUT {p['carry']:3} CARRY4  "
+                           f"{p['start']} -> {p['end']}")
+                if a.path:
+                    out.append("      path: " + " > ".join(path_of(p)))
+            res.setdefault("units", {})[dom] = {o: p for o, p in seen.items()}
     if ports:
         out.append(f"{'':26}{'(ports)':10}{'':>6}  worst port path: {fmt(ports[0])}")
     for c in worst_per_end(cross, a.n):
@@ -372,6 +436,8 @@ def main():
     ap.add_argument("--yosys-macc", action="store_true",
                     help="let Yosys merge chained additions into carry-save trees")
     ap.add_argument("--end", help="also print the worst path to endpoints matching this regex")
+    ap.add_argument("--unit-min", type=float, default=6.0,
+                    help="board top: list the units whose worst path is at least this (ns)")
     ap.add_argument("-j", type=int, default=1, help="files analysed in parallel")
     ap.add_argument("files", nargs="*")
     a = ap.parse_args()

@@ -91,42 +91,43 @@ pub fn csum_fold(acc: U<32>) -> U<16> {
     x2.slice::<0, 16>()
 }
 
-/// Sums the eight 16-bit words of a 128-bit address into `acc`.
+/// Sum of the eight 16-bit words of a 128-bit address, as a balanced tree
+/// of additions (depth 3, task T5.3): the same integer as a chain, since
+/// no partial sum can wrap (at most `8 * 0xFFFF`).
 #[lower]
-fn words8(acc: U<32>, x: U<128>) -> U<32> {
-    let a0 = csum_add(acc, x.slice::<0, 16>());
-    let a1 = csum_add(a0, x.slice::<16, 16>());
-    let a2 = csum_add(a1, x.slice::<32, 16>());
-    let a3 = csum_add(a2, x.slice::<48, 16>());
-    let a4 = csum_add(a3, x.slice::<64, 16>());
-    let a5 = csum_add(a4, x.slice::<80, 16>());
-    let a6 = csum_add(a5, x.slice::<96, 16>());
-    csum_add(a6, x.slice::<112, 16>())
+pub fn sum8(x: U<128>) -> U<32> {
+    let b0 = csum_add(x.slice::<0, 16>().zext::<32>(), x.slice::<16, 16>());
+    let b1 = csum_add(x.slice::<32, 16>().zext::<32>(), x.slice::<48, 16>());
+    let b2 = csum_add(x.slice::<64, 16>().zext::<32>(), x.slice::<80, 16>());
+    let b3 = csum_add(x.slice::<96, 16>().zext::<32>(), x.slice::<112, 16>());
+    (b0 + b1) + (b2 + b3)
 }
 
 /// Unfolded sum of the RFC 768 pseudo-header for IPv4: source, destination
 /// (IPv4 in the low 32 bits of the arguments' words), zero and protocol as
-/// one word, upper-layer length. Result in `0..=6 * 0xFFFF`.
+/// one word, upper-layer length. Result in `0..=6 * 0xFFFF`. A balanced
+/// tree of additions (depth 3, task T5.3): no partial sum wraps, so it is
+/// the plain integer sum of the six words.
 #[lower]
 pub fn pseudo_v4(src: U<32>, dst: U<32>, proto: U<8>, len: U<16>) -> U<32> {
-    let a0 = csum_add(U::<32>::from(0u32), src.slice::<0, 16>());
-    let a1 = csum_add(a0, src.slice::<16, 16>());
-    let a2 = csum_add(a1, dst.slice::<0, 16>());
-    let a3 = csum_add(a2, dst.slice::<16, 16>());
-    let a4 = csum_add(a3, proto.zext::<16>());
-    csum_add(a4, len)
+    let a = csum_add(src.slice::<0, 16>().zext::<32>(), src.slice::<16, 16>());
+    let b = csum_add(dst.slice::<0, 16>().zext::<32>(), dst.slice::<16, 16>());
+    let c = csum_add(proto.zext::<32>(), len);
+    (a + b) + c
 }
 
 /// Unfolded sum of the RFC 8200 section 8.1 pseudo-header for IPv6: source,
 /// destination, 32-bit upper-layer length, three zero bytes and the next
-/// header (one word `0x00NN`). Result in `0..=19 * 0xFFFF`.
+/// header (one word `0x00NN`). Result in `0..=19 * 0xFFFF`. A balanced tree
+/// of additions (depth 5 instead of a chain of 19, task T5.3): no partial
+/// sum wraps, so it is the plain integer sum of the nineteen words.
 #[lower]
 pub fn pseudo_v6(src: U<128>, dst: U<128>, next: U<8>, len: U<32>) -> U<32> {
-    let a = words8(U::<32>::from(0u32), src);
-    let b = words8(a, dst);
-    let c = csum_add(b, len.slice::<16, 16>());
-    let d = csum_add(c, len.slice::<0, 16>());
-    csum_add(d, next.zext::<16>())
+    let t = csum_add(
+        csum_add(next.zext::<32>(), len.slice::<16, 16>()),
+        len.slice::<0, 16>(),
+    );
+    (sum8(src) + sum8(dst)) + t
 }
 
 /// UDP over IPv4 (RFC 768): a computed checksum of 0x0000 is sent as 0xFFFF.

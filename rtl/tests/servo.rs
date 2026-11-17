@@ -215,8 +215,8 @@ fn cycles_per_event() {
         let p = s1 - 1;
         let t1 = obs.iter().position(|o| o.trim != 0).unwrap();
         assert_eq!((t1 - p) as u64, process_cycles(pn), "poll {poll}");
-        assert_eq!(process_cycles(pn), 49 + pn as u64);
-        assert!(process_cycles(pn) <= 59);
+        assert_eq!(process_cycles(pn), 50 + pn as u64);
+        assert!(process_cycles(pn) <= 60);
         assert_eq!(signed32(obs[t1].trim), first_slew(off, pn), "poll {poll}");
         assert!(obs[..t1].iter().all(|o| o.trim == 0));
         assert!(obs.iter().all(|o| !o.step_en));

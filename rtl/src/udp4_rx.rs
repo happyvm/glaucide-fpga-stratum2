@@ -162,7 +162,12 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp4Rx {
             let word = mux(odd, (hi.zext::<16>() << 8u32) | lo, lo << 8u32);
             let add = odd | endb;
             let next = mux(add, csum_add(base, word), base);
-            let sum_ok = Bit::from(csum_fold(next) == U::<16>::from(0xFFFFu16));
+            // The verdict is only used on a forwarded byte (state FWD), where
+            // `base` is `acc`: it is computed from `acc` directly, which keeps
+            // the pseudo-header seed off its path (task T5.3; same value
+            // wherever it is used).
+            let next_f = mux(add, csum_add(acc, word), acc);
+            let sum_ok = Bit::from(csum_fold(next_f) == U::<16>::from(0xFFFFu16));
             let ck_good = self.nock.get() | sum_ok;
 
             if (take & p7 & !last).to_bool() {

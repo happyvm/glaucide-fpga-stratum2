@@ -156,18 +156,14 @@ impl Unit<(Rx<UdpTxReq>, Rx<FrameByte>, In<U<32>>), (Tx<IpTxReq>, Tx<FrameByte>)
             let r = req.head();
             let take_r = is_idle & Bit::from(req.peek().is_some());
             let _ = req.recv_if(take_r);
-            let seed = csum_add(
-                csum_add(
-                    pseudo_v4(
-                        local_ip.get(),
-                        r.dst_ip,
-                        U::<8>::from(PROTO_UDP),
-                        U::<16>::from(16u16),
-                    ),
-                    r.sport,
-                ),
-                r.dport,
-            );
+            // Two balanced halves (task T5.3): the same integer as the chain
+            // pseudo-header + sport + dport, no partial sum wraps.
+            let seed = pseudo_v4(
+                local_ip.get(),
+                r.dst_ip,
+                U::<8>::from(PROTO_UDP),
+                U::<16>::from(16u16),
+            ) + csum_add(r.sport.zext::<32>(), r.dport);
 
             // Collect: take every byte, buffer up to 128.
             let pv = Bit::from(payload.peek().is_some());
