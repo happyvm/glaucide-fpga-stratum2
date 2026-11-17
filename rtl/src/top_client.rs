@@ -117,7 +117,6 @@
 //! within a few hundred thousand cycles.
 use crate::arp::{Arp, ArpEntry};
 use crate::clock::{DisciplinedClock, INCR};
-use crate::clocks::{ClkRx, ClkTx};
 use crate::config::{Config, ConfigSet};
 use crate::eth_rx::{EthMeta, EthRx};
 use crate::eth_tx::{EthHdr, EthTx};
@@ -331,7 +330,7 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource> Default for ArtyCoreClien
     }
 }
 
-impl<C: ConfigSet, K: ClockSource> TopCore for ArtyCoreClient<ClkRx, ClkTx, C, K> {}
+impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource> TopCore<R, T> for ArtyCoreClient<R, T, C, K> {}
 
 #[lower]
 impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>

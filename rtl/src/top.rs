@@ -172,8 +172,8 @@ use crate::ipv4_rx::{IpMeta, Ipv4Rx};
 use crate::ipv4_tx::{IpTxReq, Ipv4Tx};
 use crate::ipv6_rx::{Ip6Meta, Ipv6Rx};
 use crate::ipv6_tx::{Ip6TxReq, Ipv6Tx};
-use crate::mii_rx::MiiRx;
-use crate::mii_tx::MiiTx;
+use crate::mii_rx::MiiRxG;
+use crate::mii_tx::MiiTxG;
 use crate::ntp_reply_route::NtpReplyRoute;
 use crate::ntp_server::{NtpReplyMeta, NtpServer};
 use crate::ntp_types::{PeerStat, Sample, Selected};
@@ -1082,22 +1082,15 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
 /// The core of a top (what sits between the MII units): [`ArtyCore`] (the
 /// server path, Phase A) or [`ArtyCoreClient`](crate::top_client::ArtyCoreClient)
 /// (server and NTP client, the stratum-2 board), at the board's MII clocks.
-pub trait TopCore:
-    Unit<
-        (
-            Rx<FrameByte, ClkRx>,
-            In<Bit, ClkRx>,
-            In<Bit, ClkTx>,
-            In<Bit, ClkTx>,
-        ),
-        Tx<FrameByte, ClkTx>,
-    > + Lower
+pub trait TopCore<R: Clock = ClkRx, T: Clock = ClkTx>:
+    Unit<(Rx<FrameByte, R>, In<Bit, R>, In<Bit, T>, In<Bit, T>), Tx<FrameByte, T>>
+    + Lower
     + Port
     + Traceable
     + Default
 {
 }
-impl<C: ConfigSet, S: SyncSource> TopCore for ArtyCore<ClkRx, ClkTx, C, S> {}
+impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource> TopCore<R, T> for ArtyCore<R, T, C, S> {}
 
 /// The design as the board wrapper instantiates it (module `arty_top`),
 /// generic in its core `K` ([`TopCore`]); [`ArtyTop`] is the server-only
@@ -1111,16 +1104,16 @@ impl<C: ConfigSet, S: SyncSource> TopCore for ArtyCore<ClkRx, ClkTx, C, S> {}
 /// go straight into `mii_rx`. The netlist adds the clock inputs `clk`
 /// (`clk_sys`), `clk_rx`, `clk_tx` and `rst`.
 #[derive(Trace)]
-pub struct ArtyTopOf<P: PhyTiming, K: TopCore> {
-    pub mii_rx: MiiRx,
-    pub mii_tx: MiiTx,
+pub struct ArtyTopG<R: Clock, T: Clock, P: PhyTiming, K: TopCore<R, T>> {
+    pub mii_rx: MiiRxG<R>,
+    pub mii_tx: MiiTxG<T>,
     pub phy: PhyInit<P>,
     pub core: K,
 }
 
-impl<P: PhyTiming, K: TopCore> Default for ArtyTopOf<P, K> {
+impl<R: Clock, T: Clock, P: PhyTiming, K: TopCore<R, T>> Default for ArtyTopG<R, T, P, K> {
     fn default() -> Self {
-        ArtyTopOf {
+        ArtyTopG {
             mii_rx: Default::default(),
             mii_tx: Default::default(),
             phy: Default::default(),
@@ -1129,21 +1122,28 @@ impl<P: PhyTiming, K: TopCore> Default for ArtyTopOf<P, K> {
     }
 }
 
+/// The top at the board's MII clocks `ClkRx`/`ClkTx`; [`ArtyTopG`] takes
+/// them as parameters (the pin-level tests simulate the real 25 MHz ratio).
+pub type ArtyTopOf<P, K> = ArtyTopG<ClkRx, ClkTx, P, K>;
+
 /// The server-only top: core [`ArtyCore`] with configuration `C` and
 /// synchronisation source `S` (Phase A; the system tests of `top.rs`).
 pub type ArtyTop<C, S, P> = ArtyTopOf<P, ArtyCore<ClkRx, ClkTx, C, S>>;
+
+/// [`ArtyTop`] with the MII clocks as parameters (pin-level tests).
+pub type ArtyTopClk<R, T, C, S, P> = ArtyTopG<R, T, P, ArtyCore<R, T, C, S>>;
 
 /// The board build: `Board` addresses, never synchronised (Phase A), real
 /// PHY timings.
 pub type ArtyBoard = ArtyTop<crate::config::Board, Standalone, crate::phy_init::Board>;
 
 #[lower]
-impl<P: PhyTiming, K: TopCore>
+impl<R: Clock, T: Clock, P: PhyTiming, K: TopCore<R, T>>
     Unit<
-        (In<U<4>, ClkRx>, In<Bit, ClkRx>, In<Bit, ClkRx>, In<Bit>),
+        (In<U<4>, R>, In<Bit, R>, In<Bit, R>, In<Bit>),
         (
-            Out<U<4>, ClkTx>,
-            Out<Bit, ClkTx>,
+            Out<U<4>, T>,
+            Out<Bit, T>,
             Out<Bit>,
             Out<Bit>,
             Out<Bit>,
@@ -1152,14 +1152,14 @@ impl<P: PhyTiming, K: TopCore>
             Out<Bit>,
             Out<Bit>,
         ),
-    > for ArtyTopOf<P, K>
+    > for ArtyTopG<R, T, P, K>
 {
     async fn run(
         &mut self,
-        (rxd, rx_dv, rx_er, mdio_i): (In<U<4>, ClkRx>, In<Bit, ClkRx>, In<Bit, ClkRx>, In<Bit>),
+        (rxd, rx_dv, rx_er, mdio_i): (In<U<4>, R>, In<Bit, R>, In<Bit, R>, In<Bit>),
         (txd, tx_en, phy_rstn, mdc, mdio_o, mdio_oe, link_up, id_ok, phy_ready): (
-            Out<U<4>, ClkTx>,
-            Out<Bit, ClkTx>,
+            Out<U<4>, T>,
+            Out<Bit, T>,
             Out<Bit>,
             Out<Bit>,
             Out<Bit>,
@@ -1169,11 +1169,11 @@ impl<P: PhyTiming, K: TopCore>
             Out<Bit>,
         ),
     ) {
-        let (raw_tx, raw_rx) = chan::<FrameByte, ClkRx>();
-        let (rsfd_o, rsfd) = signal::<Bit, ClkRx>();
-        let (txf_tx, txf_rx) = chan::<FrameByte, ClkTx>();
-        let (tsfd_o, tsfd) = signal::<Bit, ClkTx>();
-        let (und_o, und) = signal::<Bit, ClkTx>();
+        let (raw_tx, raw_rx) = chan::<FrameByte, R>();
+        let (rsfd_o, rsfd) = signal::<Bit, R>();
+        let (txf_tx, txf_rx) = chan::<FrameByte, T>();
+        let (tsfd_o, tsfd) = signal::<Bit, T>();
+        let (und_o, und) = signal::<Bit, T>();
         join2(
             join2(
                 self.mii_rx.run((rxd, rx_dv, rx_er), (raw_tx, rsfd_o)),
