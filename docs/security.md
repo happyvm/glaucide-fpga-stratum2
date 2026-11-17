@@ -205,12 +205,12 @@ Changement proposé :
 2. Index = `(a · key mod 2^64) >> 52` (hachage multiplication-décalage de Dietzfelbinger, universel : sans connaître `a`, l'attaquant ne sait pas quelles adresses partagent une case), `a: Reg<U<64>>` impair, chargé au reset depuis la source d'entropie de F3 (et renouvelable, par ex. toutes les 2^16 s). Pas de CRC ni de pli XOR, même salés : ils sont linéaires, deux clés y entrent en collision indépendamment du sel. Le produit se calcule en série (2 bits par cycle, 32 cycles, un additionneur de 64 bits) pendant les au moins 48 cycles de RECV ; le mot est lu dès que l'index est prêt, gardé dans un registre, avec contournement si la requête précédente vient d'écrire le même index.
 3. Fuite (F2) : `allowed = unl | (cnt < lim) | (leak_bit & leak_en)` où `leak_bit` est vrai avec probabilité 2^-L.
 
-Effet attendu : la capacité totale passe à 4 096 × 8 = 32 768 réponses/s (proche de la moitié du débit ligne) ; un déni global demande ≈ 37 000 requêtes/s et ne peut plus cibler les cases ; le déni ciblé d'une victime ne fait plus que réduire son service à 1/2^L.
+Effet attendu : la capacité totale passe à 4 096 × 8 = 32 768 réponses/s (≈ 30 % du débit ligne) ; un déni global demande ≈ 37 000 requêtes/s et ne peut plus cibler les cases ; le déni ciblé d'une victime ne fait plus que réduire son service à 1/2^L.
 
 ### F3 — Origin imprévisible
 
 1. `ntp_client.rs` : `pub m_org: Mem<U<64>, 4, DefaultClock>` (distribuée). En PAY, octets 40..47 = `nonce` (registre de 64 bits figé au début de PAY) au lieu de `t1p` ; en S, `m_t1[cs] := t1p` (inchangé) et `m_org[cs] := nonce`. En CHK : `auth = out & mode4 & vn_ok & (origin == m_org[cs])`. L'arithmétique (`a = T2 − T1`, `d1 = T4 − T1`) garde `m_t1`.
-2. Source d'entropie (`rtl/src/entropy.rs`, nouvelle unité) : xorshift128+ avancé à chaque cycle, état ⊕= `rx_ts[7:0]` de chaque trame reçue (bits de phase entre l'oscillateur du PHY et celui de la carte) ; sortie `rnd: Out<U<64>>`. Sert aussi au sel de F1 et à la fuite de F2. Un générateur linéaire suffit ici : l'attaquant hors chemin ne voit jamais le nonce, et l'attaquant sur le chemin voit déjà la requête.
+2. Source d'entropie (`rtl/src/entropy.rs`, nouvelle unité) : xorshift128+ avancé à chaque cycle, état ⊕= `rx_ts[7:0]` de chaque trame reçue (bits de phase entre l'oscillateur du PHY et celui de la carte) ; sortie `rnd: Out<U<64>>`. Sert aussi au multiplicateur secret `a` de F1 et à la fuite de F2. Un générateur rapide non cryptographique suffit : l'attaquant hors chemin ne voit jamais le nonce, et l'attaquant sur le chemin voit déjà la requête ; comme l'effet de la fuite F2 est observable de l'extérieur, prendre un générateur à sortie non linéaire (l'addition finale de xorshift128+) et des bits distincts pour chaque usage.
 3. Coût : ≈ 64 + 128 bascules, une RAM 4 × 64 en LUT, un comparateur de 64 bits déjà présent. Le serveur, lui, ne change pas (il recopie l'Origin du client).
 
 ### F4 — pas de démarrage
