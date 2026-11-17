@@ -644,10 +644,8 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>
                                 (rm_tx, rp_tx),
                             ),
                             join2(
-                                self.route.run(
-                                    (rm_rx, rp_rx),
-                                    (q4_tx, y4_tx, q6_tx, y6_tx, route_lat_o),
-                                ),
+                                self.route
+                                    .run((rm_rx, rp_rx), (q4_tx, y4_tx, q6_tx, y6_tx, route_lat_o)),
                                 self.lat.run(route_lat, tx_latency_o),
                             ),
                         ),

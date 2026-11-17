@@ -276,7 +276,15 @@ fn udp(sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 /// An UDP/IPv4 frame, checksums computed.
-fn udp4_frame(dmac: u64, smac: u64, src: u32, dst: u32, sport: u16, dport: u16, p: &[u8]) -> Vec<u8> {
+fn udp4_frame(
+    dmac: u64,
+    smac: u64,
+    src: u32,
+    dst: u32,
+    sport: u16,
+    dport: u16,
+    p: &[u8],
+) -> Vec<u8> {
     let mut u = udp(sport, dport, p);
     let ps = sum16(0, &src.to_be_bytes()) + sum16(0, &dst.to_be_bytes()) + 17 + u.len() as u32;
     udp_csum(ps, &mut u);
@@ -299,7 +307,15 @@ fn pseudo6(src: u128, dst: u128, nh: u8, len: usize) -> u32 {
 }
 
 /// An UDP/IPv6 frame (hop limit 64), checksum computed.
-fn udp6_frame(dmac: u64, smac: u64, src: u128, dst: u128, sport: u16, dport: u16, p: &[u8]) -> Vec<u8> {
+fn udp6_frame(
+    dmac: u64,
+    smac: u64,
+    src: u128,
+    dst: u128,
+    sport: u16,
+    dport: u16,
+    p: &[u8],
+) -> Vec<u8> {
     let mut u = udp(sport, dport, p);
     udp_csum(pseudo6(src, dst, 17, u.len()), &mut u);
     let mut body = ip6_hdr(src, dst, 17, 64, u.len());
@@ -349,7 +365,13 @@ fn want_ns(target: u128) -> Vec<u8> {
     m.extend_from_slice(&target.to_be_bytes());
     m.extend_from_slice(&[1, 1]);
     m.extend_from_slice(&mac6(MAC));
-    icmp6_frame(0x3333_ff00_0000 | (target & 0xFF_FFFF) as u64, MAC, LL, sn_addr(target), m)
+    icmp6_frame(
+        0x3333_ff00_0000 | (target & 0xFF_FFFF) as u64,
+        MAC,
+        LL,
+        sn_addr(target),
+        m,
+    )
 }
 
 /// The upstream's solicited neighbor advertisement (S, O, target LLA).
@@ -384,12 +406,28 @@ fn build_reply(stratum: u8, ref_id: u32, org: u64, t2: u64, t3: u64) -> Vec<u8> 
 
 /// The client's IPv4 request frame for transmit timestamp `t1`.
 fn want_req4(t1: u64) -> Vec<u8> {
-    udp4_frame(UP4_MAC, MAC, IP4, UP4, 123, 123, &build_request(POLL, PREC, t1))
+    udp4_frame(
+        UP4_MAC,
+        MAC,
+        IP4,
+        UP4,
+        123,
+        123,
+        &build_request(POLL, PREC, t1),
+    )
 }
 
 /// The client's IPv6 request frame (link-local upstream: source = our LL).
 fn want_req6(t1: u64) -> Vec<u8> {
-    udp6_frame(UP6_MAC, MAC, LL, UP6, 123, 123, &build_request(POLL, PREC, t1))
+    udp6_frame(
+        UP6_MAC,
+        MAC,
+        LL,
+        UP6,
+        123,
+        123,
+        &build_request(POLL, PREC, t1),
+    )
 }
 
 /// Checks the FCS and the zero padding of a transmitted frame; returns the
@@ -398,7 +436,11 @@ fn body(got: &[u8], want_len: usize, what: &str) -> Vec<u8> {
     let n = got.len();
     assert!(n >= 64, "{what}: {n} bytes");
     let (b, fcs) = got.split_at(n - 4);
-    assert_eq!(u32::from_le_bytes(fcs.try_into().unwrap()), crc32(b), "{what}: FCS");
+    assert_eq!(
+        u32::from_le_bytes(fcs.try_into().unwrap()),
+        crc32(b),
+        "{what}: FCS"
+    );
     assert_eq!(b.len(), want_len.max(60), "{what}: length");
     assert!(b[want_len..].iter().all(|x| *x == 0), "{what}: padding");
     b[..want_len].to_vec()
@@ -408,7 +450,11 @@ fn same(got: &[u8], want: &[u8], what: &str) {
     let b = body(got, want.len(), what);
     if b != want {
         let d = (0..want.len()).find(|&i| b[i] != want[i]).unwrap();
-        panic!("{what}: byte {d} differs\n got  {}\n want {}", hex(&b), hex(want));
+        panic!(
+            "{what}: byte {d} differs\n got  {}\n want {}",
+            hex(&b),
+            hex(want)
+        );
     }
 }
 
@@ -432,7 +478,10 @@ fn kind(f: &[u8]) -> Kind {
     }
     if et == 0x0800 && f[23] == 17 {
         let p = &f[42..];
-        let (sp, dp) = (u16::from_be_bytes([f[34], f[35]]), u16::from_be_bytes([f[36], f[37]]));
+        let (sp, dp) = (
+            u16::from_be_bytes([f[34], f[35]]),
+            u16::from_be_bytes([f[36], f[37]]),
+        );
         if p[0] & 7 == 3 && sp == 123 && dp == 123 {
             return Kind::Req(false, be64(&p[40..48]));
         }
@@ -445,7 +494,10 @@ fn kind(f: &[u8]) -> Kind {
     }
     if et == 0x86dd && f[20] == 17 {
         let p = &f[62..];
-        let (sp, dp) = (u16::from_be_bytes([f[54], f[55]]), u16::from_be_bytes([f[56], f[57]]));
+        let (sp, dp) = (
+            u16::from_be_bytes([f[54], f[55]]),
+            u16::from_be_bytes([f[56], f[57]]),
+        );
         if p[0] & 7 == 3 && sp == 123 && dp == 123 {
             return Kind::Req(true, be64(&p[40..48]));
         }
@@ -683,7 +735,10 @@ impl<F: Future<Output = ()>> Pins<F> {
             None
         } else if !self.nib.is_empty() {
             let nib = std::mem::take(&mut self.nib);
-            assert!(nib[..15].iter().all(|&n| n == 5) && nib[15] == 0xd, "preamble/SFD");
+            assert!(
+                nib[..15].iter().all(|&n| n == 5) && nib[15] == 0xd,
+                "preamble/SFD"
+            );
             assert!(nib.len().is_multiple_of(2), "odd nibble count");
             let bytes = nib[16..].chunks(2).map(|c| c[0] | (c[1] << 4)).collect();
             let f = TxFrame {
@@ -792,7 +847,9 @@ fn startup<F: Future<Output = ()>>(b: &mut Pins<F>) -> (TxFrame, TxFrame, Vec<Tx
     let (mut r4, mut r6, mut res) = (None::<TxFrame>, None, vec![]);
     let mut ns_seen = false;
     while r4.is_none() || r6.is_none() {
-        let f = b.next(20_000).expect("the client's frames within 20 000 cycles");
+        let f = b
+            .next(20_000)
+            .expect("the client's frames within 20 000 cycles");
         match kind(&f.bytes) {
             Kind::ArpReq(_) => {
                 assert!(answer_resolution(b, &f));
@@ -836,9 +893,18 @@ fn startup_resolves_and_sends_requests() {
     let (r4, r6, res) = startup(&mut b);
     // The first resolution frames: one ARP request, one NS, byte exact (the
     // client may repeat a resolution while the answer is in flight).
-    let arps: Vec<_> = res.iter().filter(|f| kind(&f.bytes) == Kind::ArpReq(UP4)).collect();
-    let nss: Vec<_> = res.iter().filter(|f| kind(&f.bytes) == Kind::Ns(UP6)).collect();
-    assert!(!arps.is_empty() && !nss.is_empty(), "ARP request and NS seen");
+    let arps: Vec<_> = res
+        .iter()
+        .filter(|f| kind(&f.bytes) == Kind::ArpReq(UP4))
+        .collect();
+    let nss: Vec<_> = res
+        .iter()
+        .filter(|f| kind(&f.bytes) == Kind::Ns(UP6))
+        .collect();
+    assert!(
+        !arps.is_empty() && !nss.is_empty(),
+        "ARP request and NS seen"
+    );
     for f in &arps {
         same(&f.bytes, &want_arp_request(UP4), "ARP request");
     }
@@ -861,10 +927,18 @@ fn startup_resolves_and_sends_requests() {
             unreachable!()
         };
         let want = if v6 { want_req6(t1) } else { want_req4(t1) };
-        same(&f.bytes, &want, if v6 { "IPv6 request" } else { "IPv4 request" });
+        same(
+            &f.bytes,
+            &want,
+            if v6 { "IPv6 request" } else { "IPv4 request" },
+        );
         assert_eq!(b.p.m_t1.read(slot).raw() as u64, t1, "stored T1 = sent T1");
         assert!(b.p.out(slot), "request outstanding");
-        let k = if v6 { CLIENT_TX_LATENCY_V6 } else { CLIENT_TX_LATENCY_V4 };
+        let k = if v6 {
+            CLIENT_TX_LATENCY_V6
+        } else {
+            CLIENT_TX_LATENCY_V4
+        };
         let e = diff_ns(b.times.unwarp(t1, k), ntp_at(f.sfd_tick));
         println!("slot {slot}: T1 - tx SFD = {e:+.1} ns (real time, MII at the clk_sys rate)");
         assert!(e.abs() < 2000.0, "T1 implausible ({e} ns)");
@@ -891,7 +965,11 @@ fn reply_reaches_the_filter_and_spoof_does_not() {
     let (t2, t3) = answer_request(&mut b, &r4, 2, 0x0A0B_0C0D, None, delta, 0, 12);
     b.run(3000);
     assert!(!b.p.out(0), "valid reply: request closed");
-    assert_eq!(b.p.rid0.get().raw(), 0x0A0B_0C0D, "reference id of the reply");
+    assert_eq!(
+        b.p.rid0.get().raw(),
+        0x0A0B_0C0D,
+        "reference id of the reply"
+    );
     assert_eq!(b.p.str0.get().raw(), 2, "stratum of the reply");
     let t4 = b.p.t40.get().raw() as u64;
     let (off, dly) = arith(t1, t2, t3, t4);
@@ -930,7 +1008,11 @@ fn grants(ua: &[(u64, (u128, bool))], src: bool) -> Vec<(u64, u64)> {
     let mut v = vec![];
     for (i, &(n, (st, gr))) in ua.iter().enumerate() {
         if st == 1 && gr == src {
-            let end = ua[i + 1..].iter().find(|x| x.1 .0 == 0).map(|x| x.0).unwrap_or(u64::MAX);
+            let end = ua[i + 1..]
+                .iter()
+                .find(|x| x.1 .0 == 0)
+                .map(|x| x.0)
+                .unwrap_or(u64::MAX);
             v.push((n, end));
         }
     }
@@ -953,7 +1035,9 @@ fn server_answers_while_client_polls() {
     b.run(500);
     let s = b.send(&q4, 0) / 2;
     b.run(1500);
-    let (sg, _) = *grants(&b.ua, false).last().expect("server reply through uarb4");
+    let (sg, _) = *grants(&b.ua, false)
+        .last()
+        .expect("server reply through uarb4");
     let ls = sg - s;
     println!("client granted at cycle {cg} (until {cend}); a server request reaches uarb4 {ls} cycles after its SFD");
     drop(b);
@@ -1000,8 +1084,15 @@ fn server_answers_while_client_polls() {
         "the server's reply waited for the client's packet and was granted right after it"
     );
     let (q, r) = (got_req.unwrap(), got_rep.unwrap());
-    println!("client request at cycle {}, server reply at cycle {}", q.sfd_tick / 2, r.sfd_tick / 2);
-    assert!(r.sfd_tick > q.sfd_tick, "the reply leaves after the request");
+    println!(
+        "client request at cycle {}, server reply at cycle {}",
+        q.sfd_tick / 2,
+        r.sfd_tick / 2
+    );
+    assert!(
+        r.sfd_tick > q.sfd_tick,
+        "the reply leaves after the request"
+    );
 }
 
 /// (d): the IPv4 upstream (the only one, [`CliCfg4`]) answers the four
@@ -1028,7 +1119,16 @@ fn iburst_steps_the_clock_and_server_becomes_stratum_3() {
                 match kind(&f.bytes) {
                     Kind::Req(false, _) => {
                         if stepped.is_none() {
-                            answer_request(&mut b, &f, 2, 0x4750_5300, None, delta, answered * ms, 12);
+                            answer_request(
+                                &mut b,
+                                &f,
+                                2,
+                                0x4750_5300,
+                                None,
+                                delta,
+                                answered * ms,
+                                12,
+                            );
                             answered += 1;
                         }
                     }
@@ -1048,9 +1148,16 @@ fn iburst_steps_the_clock_and_server_becomes_stratum_3() {
         }
     }
     let (_, d) = stepped.expect("the servo stepped the clock");
-    assert_eq!(answered, 4, "the peer is eligible after the four iburst samples");
+    assert_eq!(
+        answered, 4,
+        "the peer is eligible after the four iburst samples"
+    );
     assert_eq!(b.p.servo_st.get().raw(), 3, "servo in FREQ after the step");
-    assert_eq!(d - INCR, b.p.servo_stp.get().raw(), "the clock moved by exactly the commanded step");
+    assert_eq!(
+        d - INCR,
+        b.p.servo_stp.get().raw(),
+        "the clock moved by exactly the commanded step"
+    );
     let step_s = (d - INCR) as f64 / 2f64.powi(64);
     println!("step {step_s:.6} s (upstream 100 s ahead)");
     assert!((step_s - 100.0).abs() < 0.05, "step near 100 s");
@@ -1386,7 +1493,13 @@ fn server_through_core<R: Clock, T: Clock>() -> Vec<(f64, f64)> {
         .enumerate()
         .map(|(i, (t2, t3, s))| {
             let e = (diff_ns(*t2, ntp_at(rx[i])), diff_ns(*t3, ntp_at(*s)));
-            println!("{}/{} reply {i}: T2 - rx SFD = {:+.1} ns, T3 - tx SFD = {:+.1} ns", R::NAME, T::NAME, e.0, e.1);
+            println!(
+                "{}/{} reply {i}: T2 - rx SFD = {:+.1} ns, T3 - tx SFD = {:+.1} ns",
+                R::NAME,
+                T::NAME,
+                e.0,
+                e.1
+            );
             e
         })
         .collect()
@@ -1437,7 +1550,10 @@ fn with_client_netlist_has_the_client_side() {
     ] {
         assert!(v.contains(&format!("module arty_top_{m}(")), "module {m}");
     }
-    assert!(!v.contains("warp"), "no simulation clock in the board build");
+    assert!(
+        !v.contains("warp"),
+        "no simulation clock in the board build"
+    );
     assert!(
         !v.contains("idle_samples") && !v.contains("drain_lookup") && !v.contains("idle_nd"),
         "client hooks connected"

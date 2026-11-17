@@ -75,11 +75,8 @@ pub struct UdpArb4 {
 }
 
 #[lower]
-impl
-    Unit<
-        (Rx<UdpTxReq>, Rx<FrameByte>, Rx<UdpTxReq>, Rx<FrameByte>),
-        (Tx<UdpTxReq>, Tx<FrameByte>),
-    > for UdpArb4
+impl Unit<(Rx<UdpTxReq>, Rx<FrameByte>, Rx<UdpTxReq>, Rx<FrameByte>), (Tx<UdpTxReq>, Tx<FrameByte>)>
+    for UdpArb4
 {
     async fn run(
         &mut self,

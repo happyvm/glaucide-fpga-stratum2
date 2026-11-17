@@ -1075,8 +1075,15 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
 /// server path, Phase A) or [`ArtyCoreClient`](crate::top_client::ArtyCoreClient)
 /// (server and NTP client, the stratum-2 board), at the board's MII clocks.
 pub trait TopCore:
-    Unit<(Rx<FrameByte, ClkRx>, In<Bit, ClkRx>, In<Bit, ClkTx>, In<Bit, ClkTx>), Tx<FrameByte, ClkTx>>
-    + Lower
+    Unit<
+        (
+            Rx<FrameByte, ClkRx>,
+            In<Bit, ClkRx>,
+            In<Bit, ClkTx>,
+            In<Bit, ClkTx>,
+        ),
+        Tx<FrameByte, ClkTx>,
+    > + Lower
     + Port
     + Traceable
     + Default
