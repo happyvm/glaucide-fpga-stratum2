@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import client  # noqa: E402
@@ -145,6 +146,11 @@ class AddressTest(unittest.TestCase):
 
     def test_schedule(self):
         self.assertEqual(client.schedule(6, 6), [0, 2, 4, 6, 70, 134])
+        # staggered: slot i starts a quarter second per slot later, phases persist
+        self.assertEqual(client.schedule(6, 6, 1)[:2], [Fraction(1, 4), Fraction(9, 4)])
+        self.assertEqual(client.schedule(4, 6, 3), [Fraction(3, 4) + x for x in (0, 2, 4, 6, 22, 38)])
+        starts = sorted(t for sl in range(4) for t in client.schedule(4, 6, sl))
+        self.assertTrue(all(b - a >= Fraction(1, 4) for a, b in zip(starts, starts[1:])))
         self.assertEqual(client.poll_interval(2), 16)
         self.assertEqual(client.poll_interval(30), 1 << 17)
 

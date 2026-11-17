@@ -31,6 +31,7 @@ arrival). `w(x)` is `x mod 2^64` read as a signed 64-bit integer:
 import random
 import struct
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Optional, Union
 
 NTP_PORT = 123
@@ -43,6 +44,7 @@ PEERS = 4
 # Timing constants of the RTL scheduler (documented in ntp_client.rs).
 IBURST_COUNT = 4                # requests 2 s apart after start-up / enable
 IBURST_GAP_S = 2
+STAGGER_S = Fraction(1, 4)      # slot i starts its iburst i * 2^-2 s after t0 (ntp_client.rs)
 DEADLINE_S = 2                  # miss when now_sec - sent_sec >= 2 (1 to 2 s after T1)
 POLL_MIN = 4
 POLL_MAX = 17
@@ -211,10 +213,14 @@ def poll_interval(poll_log2: int) -> int:
     return 1 << min(max(poll_log2, POLL_MIN), POLL_MAX)
 
 
-def schedule(poll_log2: int, n: int):
-    """Seconds (relative to the enable) at which the first `n` polls fire when every
-    poll is resolved and answered at once: iburst, then the regular interval."""
-    out, t = [], 0
+def schedule(poll_log2: int, n: int, slot: int = 0):
+    """Seconds (relative to the enable, `t0`) at which the first `n` polls of `slot` fire
+    when every poll is resolved and answered at once. Staggered (T4.2c): the iburst of slot
+    `i` starts at t0 + i * STAGGER_S (a quarter second per slot), then IBURST_GAP_S apart,
+    then every poll_interval, each measured from the slot's previous poll start, so the
+    per-slot phase offsets persist. Two slots never start together. Exact values (Fractions);
+    the RTL quantises to ticks of 2^-6 s (a start lies within one tick before the value)."""
+    out, t = [], Fraction(slot) * STAGGER_S
     for k in range(n):
         out.append(t)
         t += IBURST_GAP_S if k + 1 < IBURST_COUNT else poll_interval(poll_log2)

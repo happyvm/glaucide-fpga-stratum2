@@ -417,6 +417,24 @@ impl<F: Future<Output = ()>> Bench<F> {
         panic!("{} requests expected, {} seen", n, self.reqs.len());
     }
 
+    /// Like `until_reqs`, but the driven time also advances by 2^-4 s every
+    /// 128 cycles, so that the staggered start of slot `i` (`i * 2^-2` s after
+    /// its arming) comes: the first cycles run at the time set by the caller.
+    /// A request (about 60 cycles) always completes within one period, so its
+    /// T1 is the time of the period it started in.
+    fn wait_reqs(&mut self, n: usize) {
+        for c in 0..(20 * 128) {
+            if self.reqs.len() >= n {
+                return;
+            }
+            if c % 128 == 127 {
+                self.now = (self.now + (((SEC / 16) as u128) << 32)) & ((1u128 << 96) - 1);
+            }
+            self.cycle();
+        }
+        panic!("{} requests expected, {} seen", n, self.reqs.len());
+    }
+
     fn reply(&mut self, r: Reply) {
         self.inq.push_back((false, r, 0));
     }
@@ -579,8 +597,9 @@ fn vectors_replay() {
         let mut b = bench();
         b.slot(slot, addr, v6, true);
         b.prec.set(U::<8>::from(our));
-        b.set_ntp(t1);
-        b.until_reqs(1, 300);
+        // slot i starts i * 2^-2 s after its arming: begin that much earlier
+        b.set_ntp(t1.wrapping_sub(slot as u64 * (SEC / 4)));
+        b.wait_reqs(1);
         assert_eq!(b.reqs[0].t1(), t1, "{line}");
         b.feed(Reply {
             v6: fam,
@@ -645,8 +664,8 @@ fn request_bytes() {
             }
             b.poll.set(U::<8>::from(poll));
             b.prec.set(U::<8>::from(prec));
-            b.set_ntp(t1);
-            b.until_reqs(1, 300);
+            b.set_ntp(t1.wrapping_sub(2 * (SEC / 4))); // slot 2
+            b.wait_reqs(1);
             let q = &b.reqs[0];
             assert_eq!(q.bytes, hex(rhs), "{line}");
             assert_eq!((q.v6, q.sport, q.dport, q.len), (v6, 123, 123, 48));
@@ -749,6 +768,54 @@ fn iburst_then_regular() {
     assert!(b.misses.is_empty());
 }
 
+/// Staggered schedule (T4.2c): four slots enabled together start their
+/// iburst at `t0 + i * 2^-2` s, then 2, 4, 6 s later, then every 2^poll s
+/// from their own previous start (poll 4: 16 s): the per-slot phases
+/// persist, and no two requests are ever less than 0.2 s apart. (The
+/// bench's `open` assertion also shows requests are never interleaved.)
+#[test]
+fn staggered_schedule() {
+    let peers: [(u128, bool); 4] = [
+        (PEER4 as u128, false),
+        (PEER4_OFF as u128, false),
+        (PEER6, true),
+        (PEER6_LL, true),
+    ];
+    let mut b = bench();
+    b.poll.set(U::<8>::from(4u8));
+    for (i, (a, v6)) in peers.iter().enumerate() {
+        b.slot(i, *a, *v6, true);
+    }
+    let t0 = b.ntp();
+    let mut answered = 0;
+    // 1/16 s steps over 40 s
+    for _ in 0..(40 * 16) {
+        b.run(130);
+        while answered < b.reqs.len() {
+            let q = b.reqs[answered].clone();
+            let src = q.dst_ip;
+            b.feed(good_reply(&q, src, 0));
+            answered += 1;
+        }
+        b.now += ((SEC / 16) as u128) << 32;
+    }
+    // iburst gap 2 s, then 16 s
+    let rel = [0u64, 2, 4, 6, 22, 38];
+    for (i, (a, _)) in peers.iter().enumerate() {
+        let ts: Vec<u64> = b.reqs.iter().filter(|q| q.dst_ip == *a).map(|q| q.t1() - t0).collect();
+        assert_eq!(ts.len(), rel.len(), "slot {i}: {ts:?}");
+        for (t, r) in ts.iter().zip(rel) {
+            let want = r * SEC + i as u64 * (SEC / 4);
+            let d = (*t as i64 - want as i64).abs();
+            assert!(d <= (SEC / 8) as i64, "slot {i}: start {t:#x}, want {want:#x}");
+        }
+    }
+    let mut all: Vec<u64> = b.reqs.iter().map(|q| q.t1()).collect();
+    all.sort();
+    assert!(all.windows(2).all(|w| w[1] - w[0] >= SEC / 5), "requests too close: {all:?}");
+    assert!(b.misses.is_empty());
+}
+
 /// The regular interval follows `poll_log2` (clamped to 4..=17).
 #[test]
 fn poll_interval_clamped() {
@@ -778,7 +845,7 @@ fn first_request(slot_addr: u128, v6: bool, gua_valid: bool) -> (Vec<(bool, u128
     let mut b = bench();
     b.gua_valid.set(Bit::from_bool(gua_valid));
     b.slot(3, slot_addr, v6, true);
-    b.until_reqs(1, 300);
+    b.wait_reqs(1);
     (b.lookups.clone(), b.reqs[0].clone())
 }
 
@@ -892,17 +959,20 @@ fn resolution_cap() {
 fn deadline_miss_once() {
     let mut b = bench();
     b.set_ntp(T0 + SEC / 2);
-    b.slot(2, PEER6, true, true);
+    b.slot(0, PEER6, true, true);
     b.until_reqs(1, 300);
     // 1.25 s later (second s + 1.75): still waiting
     b.advance(SEC + SEC / 4, 5, 50);
     assert!(b.misses.is_empty());
     assert_eq!(b.reqs.len(), 1);
-    // DEADLINE_S whole seconds after T1's second: one miss, then the next
-    // iburst request (due 2 s after the first) goes out
+    // DEADLINE_S whole seconds after T1's second: one miss; the next iburst
+    // request is due 2 s after the first poll start (0.5 s later: tick
+    // granularity, not whole seconds)
     b.advance(SEC / 4, 1, 300);
     assert_eq!(DEADLINE_S, 2);
-    assert_eq!(b.misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![2]);
+    assert_eq!(b.misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![0]);
+    assert_eq!(b.reqs.len(), 1);
+    b.advance(SEC / 2, 2, 300);
     assert_eq!(b.reqs.len(), 2);
     // a late reply to the first request is dropped
     let q0 = b.reqs[0].clone();
@@ -1048,7 +1118,7 @@ fn two_slots_in_flight() {
     b.slot(0, PEER4 as u128, false, true);
     b.slot(1, PEER6_LL, true, true);
     b.slot(3, PEER4_OFF as u128, false, true);
-    b.until_reqs(3, 1000);
+    b.wait_reqs(3);
     let by_ip = |ip: u128| b.reqs.iter().find(|q| q.dst_ip == ip).unwrap().clone();
     let q0 = by_ip(PEER4 as u128);
     let q1 = by_ip(PEER6_LL);
@@ -1107,7 +1177,7 @@ fn same_address_two_slots() {
     let mut b = bench();
     b.slot(1, PEER4 as u128, false, true);
     b.slot(2, PEER4 as u128, false, true);
-    b.until_reqs(2, 600);
+    b.wait_reqs(2);
     let q = b.reqs[0].clone();
     b.feed(good_reply(&q, PEER4 as u128, 0));
     assert_eq!(b.samples_got.len(), 1);
