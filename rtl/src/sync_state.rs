@@ -57,18 +57,20 @@
 //! * `ref_id = peer_ref[S.peer]` if `ok`, else the last value (see below).
 //! * `ref_ts = S.upd` if `ok`, else the last value.
 //! * `root_delay = sat32(S.root_delay + sat32(ceil16(S.delay)))`.
-//! * `root_disp = sat32(S.root_disp + sat32(ceil16(S.disp + J + PHI *
-//!   age)))` with `J = max(S.jitter, 2^precision)` (the jitter floor of RFC
-//!   5905 §11.2.3, a power of two in 32.32: `1 << (32 + p)` for `p` in
+//! * `root_disp = sat32(S.root_disp + sat32(ceil48(T)))` with
+//!   `T = (S.disp + J) * 2^32 + PHI * age`, an exact integer in units of
+//!   2^-64 s, where `J = max(S.jitter, 2^precision)` (the jitter floor of
+//!   RFC 5905 §11.2.3, a power of two in 32.32: `1 << (32 + p)` for `p` in
 //!   -32..=-1, `1 << 32` for `p >= 0`, `1` for `p < -32`) and
-//!   `PHI = PHI_Q32` = 64425 (2^-32 s per second, 15 ppm, ntp_types.rs).
-//!   `PHI * age` is exact integer arithmetic on the 64-bit `age`.
-//!   The sums are exact in 32.32 (no wrap: `age < 2^64`, `PHI < 2^16`);
-//!   `ceil16(x) = (x + 0xFFFF) >> 16` converts 32.32 to 16.16 rounding UP
-//!   (a dispersion is never understated); `sat32(x) = min(x, 0xFFFFFFFF)`.
-//!   The dispersion therefore grows with `time` while no update arrives
-//!   (1 s of age adds 64425 / 2^16 = 0.983 units of 16.16, about 15 us;
-//!   1000 s add about 983 units, 15 ms).
+//!   `PHI = PHI_Q32` = 64425 (2^-32 s per second of age, 15 ppm, see
+//!   ntp_types.rs; `age` is in 32.32 so `PHI * age` is in 2^-64 s).
+//!   No sum wraps (`age < 2^64`, `PHI < 2^16`: `T < 2^98`).
+//!   `ceil48(x) = (x + 2^48 - 1) >> 48` converts 2^-64 s to 16.16 rounding
+//!   UP (a dispersion is never understated); `ceil16(x) = (x + 0xFFFF) >>
+//!   16` does the same for 32.32; `sat32(x) = min(x, 0xFFFFFFFF)`.
+//!   The dispersion therefore grows with `time` while no update arrives:
+//!   1 s of age adds 64425 / 2^16 = 0.983 units of 16.16 (about 15 us),
+//!   1000 s add about 983 units (15 ms).
 //!   The `Selected.root_dist` is not used.
 //!
 //! # Unsynchronised
@@ -119,6 +121,12 @@ pub fn sat32(x: U<96>) -> U<32> {
 #[lower]
 pub fn ceil16(x: U<96>) -> U<96> {
     (x + U::<96>::from(0xFFFFu32)) >> 16u32
+}
+
+/// 2^-64 s to 16.16, rounding up (the result is below 2^80).
+#[lower]
+pub fn ceil48(x: U<128>) -> U<96> {
+    ((x + U::<128>::from(0xFFFF_FFFF_FFFFu64)) >> 48u32).slice::<0, 96>()
 }
 
 /// `2^precision` in 32.32, for the signed log2 `pr` (see the module header).
@@ -260,9 +268,9 @@ impl
             );
 
             // ---------------------------------------------- stage 3
-            let total = self.p2_dj.get().zext::<96>() + self.p2_prod.get();
+            let total = (self.p2_dj.get().zext::<128>() << 32u32) + self.p2_prod.get().zext::<128>();
             let rds = sat32(
-                self.p2_rds.get().zext::<96>() + sat32(ceil16(total)).zext::<96>(),
+                self.p2_rds.get().zext::<96>() + sat32(ceil48(total)).zext::<96>(),
             );
             let ok2 = self.p2_ok.get();
 
