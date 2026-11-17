@@ -14,6 +14,8 @@ pub mod formal_smoke;
 pub mod icmp_echo;
 pub mod ipv4_rx;
 pub mod ipv4_tx;
+pub mod ipv6_rx;
+pub mod ipv6_tx;
 pub mod mii_rx;
 pub mod mii_tx;
 pub mod phy_init;
