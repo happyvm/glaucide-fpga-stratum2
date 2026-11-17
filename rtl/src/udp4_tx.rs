@@ -83,7 +83,7 @@ use crate::ipv4_tx::IpTxReq;
 use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Mem, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
+use txhdl::{assume, check, cover, lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
 
 /// Largest payload buffered, in bytes.
 pub const MAX_PAYLOAD: usize = 128;
@@ -206,6 +206,24 @@ impl Unit<(Rx<UdpTxReq>, Rx<FrameByte>, In<U<32>>), (Tx<IpTxReq>, Tx<FrameByte>)
                     err: o_last & self.abort.get(),
                 });
             }
+
+            // ---- formal properties (orchestrator; docs/formal.md, rows "UDP" and "Flux d'octets") ----
+            assume!(!(take_p) | !b.err | b.last, "payload: err only together with last (stream contract 2)");
+            let abort = self.abort.get();
+            let rest = (is_req | is_out);
+            check!(Bit::from(n <= 128u8), "at most 128 payload bytes are buffered");
+            check!(!rest | Bit::from(n >= 1u8), "a datagram has at least one payload byte");
+            check!(!send_q | is_req, "nothing is sent before the payload is complete (request only after the last byte)");
+            check!(!send_o | is_out, "datagram bytes only after the request was sent");
+            check!(!(send_q & send_o), "request and datagram bytes never share a cycle");
+            check!(!(rest & !abort) | Bit::from(self.len.get() == n.zext::<16>()), "a datagram without abort has the length the request announced");
+            check!(!send_q | Bit::from(tot == n.zext::<16>() + 8u16), "the IP request announces 8 + n bytes");
+            check!(!is_out | Bit::from(oc <= n + 7u8), "the datagram has 8 + n bytes");
+            check!(!(send_o & o_last) | Bit::from(oc == n + 7u8), "last on byte 8 + n");
+            check!(!(send_o & Bit::from(oc == n + 7u8)) | o_last, "byte 8 + n carries last");
+            cover!(send_q, "a request is sent");
+            cover!(send_o & o_last & !abort, "a good datagram is completed");
+            cover!(send_o & o_last & abort, "an aborted datagram is completed");
 
             with!(self <= {
                 take_r ? {
