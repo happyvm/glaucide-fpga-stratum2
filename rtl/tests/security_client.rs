@@ -26,7 +26,7 @@ use ntp_fpga::udp4_tx::UdpTxReq;
 use ntp_fpga::udp6_tx::Udp6TxReq;
 use std::collections::VecDeque;
 use std::future::Future;
-use txhdl::comp::{chan, join2, signal, DefaultClock, Out, Running, Rx, Tx, Unit};
+use txhdl::comp::{chan, join2, signal, DefaultClock, In, Out, Running, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 
 const SEC: u64 = 1 << 32;
@@ -73,6 +73,10 @@ struct Bench<F: Future<Output = ()>> {
     lat4: Out<U<64>>,
     lat6: Out<U<64>>,
     time: Out<U<96>>,
+    /// The entropy word (`rnd`); 0 unless a test sets it.
+    rnd: Out<U<64>>,
+    /// The client's `rx_stamp` output.
+    rx_stamp: In<U<64>>,
     meta_t: Tx<Meta>,
     rep_t: Tx<FrameByte>,
     arp_rsp_t: Tx<ArpEntry>,
@@ -122,6 +126,8 @@ fn bench() -> Bench<impl Future<Output = ()>> {
     let (lat4, lat4_i) = signal::<U<64>, DefaultClock>();
     let (lat6, lat6_i) = signal::<U<64>, DefaultClock>();
     let (time, time_i) = signal::<U<96>, DefaultClock>();
+    let (rnd, rnd_i) = signal::<U<64>, DefaultClock>();
+    let (rxst_o, rx_stamp) = signal::<U<64>, DefaultClock>();
     let (meta_t, meta_r) = chan::<Meta, DefaultClock>();
     let (rep_t, rep_r) = chan::<FrameByte, DefaultClock>();
     let (arp_rsp_t, arp_rsp_r) = chan::<ArpEntry, DefaultClock>();
@@ -145,10 +151,10 @@ fn bench() -> Bench<impl Future<Output = ()>> {
     let sim = Running::new(c.run(
         (
             a0, v0, e0, a1, v1, e1, a2, v2, e2, a3, v3, e3, lip_i, nm_i, gw_i, gw6_i, ll_i, gua_i,
-            gv_i, mac_i, poll_i, prec_i, lat4_i, lat6_i, time_i, meta_r, rep_r, arp_rsp_r,
+            gv_i, mac_i, poll_i, prec_i, lat4_i, lat6_i, time_i, rnd_i, meta_r, rep_r, arp_rsp_r,
             nd_rsp_r,
         ),
-        (al_t, ar_t, nl_t, nr_t, q4_t, p4_t, q6_t, p6_t, s_t, m_t),
+        (al_t, ar_t, nl_t, nr_t, q4_t, p4_t, q6_t, p6_t, s_t, m_t, rxst_o),
     ));
     local_mac.set(U::<48>::from(OUR_MAC));
     local_ip4.set(U::<32>::from(LOCAL4));
@@ -168,6 +174,8 @@ fn bench() -> Bench<impl Future<Output = ()>> {
         lat4,
         lat6,
         time,
+        rnd,
+        rx_stamp,
         meta_t,
         rep_t,
         arp_rsp_t,

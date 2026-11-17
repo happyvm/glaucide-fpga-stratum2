@@ -13,7 +13,7 @@ use ntp_fpga::udp4_tx::UdpTxReq;
 use ntp_fpga::udp6_tx::Udp6TxReq;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use txhdl::comp::{chan, signal, DefaultClock, Out, Running, Rx, Tx, Unit};
+use txhdl::comp::{chan, signal, DefaultClock, In, Out, Running, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 
 const SEC: u64 = 1 << 32;
@@ -85,6 +85,10 @@ struct Bench<F: Future<Output = ()>> {
     lat4: Out<U<64>>,
     lat6: Out<U<64>>,
     time: Out<U<96>>,
+    /// The entropy word (`rnd`); 0 unless a test sets it.
+    rnd: Out<U<64>>,
+    /// The client's `rx_stamp` output.
+    rx_stamp: In<U<64>>,
     meta_t: Tx<Meta>,
     rep_t: Tx<FrameByte>,
     arp_rsp_t: Tx<ArpEntry>,
@@ -123,6 +127,13 @@ struct Bench<F: Future<Output = ()>> {
     inq: VecDeque<(bool, Reply, usize)>,
     /// `pay4`/`pay6` are not read while set.
     hold_pay: bool,
+    /// When set, `rnd` is driven with `rnd_of(t)` in bench cycle `t`.
+    rnd_seq: bool,
+}
+
+/// The entropy word the bench drives in cycle `t` when `rnd_seq` is set.
+fn rnd_of(t: usize) -> u64 {
+    (t as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x0123_4567_89AB_CDEF
 }
 
 fn bench() -> Bench<impl Future<Output = ()>> {
@@ -148,6 +159,8 @@ fn bench() -> Bench<impl Future<Output = ()>> {
     let (lat4, lat4_i) = signal::<U<64>, DefaultClock>();
     let (lat6, lat6_i) = signal::<U<64>, DefaultClock>();
     let (time, time_i) = signal::<U<96>, DefaultClock>();
+    let (rnd, rnd_i) = signal::<U<64>, DefaultClock>();
+    let (rxst_o, rx_stamp) = signal::<U<64>, DefaultClock>();
     let (meta_t, meta_r) = chan::<Meta, DefaultClock>();
     let (rep_t, rep_r) = chan::<FrameByte, DefaultClock>();
     let (arp_rsp_t, arp_rsp_r) = chan::<ArpEntry, DefaultClock>();
@@ -171,10 +184,10 @@ fn bench() -> Bench<impl Future<Output = ()>> {
     let sim = Running::new(c.run(
         (
             a0, v0, e0, a1, v1, e1, a2, v2, e2, a3, v3, e3, lip_i, nm_i, gw_i, gw6_i, ll_i, gua_i,
-            gv_i, mac_i, poll_i, prec_i, lat4_i, lat6_i, time_i, meta_r, rep_r, arp_rsp_r,
+            gv_i, mac_i, poll_i, prec_i, lat4_i, lat6_i, time_i, rnd_i, meta_r, rep_r, arp_rsp_r,
             nd_rsp_r,
         ),
-        (al_t, ar_t, nl_t, nr_t, q4_t, p4_t, q6_t, p6_t, s_t, m_t),
+        (al_t, ar_t, nl_t, nr_t, q4_t, p4_t, q6_t, p6_t, s_t, m_t, rxst_o),
     ));
     local_mac.set(U::<48>::from(0x0200_0000_0001u64));
     let b = Bench {
@@ -192,6 +205,8 @@ fn bench() -> Bench<impl Future<Output = ()>> {
         lat4,
         lat6,
         time,
+        rnd,
+        rx_stamp,
         meta_t,
         rep_t,
         arp_rsp_t,
@@ -223,6 +238,7 @@ fn bench() -> Bench<impl Future<Output = ()>> {
         misses: vec![],
         inq: VecDeque::new(),
         hold_pay: false,
+        rnd_seq: false,
     };
     b.local_ip4.set(U::<32>::from(LOCAL4));
     b.netmask.set(U::<32>::from(MASK4));
@@ -235,6 +251,7 @@ fn bench() -> Bench<impl Future<Output = ()>> {
     b.prec.set(U::<8>::from(PREC));
     b.lat4.set(U::<64>::from(0u64));
     b.lat6.set(U::<64>::from(0u64));
+    b.rnd.set(U::<64>::from(0u64));
     for i in 0..4 {
         b.slot(i, 0, false, false);
     }
@@ -274,6 +291,9 @@ impl<F: Future<Output = ()>> Bench<F> {
     fn cycle(&mut self) {
         self.time.set(U::<96>::new(self.now & ((1u128 << 96) - 1)));
         let t = self.t;
+        if self.rnd_seq {
+            self.rnd.set(U::<64>::from(rnd_of(t)));
+        }
         // ---- outputs (always ready, except the payload when held)
         if let Some(ip) = self.arp_lookup.recv() {
             let ip = ip.raw();
@@ -543,6 +563,12 @@ fn check_good(s: &Sample, q: &ReqOut, r: &Reply, peer: u8) {
 
 // ------------------------------------------------------------ vectors
 
+/// `client.py::nonce`: T1's seconds, T1's fraction XOR the low 32 bits of
+/// the entropy word.
+fn nonce(t1: u64, rnd: u64) -> u64 {
+    t1 ^ (rnd & 0xFFFF_FFFF)
+}
+
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
@@ -587,20 +613,22 @@ fn vectors_replay() {
         let v6 = num(f[1]) == 1;
         let addr = num(f[2]);
         let t1 = num(f[3]) as u64;
-        let our = num(f[4]) as u8;
-        let src = num(f[5]);
-        let fam = num(f[6]) == 1;
-        let sport = num(f[7]) as u16;
-        let err = num(f[8]) == 1;
-        let t4 = num(f[9]) as u64;
-        let pay = hex(f[10]);
+        let rnd = num(f[4]) as u64;
+        let our = num(f[5]) as u8;
+        let src = num(f[6]);
+        let fam = num(f[7]) == 1;
+        let sport = num(f[8]) as u16;
+        let err = num(f[9]) == 1;
+        let t4 = num(f[10]) as u64;
+        let pay = hex(f[11]);
         let mut b = bench();
         b.slot(slot, addr, v6, true);
         b.prec.set(U::<8>::from(our));
+        b.rnd.set(U::<64>::from(rnd));
         // slot i starts i * 2^-2 s after its arming: begin that much earlier
         b.set_ntp(t1.wrapping_sub(slot as u64 * (SEC / 4)));
         b.wait_reqs(1);
-        assert_eq!(b.reqs[0].t1(), t1, "{line}");
+        assert_eq!(b.reqs[0].t1(), nonce(t1, rnd), "{line}");
         b.feed(Reply {
             v6: fam,
             src,
@@ -654,7 +682,12 @@ fn request_bytes() {
         };
         let (lhs, rhs) = rest.split_once(" -> ").unwrap();
         let f: Vec<&str> = lhs.split(' ').collect();
-        let (poll, prec, t1) = (num(f[0]) as u8, num(f[1]) as u8, num(f[2]) as u64);
+        let (poll, prec, t1, rnd) = (
+            num(f[0]) as u8,
+            num(f[1]) as u8,
+            num(f[2]) as u64,
+            num(f[3]) as u64,
+        );
         for v6 in [false, true] {
             let mut b = bench();
             if v6 {
@@ -664,6 +697,7 @@ fn request_bytes() {
             }
             b.poll.set(U::<8>::from(poll));
             b.prec.set(U::<8>::from(prec));
+            b.rnd.set(U::<64>::from(rnd));
             b.set_ntp(t1.wrapping_sub(2 * (SEC / 4))); // slot 2
             b.wait_reqs(1);
             let q = &b.reqs[0];
@@ -1207,6 +1241,223 @@ fn extreme_timestamps() {
             assert_eq!(b.samples_got[0].0.offset.raw() as u64, off);
         }
     }
+}
+
+// ------------------------------------------------------------ F3: Origin nonce
+
+/// `q` with bytes 40..47 replaced by the clock reading `t1` (for the
+/// arithmetic checks, which use the real T1).
+fn with_t1(q: &ReqOut, t1: u64) -> ReqOut {
+    let mut r = q.clone();
+    r.bytes[40..48].copy_from_slice(&t1.to_be_bytes());
+    r
+}
+
+/// Security finding F3: the Transmit Timestamp of a request is T1's
+/// seconds and T1's fraction XOR the entropy word's low 32 bits, sampled in
+/// the cycle S byte 40 is sent (the cycle before the bench reads it); the
+/// reply must carry that nonce as its Origin, the clock reading T1 itself
+/// is rejected, and the sample's arithmetic uses the real T1 (`m_t1`).
+#[test]
+fn origin_is_the_nonce() {
+    for v6 in [false, true] {
+        let peer = if v6 { PEER6 } else { PEER4 as u128 };
+        let mut b = bench();
+        b.rnd_seq = true;
+        b.lat4.set(U::<64>::from(8032u64));
+        b.lat6.set(U::<64>::from(8891u64));
+        b.slot(0, peer, v6, true);
+        b.until_reqs(1, 300);
+        let q = b.reqs[0].clone();
+        let t1 = b.ntp().wrapping_add(if v6 { 8891 } else { 8032 });
+        let sent = q.t1();
+        assert_eq!(sent >> 32, t1 >> 32, "seconds of T1");
+        assert_eq!(sent, nonce(t1, rnd_of(q.t40 - 1)), "fraction: T1 ^ rnd of cycle S");
+        assert_ne!(sent, t1);
+        b.rnd_seq = false;
+        let qr = with_t1(&q, t1);
+        // Origin = the clock reading: rejected (no sample, no miss).
+        b.feed(good_reply(&qr, peer, 0));
+        assert!(b.samples_got.is_empty() && b.misses.is_empty());
+        // Origin = the nonce, any single bit flipped: rejected.
+        let mut g = good_reply(&qr, peer, 5 * SEC);
+        g.pay[24..32].copy_from_slice(&sent.to_be_bytes());
+        for bit in [0, 13, 31, 32, 63] {
+            let mut r = g.clone();
+            r.pay[24..32].copy_from_slice(&(sent ^ (1u64 << bit)).to_be_bytes());
+            b.feed(r);
+        }
+        assert!(b.samples_got.is_empty() && b.misses.is_empty());
+        // Origin = the nonce: accepted, arithmetic from the real T1.
+        b.feed(g.clone());
+        assert_eq!(b.samples_got.len(), 1);
+        check_good(&b.samples_got[0].0, &qr, &g, 0);
+        assert_eq!(b.samples_got[0].0.offset.raw() as u64, 5 * SEC);
+    }
+}
+
+/// Successive requests draw fresh entropy: the nonces of four slots differ
+/// and their seconds stay T1's.
+#[test]
+fn nonces_differ_between_polls() {
+    let mut b = bench();
+    b.rnd_seq = true;
+    b.slot(0, PEER4 as u128, false, true);
+    b.slot(1, PEER6, true, true);
+    b.slot(2, PEER6_LL, true, true);
+    b.slot(3, PEER4_OFF as u128, false, true);
+    b.wait_reqs(4);
+    let mut n: Vec<u64> = b.reqs.iter().map(|q| q.t1()).collect();
+    for q in &b.reqs {
+        assert_eq!((q.t1() >> 32) as u32, q.sec, "seconds of T1 (latency 0)");
+    }
+    n.sort();
+    n.dedup();
+    assert_eq!(n.len(), 4);
+}
+
+/// `rx_stamp` is the receive timestamp of the last reply `Meta` taken,
+/// matched or not (the entropy unit's stirring input).
+#[test]
+fn rx_stamp_follows_the_replies() {
+    let (mut b, q, peer) = one_request(false);
+    assert_eq!(b.rx_stamp.get().raw(), 0);
+    let mut junk = good_reply(&q, 0xC000_0277, 0);
+    junk.rx_ts = 0x1234_5678_9ABC_DEF0;
+    b.feed(junk);
+    assert_eq!(b.rx_stamp.get().raw() as u64, 0x1234_5678_9ABC_DEF0);
+    let g = good_reply(&q, peer, 0);
+    b.feed(g.clone());
+    assert_eq!(b.rx_stamp.get().raw() as u64, g.rx_ts);
+}
+
+// ------------------------------------------------------------ F9: KoD
+
+/// An authentic KoD for request `q` with kiss code `code`.
+fn kod_reply(q: &ReqOut, src: u128, code: &[u8; 4]) -> Reply {
+    let mut r = good_reply(q, src, 0);
+    r.pay[0] = (3 << 6) | (4 << 3) | 4;
+    r.pay[1] = 0;
+    r.pay[12..16].copy_from_slice(code);
+    r
+}
+
+/// Runs a slot-0 IPv4 client in `step`-second steps for `secs` seconds,
+/// answering request k with `answer(k, q)`; returns the request seconds
+/// relative to the start, and the misses' seconds.
+fn kod_run(
+    poll: u8,
+    secs: u64,
+    step_q: u64,
+    answer: impl Fn(usize, &ReqOut) -> Option<Reply>,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut b = bench();
+    b.poll.set(U::<8>::from(poll));
+    b.slot(0, PEER4 as u128, false, true);
+    let start = (b.ntp() >> 32) as u32;
+    let mut answered = 0;
+    let mut miss_at = vec![];
+    for _ in 0..(secs * 4 / step_q) {
+        b.now += (((step_q * SEC) / 4) as u128) << 32;
+        b.run(130);
+        while answered < b.reqs.len() {
+            let q = b.reqs[answered].clone();
+            if let Some(r) = answer(answered, &q) {
+                b.feed(r);
+            }
+            answered += 1;
+        }
+        while miss_at.len() < b.misses.len() {
+            assert_eq!(b.misses[miss_at.len()].0, 0);
+            miss_at.push(((b.ntp() >> 32) as u32).wrapping_sub(start));
+        }
+    }
+    // Relative to the first request.
+    let s0 = b.reqs[0].sec - start;
+    (
+        b.reqs.iter().map(|q| q.sec - start - s0).collect(),
+        miss_at.iter().map(|m| m - s0).collect(),
+    )
+}
+
+/// RATE (F9): one miss, the iburst ends, and the slot's interval doubles
+/// from the one in use (poll 6: 2^7, then 2^8 s), never beyond 2^10 s;
+/// later normal replies keep the backed-off interval.
+#[test]
+fn kod_rate_backs_off() {
+    let (secs, misses) = kod_run(6, 800, 1, |k, q| {
+        Some(if k == 1 || k == 2 {
+            kod_reply(q, PEER4 as u128, b"RATE")
+        } else {
+            good_reply(q, PEER4 as u128, 0)
+        })
+    });
+    assert_eq!(secs, vec![0, 2, 130, 386, 642], "{secs:?}");
+    assert_eq!(misses.len(), 2, "{misses:?}");
+    // At the cap: poll 9, two RATEs give 2^10 s each time.
+    let (secs, misses) = kod_run(9, 2600, 4, |k, q| {
+        Some(if k <= 1 {
+            kod_reply(q, PEER4 as u128, b"RATE")
+        } else {
+            good_reply(q, PEER4 as u128, 0)
+        })
+    });
+    assert_eq!(secs, vec![0, 1024, 2048], "{secs:?}");
+    assert_eq!(misses.len(), 2);
+    // Poll 10 or more: no back-off beyond the configured interval.
+    let (secs, _) = kod_run(10, 2600, 4, |k, q| {
+        Some(if k == 0 {
+            kod_reply(q, PEER4 as u128, b"RATE")
+        } else {
+            good_reply(q, PEER4 as u128, 0)
+        })
+    });
+    assert_eq!(secs, vec![0, 1024, 2048], "{secs:?}");
+}
+
+/// DENY / RSTR (F9): one miss, then the slot sends no more requests; each
+/// later poll start (every 2^poll s) is a miss at once, so the clock filter
+/// ages the peer out. Another kiss code ("INIT") changes nothing: one miss
+/// and the iburst continues.
+#[test]
+fn kod_deny_and_rstr_kill_the_slot() {
+    for code in [b"DENY", b"RSTR"] {
+        let (secs, misses) =
+            kod_run(4, 70, 1, |_, q| Some(kod_reply(q, PEER4 as u128, code)));
+        assert_eq!(secs, vec![0], "{secs:?}");
+        assert_eq!(misses.len(), 5, "{misses:?}");
+        let gaps: Vec<u32> = misses.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.iter().all(|&g| g == 16), "{misses:?}");
+    }
+    let (secs, misses) = kod_run(4, 30, 1, |k, q| {
+        Some(if k == 0 {
+            kod_reply(q, PEER4 as u128, b"INIT")
+        } else {
+            good_reply(q, PEER4 as u128, 0)
+        })
+    });
+    assert_eq!(secs, vec![0, 2, 4, 6, 22], "{secs:?}");
+    assert_eq!(misses.len(), 1);
+}
+
+/// A KoD with a wrong Origin is nothing (no back-off, no kill); disabling
+/// and re-enabling a dead slot revives it (the KoD state is per slot and
+/// cleared with its flags).
+#[test]
+fn kod_needs_the_origin_and_is_cleared_by_disable() {
+    let (mut b, q, peer) = one_request(false);
+    let mut bad = kod_reply(&q, peer, b"DENY");
+    bad.pay[24..32].copy_from_slice(&(q.t1() ^ 0x10).to_be_bytes());
+    b.feed(bad);
+    assert!(b.misses.is_empty());
+    b.feed(kod_reply(&q, peer, b"DENY"));
+    assert_eq!(b.misses.len(), 1);
+    b.advance(40 * SEC, 160, 30);
+    assert_eq!(b.reqs.len(), 1, "dead");
+    b.slot(0, peer, false, false);
+    b.run(20);
+    b.slot(0, peer, false, true);
+    b.until_reqs(2, 600);
 }
 
 // ------------------------------------------------------------ Verilog
