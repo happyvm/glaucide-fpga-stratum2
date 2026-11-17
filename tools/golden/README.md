@@ -18,6 +18,10 @@ preuves de `docs/formal.md` se comparent à lui. Bibliothèque standard Python 3
 Toute analyse (`parse`) lève `golden.errors.ParseError` sur entrée malformée (mauvais checksum,
 longueurs incohérentes, version incorrecte...).
 
+## Côté client NTP (`ntpclient/`)
+
+`ntpclient/filter.py` : filtre d'horloge RFC 5905 §10 en virgule fixe (identique bit à bit à `rtl/src/clock_filter.rs`, T4.3), référence en rationnels exacts, et générateur de `ntpclient/vectors/filter.txt` (`cd tools/golden && python3 -m ntpclient.filter`). Tests : `python3 -m unittest discover tools/golden/ntpclient`.
+
 ## Utilisation
 
 ```sh
