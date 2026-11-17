@@ -1039,6 +1039,8 @@ impl Unit<(Rx<PeerStat>, In<U<64>>, In<U<3>>), Tx<Selected>> for Selection {
             // System-peer search: the best index found so far is a survivor, and every
             // survivor already scanned has set `bv`.
             let bi_r = self.bi.get();
+            check!(!((s_clu | s_clu2) & bv), "no best peer yet while clustering (bv cleared by the decision)");
+            check!(!(s_sys & Bit::from(ia == 0) & bv), "the search starts without a best peer");
             check!(!((s_sys | s_sys2) & bv) | pickb(bi_r, svp0, svp1, svp2, svp3), "the best peer found so far is a survivor");
             check!(!(s_sys2 & svp0) | bv, "all survivors scanned: bv set (0)");
             check!(!(s_sys2 & svp1) | bv, "all survivors scanned: bv set (1)");
