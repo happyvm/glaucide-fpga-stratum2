@@ -18,6 +18,7 @@
 //! | `LOCAL_MAC` | `02:4e:54:50:00:01` | `02:00:00:00:00:01` |
 //! | `LOCAL_IP4` | `192.0.2.10` | `192.0.2.1` |
 //! | `GATEWAY_IP4`, `NETMASK4` | `192.0.2.254`, `255.255.255.0` | same |
+//! | `GATEWAY_IP6` | `fe80::1` | `fe80::1` (on a real network, the router's link-local address) |
 //! | `LOCAL_GUA`, `GUA_ENABLED` | `2001:db8:0:1::50:1`, on | `2001:db8::1`, on |
 //! | `UPSTREAM` | `192.0.2.1`, `2001:db8::1`, on; two slots off | `192.0.2.99`, `2001:db8::99`, on; two slots off |
 //! | `POLL_LOG2` | 6 (64 s) | 6 |
@@ -62,6 +63,7 @@
 //! | `gua_valid` | `Bit` | `GUA_ENABLED`; `local_gua` is only in use when high |
 //! | `sn_low` | `U<24>` | `solicited_node_low24(local_ll)` |
 //! | `gateway` | `U<32>` | `GATEWAY_IP4` |
+//! | `gateway6` | `U<128>` | `GATEWAY_IP6` |
 //! | `netmask` | `U<32>` | `NETMASK4` |
 //! | `up<i>_addr` | `U<128>` | `UPSTREAM[i].1`, `i` in 0..4; IPv4 in the low 32 bits |
 //! | `up<i>_v6` | `Bit` | `UPSTREAM[i].0` (high: IPv6) |
@@ -82,7 +84,8 @@
 //! # Compile-time checks
 //!
 //! Every [`ConfigSet`] is checked, when a [`Config`] is built, for: a
-//! unicast `LOCAL_MAC` that fits in 48 bits, and `POLL_LOG2` in 4..=10.
+//! unicast `LOCAL_MAC` that fits in 48 bits, `GATEWAY_IP6` neither multicast
+//! nor unspecified ([`ip6_is_valid_gateway`]), and `POLL_LOG2` in 4..=10.
 //! The check is `Config::<C>::CHECK`, forced by `Default`, and the sets
 //! [`Board`] and [`Test`] also carry a module-level `const` assertion.
 use std::marker::PhantomData;
@@ -100,6 +103,9 @@ pub trait ConfigSet {
     const GATEWAY_IP4: u32;
     /// IPv4 netmask (1 bits up to the network part).
     const NETMASK4: u32;
+    /// IPv6 default gateway (the router): link-local `fe80::/10` or global.
+    /// Must be neither multicast (`ff00::/8`) nor unspecified (`::`).
+    const GATEWAY_IP6: u128;
     /// Global IPv6 address, static (a server keeps a fixed, memorable address;
     /// no SLAAC in v1). Its low 24 bits MUST equal those of the link-local
     /// address (`eui64_link_local(LOCAL_MAC)`): `ipv6_rx` has a single
@@ -128,6 +134,7 @@ impl ConfigSet for Board {
     const LOCAL_IP4: u32 = 0xC000_020A; // 192.0.2.10
     const GATEWAY_IP4: u32 = 0xC000_02FE; // 192.0.2.254
     const NETMASK4: u32 = 0xFFFF_FF00; // /24
+    const GATEWAY_IP6: u128 = 0xFE80_0000_0000_0000_0000_0000_0000_0001; // fe80::1
     // 2001:db8:0:1::50:1 (low 24 bits 0x500001 = those of the link-local address)
     const LOCAL_GUA: u128 = 0x2001_0DB8_0000_0001_0000_0000_0050_0001;
     const GUA_ENABLED: bool = true;
@@ -153,6 +160,8 @@ impl ConfigSet for Test {
     const LOCAL_IP4: u32 = 0xC000_0201; // 192.0.2.1
     const GATEWAY_IP4: u32 = 0xC000_02FE; // 192.0.2.254
     const NETMASK4: u32 = 0xFFFF_FF00; // /24
+    // fe80::1: on a real network this is the router's link-local address.
+    const GATEWAY_IP6: u128 = 0xFE80_0000_0000_0000_0000_0000_0000_0001; // fe80::1
     // 2001:db8::1, the golden model's SRV_GUA (low 24 bits 0x000001)
     const LOCAL_GUA: u128 = 0x2001_0DB8_0000_0000_0000_0000_0000_0001;
     const GUA_ENABLED: bool = true;
@@ -198,10 +207,20 @@ pub const fn solicited_node_low24(addr: u128) -> u32 {
     (addr & 0xFF_FFFF) as u32
 }
 
+/// An IPv6 default gateway is a usable unicast address: not multicast
+/// (`ff00::/8`) and not the unspecified address `::`.
+pub const fn ip6_is_valid_gateway(addr: u128) -> bool {
+    addr != 0 && addr >> 120 != 0xFF
+}
+
 /// The compile-time checks of a configuration set (see the module header).
 pub struct Checks<C: ConfigSet>(PhantomData<C>);
 impl<C: ConfigSet> Checks<C> {
     pub const OK: () = {
+        assert!(
+            ip6_is_valid_gateway(C::GATEWAY_IP6),
+            "GATEWAY_IP6 must not be multicast (ff00::/8) nor unspecified (::)"
+        );
         assert!(
             mac_is_unicast(C::LOCAL_MAC),
             "LOCAL_MAC must be a 48-bit unicast address"
@@ -255,6 +274,7 @@ impl<C: ConfigSet>
             Out<Bit>,
             Out<U<24>>,
             Out<U<32>>,
+            Out<U<128>>,
             Out<U<32>>,
             Out<U<128>>,
             Out<Bit>,
@@ -286,6 +306,7 @@ impl<C: ConfigSet>
             gua_valid,
             sn_low,
             gateway,
+            gateway6,
             netmask,
             up0_addr,
             up0_v6,
@@ -311,6 +332,7 @@ impl<C: ConfigSet>
             Out<Bit>,
             Out<U<24>>,
             Out<U<32>>,
+            Out<U<128>>,
             Out<U<32>>,
             Out<U<128>>,
             Out<Bit>,
@@ -350,6 +372,7 @@ impl<C: ConfigSet>
             gua_valid.set(Bit::from_bool(C::GUA_ENABLED));
             sn_low.set(U::<24>::new(Self::SN as u128));
             gateway.set(U::<32>::new(C::GATEWAY_IP4 as u128));
+            gateway6.set(U::<128>::new(C::GATEWAY_IP6));
             netmask.set(U::<32>::new(C::NETMASK4 as u128));
             up0_addr.set(U::<128>::new(C::UPSTREAM[0].1));
             up0_v6.set(Bit::from_bool(C::UPSTREAM[0].0));

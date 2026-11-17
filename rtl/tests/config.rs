@@ -13,8 +13,8 @@
 //! # -> b70a6091 (the golden Reference ID of tools/golden/vectors.py)
 //! ```
 use ntp_fpga::config::{
-    eui64_global, eui64_link_local, mac_is_unicast, solicited_node_low24, Board, Config, ConfigSet,
-    Test,
+    eui64_global, eui64_link_local, ip6_is_valid_gateway, mac_is_unicast, solicited_node_low24,
+    Board, Config, ConfigSet, Test,
 };
 use txhdl::comp::{signal, DefaultClock, In, Running, Unit};
 use txhdl::types::{Bit, U};
@@ -105,6 +105,37 @@ fn solicited_node_takes_the_low_24_bits() {
     );
 }
 
+// ---------------------------------------------------------------- IPv6 gateway
+
+#[test]
+fn ip6_gateway_rule() {
+    // Unspecified: refused.
+    assert!(!ip6_is_valid_gateway(0));
+    // Multicast (ff00::/8): refused, all-nodes and a generic group.
+    assert!(!ip6_is_valid_gateway(0xFF02_0000_0000_0000_0000_0000_0000_0001)); // ff02::1
+    assert!(!ip6_is_valid_gateway(0xFF00_0000_0000_0000_0000_0000_0000_0000)); // ff00::
+    assert!(!ip6_is_valid_gateway(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF));
+    // Link-local router (fe80::/10) and global unicast: accepted.
+    assert!(ip6_is_valid_gateway(0xFE80_0000_0000_0000_0000_0000_0000_0001)); // fe80::1
+    assert!(ip6_is_valid_gateway(0x2001_0DB8_0000_0000_0000_0000_0000_0001)); // 2001:db8::1
+    // Just outside ff00::/8 on both sides: fe00:: and the top of the space.
+    assert!(ip6_is_valid_gateway(0xFEFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF));
+    // The rule only excludes the two forbidden forms: ::1 is neither
+    // multicast nor unspecified, so it is accepted by the predicate.
+    assert!(ip6_is_valid_gateway(1));
+}
+
+#[test]
+fn every_set_has_a_valid_ip6_gateway() {
+    fn check<C: ConfigSet>() {
+        assert!(ip6_is_valid_gateway(C::GATEWAY_IP6), "GATEWAY_IP6 is valid");
+    }
+    check::<Board>();
+    check::<Test>();
+    assert_eq!(Board::GATEWAY_IP6, 0xFE80_0000_0000_0000_0000_0000_0000_0001); // fe80::1
+    assert_eq!(Test::GATEWAY_IP6, 0xFE80_0000_0000_0000_0000_0000_0000_0001); // fe80::1
+}
+
 // ---------------------------------------------------------------- the sets
 
 #[test]
@@ -165,6 +196,7 @@ struct Wires {
     gua_valid: In<Bit>,
     sn_low: In<U<24>>,
     gateway: In<U<32>>,
+    gateway6: In<U<128>>,
     netmask: In<U<32>>,
     up: [(In<U<128>>, In<Bit>, In<Bit>); 4],
     poll_log2: In<U<8>>,
@@ -181,6 +213,7 @@ fn bench<C: ConfigSet + 'static>() -> (Wires, Running<impl std::future::Future<O
     let (gua_valid_d, gua_valid) = signal::<Bit, DefaultClock>();
     let (sn_low_d, sn_low) = signal::<U<24>, DefaultClock>();
     let (gateway_d, gateway) = signal::<U<32>, DefaultClock>();
+    let (gateway6_d, gateway6) = signal::<U<128>, DefaultClock>();
     let (netmask_d, netmask) = signal::<U<32>, DefaultClock>();
     let (u0a_d, u0a) = signal::<U<128>, DefaultClock>();
     let (u0v_d, u0v) = signal::<Bit, DefaultClock>();
@@ -210,6 +243,7 @@ fn bench<C: ConfigSet + 'static>() -> (Wires, Running<impl std::future::Future<O
             gua_valid_d,
             sn_low_d,
             gateway_d,
+            gateway6_d,
             netmask_d,
             u0a_d,
             u0v_d,
@@ -237,6 +271,7 @@ fn bench<C: ConfigSet + 'static>() -> (Wires, Running<impl std::future::Future<O
         gua_valid,
         sn_low,
         gateway,
+        gateway6,
         netmask,
         up: [
             (u0a, u0v, u0e),
@@ -268,6 +303,7 @@ fn sample(w: &Wires) -> Vec<u128> {
         bit(w.gua_valid.get()),
         w.sn_low.get().raw(),
         w.gateway.get().raw(),
+        w.gateway6.get().raw(),
         w.netmask.get().raw(),
     ];
     for (a, vb, e) in &w.up {
@@ -298,6 +334,7 @@ fn board_wires_carry_the_board_constants() {
                 1,
                 0x50_0001,
                 0xC000_02FE,
+                0xFE80_0000_0000_0000_0000_0000_0000_0001,
                 0xFFFF_FF00,
                 0xC000_0201,
                 0,
@@ -335,6 +372,7 @@ fn test_wires_carry_the_golden_constants() {
                 1,
                 0x00_0001,
                 0xC000_02FE,
+                0xFE80_0000_0000_0000_0000_0000_0000_0001,
                 0xFFFF_FF00,
                 0xC000_0263,
                 0,
