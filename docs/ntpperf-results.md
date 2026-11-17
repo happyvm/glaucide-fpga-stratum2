@@ -335,8 +335,67 @@ par ce test.
 
 ## 4. Constats
 
-CONSTATS
+Aucun défaut de débit, de latence ni d'horodatage : pas de perte imputable au design, pas de croissance de la
+latence, pas de dérive de T3, aucune trame erronée (FCS, sommes IPv4/UDP vérifiées sur chaque trame émise), aucun
+blocage, aucune réponse sans requête. Un constat porte sur le limiteur (N1), les autres sont des observations.
+
+**N1 — Le hachage du limiteur répartit mal des sources consécutives pour certains secrets (basse à moyenne).**
+`rl_index` = bits de poids fort de `m·k + b` (multiplication-décalage) : universel *en moyenne sur m* (deux clés
+données collisionnent avec une probabilité ≤ 2/4096), mais pour un `RATE_SECRET` **fixé**, des clés en progression
+arithmétique (un bloc d'adresses consécutives : les clients de ntpperf, un réseau de campus derrière un pool de NAT,
+un /20 de centre de données) forment une suite de Weyl dont la répartition dépend de la fraction continue de
+m/2⁶⁴. Reproduction : `run.sh --long lc-30k lc-80k` (tableau 3.3), ou en Python (`analyse.py`, `rl_index`) :
+- secret de `Test` : 3 000 sources consécutives n'occupent que 1 498 cases (2 818 partagent une case ; une fonction
+  aléatoire en occuperait 2 127), 16 384 sources 2 374 cases ; mesuré à 30 000 req/s : LC30 ;
+- sur 300 secrets tirés au hasard, 4 096 sources consécutives occupent de **120** à 4 045 cases (10 % des secrets :
+  moins de 1 572 ; médiane 3 012 ; fonction aléatoire : 2 589). Le secret de `Board` est bon (3 351 ; 16 384
+  sources sur les 4 096 cases).
+Effet : des clients légitimes d'un même bloc partagent la limite de 8 réponses/s de leur case bien plus souvent que
+ne l'annonce la borne 2/4096 ; dans le pire des cas observé (120 cases), 4 096 clients consécutifs n'ont droit
+ensemble qu'à 960 réponses/s (+ 1/16 du reste). Un attaquant n'en tire rien de plus (il ne connaît pas m), et
+jusqu'à ≈ 1 000 sources consécutives la suite de Weyl fait au contraire mieux que le hasard (0 collision).
+Correctifs proposés (non appliqués, `rtl/src` hors du périmètre de cette tâche) : (a) sans matériel : un contrôle
+de compilation dans `config::Checks` qui refuse un `RATE_SECRET` dont 4 096 clés consécutives occupent moins de,
+par exemple, 2 500 cases (celui de `Test` serait refusé, celui de `Board` accepté) — ne couvre que le pas 1 ;
+(b) robuste : un second tour de mélange `x = m·k + b ; x ^= x >> 32 ; case = (m·x) >> 52`, qui rend la
+répartition indépendante du secret et de la structure des clés (2 523 à 2 643 cases pour 4 096 clés consécutives
+sur les 300 secrets, comme une fonction aléatoire) ; coût : un second produit 64 × 64, à faire en 16 cycles (4 bits
+par cycle) ou sur DSP48 pour rester avant le cycle de décision (le premier tour finit au cycle 32, la décision a
+lieu au plus tôt au cycle 49).
+
+**N2 — T3 ne dépend pas de la charge parce que requêtes et réponses ont la même taille (observation).** La
+latence d'émission K est calibrée sur un chemin TX libre ; une réponse qui attendrait dans `tx_path` derrière une
+autre trame aurait un T3 trop tôt de ce temps d'attente (limite documentée de K, `ntp_server.rs`). Avec ntpperf ce
+cas est inatteignable : les requêtes de 90 octets arrivent au plus au débit de ligne et chaque réponse de 90 octets
+part avant que la suivante soit prête (vérifié : erreur de T3 +9,88 ns, σ 0,12, à 105 000 et 125 000 req/s). Il le
+deviendrait avec un trafic mêlé (écho ICMP de grande taille, ARP, NA émis juste avant une réponse NTP) : non testé
+ici.
+
+**N3 — ntpperf compte les KoD comme des réponses valides (outil, pas design).** Strate 0 non vérifiée : avec
+`--kod`, 0 % perdu et 0 % « invalid », temps de réponse minimal 0 et écarts `-o` absurdes (10¹⁷ ns) ; pour mesurer
+un serveur dont le KoD est activé, lire la proportion de KoD dans le journal du pont (`requests.csv`, `stratum` = 0).
+
+**N4 — Le débit maximal sans perte est le débit de la ligne à 100 Mb/s (observation).** 109 649 requêtes NTP IPv4
+par seconde, soit environ 9 fois moins que ce que le cœur traiterait (98 cycles par requête). Le PHY de l'Arty
+(10/100) est donc le goulot ; un serveur sur un lien gigabit (exemple de ntpperf : pas de perte jusqu'à
+≈ 200 000 req/s) n'est pas comparable.
+
+**N5 — Méthode : deux pièges de ntpperf en temps virtuel, contournés sans le modifier.** `-o 0` désactive l'affichage
+de l'écart (il faut une correction non nulle : 1e-12) ; et l'intervalle `-t` minimal est 0,2 s, ce qui fixe le
+coût d'un point à 0,5 s virtuelle (5 minutes de simulation au-delà de 45 000 req/s).
 
 ## 5. Ce qui n'est pas couvert
 
-NONCOUVERT
+- **IPv6** (ntpperf est IPv4 seulement), le mode entrelacé (`-I` : le design ne le gère pas, il répondrait en mode
+  de base), PTP (`-D`, `-N`), NTS (`-S`, ntpperf compilé sans gnutls ; le design ne fait pas NTS).
+- La carte avec client (`ArtyBoardWithClient`, cœur `ArtyCoreClient`) : seul le serveur seul (`ArtyCore`, celui
+  d'`ArtyBoard`) est chargé ; sa synchronisation est `FixedSync` (strate 2), pas le servo.
+- Plusieurs processus d'émission (`-p`), la distribution exponentielle des départs (`-e`) : les requêtes restent
+  sérialisées par le fil, le design ne verrait pas de rafale plus dense qu'au débit de ligne.
+- Le trafic mêlé (ICMP, ARP, IPv6 en même temps que la charge NTP), qui seul pourrait faire attendre une réponse
+  dans `tx_path` (N2).
+- Les latences du PHY et du câble, la gigue de l'oscillateur, d'autres phases MII (une seule paire simulée, comme
+  dans `chrony_bridge`), le limiteur sur une durée longue (fenêtres glissant sur 65 536 s) et des clients au-delà
+  de 16 384 (plafond de ntpperf).
+- Pendant les cycles sautés, le générateur de la fuite n'avance pas : la séquence des fuites n'est pas celle du
+  matériel, leur loi (1/16) l'est (vérifiée en 3.3).
