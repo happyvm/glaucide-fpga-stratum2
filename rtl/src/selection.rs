@@ -177,7 +177,7 @@
 use crate::ntp_types::{PeerStat, Selected, PHI_Q32};
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{check, cover, lower, with, Trace};
 
 /// 1.5 s, RFC 5905 MAXDIST, Q32.
 pub const MAXDIST_Q32: u64 = 3 << 31u32;
@@ -431,6 +431,8 @@ pub struct Selection {
     pub dc: Reg<U<7>>,
     // ---- result ----
     pub ok: Reg<Bit>,
+    /// Monitor (check!/cover! only): the decision left at least one survivor.
+    pub m_ne: Reg<Bit>,
     pub res_off: Reg<U<64>>,
     pub res_jit: Reg<U<35>>,
 }
@@ -992,6 +994,55 @@ impl Unit<(Rx<PeerStat>, In<U<64>>, In<U<3>>), Tx<Selected>> for Selection {
                 });
             }
 
+            // ------------------------------------------------ formal properties
+            // (orchestrator; "Facts for the formal properties" above). `ok_i` is set with
+            // the PeerStat; `el_i` and `sv_i` are recomputed per event.
+            let okp0 = self.ok0.get();
+            let okp1 = self.ok1.get();
+            let okp2 = self.ok2.get();
+            let okp3 = self.ok3.get();
+            let stp0 = self.str0.get();
+            let stp1 = self.str1.get();
+            let stp2 = self.str2.get();
+            let stp3 = self.str3.get();
+            let lpp0 = self.lp0.get();
+            let lpp1 = self.lp1.get();
+            let lpp2 = self.lp2.get();
+            let lpp3 = self.lp3.get();
+            let elp0 = el0;
+            let svp0 = sv0;
+            let rdp0 = rd0;
+            let elp1 = el1;
+            let svp1 = sv1;
+            let rdp1 = rd1;
+            let elp2 = el2;
+            let svp2 = sv2;
+            let rdp2 = rd2;
+            let elp3 = el3;
+            let svp3 = sv3;
+            let rdp3 = rd3;
+            let post = s_clu | s_clu2 | s_sys | s_sys2 | s_cmbi | s_divw | s_cmbm | s_fphi | s_divn | s_divj | s_sqrt | s_out;
+            check!(!okp0 | (Bit::from(stp0 >= 1) & Bit::from(stp0 <= 15) & !Bit::from(lpp0 == 3)), "a usable peer 0 has stratum 1..=15 and leap != 3");
+            check!(!okp1 | (Bit::from(stp1 >= 1) & Bit::from(stp1 <= 15) & !Bit::from(lpp1 == 3)), "a usable peer 1 has stratum 1..=15 and leap != 3");
+            check!(!okp2 | (Bit::from(stp2 >= 1) & Bit::from(stp2 <= 15) & !Bit::from(lpp2 == 3)), "a usable peer 2 has stratum 1..=15 and leap != 3");
+            check!(!okp3 | (Bit::from(stp3 >= 1) & Bit::from(stp3 <= 15) & !Bit::from(lpp3 == 3)), "a usable peer 3 has stratum 1..=15 and leap != 3");
+            check!(!(elp0 & !s_dist) | (okp0 & Bit::from(rdp0 < MAXDIST_Q32)), "an eligible peer 0 is usable with root distance < MAXDIST");
+            check!(!(elp1 & !s_dist) | (okp1 & Bit::from(rdp1 < MAXDIST_Q32)), "an eligible peer 1 is usable with root distance < MAXDIST");
+            check!(!(elp2 & !s_dist) | (okp2 & Bit::from(rdp2 < MAXDIST_Q32)), "an eligible peer 2 is usable with root distance < MAXDIST");
+            check!(!(elp3 & !s_dist) | (okp3 & Bit::from(rdp3 < MAXDIST_Q32)), "an eligible peer 3 is usable with root distance < MAXDIST");
+            check!(!(post & !s_out) | self.ok.get(), "after a successful decision the selection is valid until OUT");
+            check!(!(post & svp0) | elp0, "a survivor 0 is eligible");
+            check!(!(post & svp1) | elp1, "a survivor 1 is eligible");
+            check!(!(post & svp2) | elp2, "a survivor 2 is eligible");
+            check!(!(post & svp3) | elp3, "a survivor 3 is eligible");
+            check!(!self.ok.get() | self.ever.get(), "a valid selection implies ever");
+            let post2 = s_cmbi | s_divw | s_cmbm | s_fphi | s_divn | s_divj | s_sqrt | s_out;
+            check!(!(post2 & self.ok.get() & self.m_ne.get()) | pickb(sp, svp0, svp1, svp2, svp3), "the system peer is a survivor (given that the intersection left one)");
+            check!(!(post2 & self.ok.get() & self.m_ne.get()) | pickb(sp, elp0, elp1, elp2, elp3), "the system peer is eligible (given that the intersection left a survivor)");
+            check!(!(out_go & ok & self.m_ne.get()) | Bit::from(pick33(sp, rd0, rd1, rd2, rd3) < MAXDIST_Q32), "valid: root_dist < MAXDIST (given a survivor)");
+            cover!(out_go & ok, "a valid selection is output");
+            cover!(out_go & !ok, "no selection is output");
+
             with!(self <= {
                 // Multiplier pipeline, every cycle.
                 rdx: rdx_n,
@@ -1088,6 +1139,7 @@ impl Unit<(Rx<PeerStat>, In<U<64>>, In<U<3>>), Tx<Selected>> for Selection {
                 fin_ok ? {
                     ever: Bit::One,
                     ok: Bit::One,
+                    m_ne: nsv0 | nsv1 | nsv2 | nsv3,
                     sv0: nsv0,
                     sv1: nsv1,
                     sv2: nsv2,
