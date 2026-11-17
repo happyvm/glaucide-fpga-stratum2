@@ -490,14 +490,19 @@ impl<S: Clock>
                     !b.err | b.last,
                     "err only together with last (stream contract 2)"
                 );
+                // Same text as the assumption of `fcs_check`, the consumer.
                 check!(
                     m_n + 1 <= 1518,
-                    "a frame has at most 1518 bytes (IEEE 802.3 4.4.2.3)"
+                    "a frame has at most 1518 bytes (stream contract 3)"
                 );
                 frames.send(b);
             }
             let tsend = Bit::from(owed != 0) & tokens.ready();
             if tsend.to_bool() {
+                check!(
+                    owed != 0,
+                    "a credit token returns a stamp slot taken by a commit"
+                );
                 tokens.send(U::<1>::from(1u8));
             }
             cover!(give, "a stamp is delivered");
