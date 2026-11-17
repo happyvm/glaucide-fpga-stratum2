@@ -91,6 +91,16 @@ pub fn csum_fold(acc: U<32>) -> U<16> {
     x2.slice::<0, 16>()
 }
 
+/// `csum_fold(acc) == 0xFFFF` (the receiver's test) with a single fold:
+/// the first fold `x1 = (acc & 0xFFFF) + (acc >> 16)` is at most 0x1FFFE,
+/// and the second fold gives 0xFFFF exactly when `x1` is 0xFFFF or
+/// 0x1FFFE. One addition shorter than the fold and compare (task T5.3).
+#[lower]
+pub fn csum_ok(acc: U<32>) -> Bit {
+    let x1 = (acc & U::<32>::from(0xFFFFu32)) + (acc >> 16u32);
+    Bit::from(x1 == U::<32>::from(0xFFFFu32)) | Bit::from(x1 == U::<32>::from(0x1FFFEu32))
+}
+
 /// Sum of the eight 16-bit words of a 128-bit address, as a balanced tree
 /// of additions (depth 3, task T5.3): the same integer as a chain, since
 /// no partial sum can wrap (at most `8 * 0xFFFF`).

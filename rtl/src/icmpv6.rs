@@ -157,7 +157,7 @@
 //! one `req` is followed by exactly one frame on `out_payload`. The input
 //! meta is not needed before byte 0 (do not make its availability depend on
 //! this unit's payload progress).
-use crate::csum::{csum_add, csum_fold, pseudo_v6};
+use crate::csum::{csum_add, csum_fold, csum_ok, pseudo_v6};
 use crate::ipv6_rx::Ip6Meta;
 use crate::ipv6_tx::Ip6TxReq;
 use crate::stream::FrameByte;
@@ -347,7 +347,7 @@ impl
             let word = mux(odd, (hi.zext::<16>() << 8u32) | lo, lo << 8u32);
             let add = odd | last;
             let next = mux(add, csum_add(acc, word), acc);
-            let sum_ok = Bit::from(csum_fold(next) == U::<16>::from(0xFFFFu16));
+            let sum_ok = csum_ok(next);
             let seed = pseudo_v6(
                 m.src,
                 m.dst,

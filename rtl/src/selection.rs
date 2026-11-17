@@ -70,7 +70,12 @@
 //!    on success, and any two are less than 2·MAXDIST = 3 s (< 2^34 Q32)
 //!    apart (a majority of the intervals contains [low, high]).
 //!    Hardware: no sort; each of the 12 tuples is compared with the 12
-//!    (one comparison per cycle) to get its rank and the counts above.
+//!    (one comparison per cycle) to get its rank and the counts above. The
+//!    comparator is a two-stage pipeline (task T5.3): the edges of a pair
+//!    are registered (`e_*`), then their comparison (`c_*`), and the counts
+//!    are updated from the registered comparison, two cycles after the pair
+//!    is issued; the decision pairs (`lk`, `hk`) go through the same
+//!    pipeline.
 //! 4. **Clustering** (§11.2.2) with NMIN = 3: only when the 4 peers are
 //!    truechimers. `S_p = Σ_q (θ_p − θ_q)²` (exact, Q64, < 2^70);
 //!    `qmax` = the largest `S_p` (strict, lowest index on a tie);
@@ -161,14 +166,15 @@ pub const RHO_Q32: u64 = 1 << 8u32;
 pub const AGE_MAX: u64 = (1 << 50u32) - 1;
 /// Largest number of cycles from the take of a `PeerStat` (cycle 0) to the
 /// first cycle `selected` is offered.
-pub const MAX_EVENT_CYCLES: u64 = 541;
+pub const MAX_EVENT_CYCLES: u64 = 545;
 
 /// Cycle (counted from the take, cycle 0) in which `selected` is first
 /// offered, for `n` survivors (0 when there is no selection); `n = 4` means
 /// 4 truechimers, whether clustering then keeps 4 or 3.
 pub const fn event_cycles(n: u64, truechimers4: bool) -> u64 {
-    // 1 take + 16 distances + 144 intersection + 2 decision.
-    let front = 1 + 16 + 144 + 2;
+    // 1 take + 16 distances + 144 intersection (+ 2 for the comparator
+    // pipeline) + 4 decision (two pairs through the comparator pipeline).
+    let front = 1 + 16 + 146 + 4;
     if n == 0 {
         return front;
     }
@@ -196,6 +202,8 @@ const DIVN: u8 = 13;
 const DIVJ: u8 = 14;
 const SQRT: u8 = 15;
 const OUT: u8 = 16;
+const FINA: u8 = 17;
+const FINB: u8 = 18;
 
 #[lower]
 fn pick64(i: U<2>, a: U<64>, b: U<64>, c: U<64>, d: U<64>) -> U<64> {
@@ -299,6 +307,23 @@ pub struct Selection {
     /// Tuples k (outer) and j (inner): bits 3:2 type (0 low, 1 mid, 2 high), 1:0 peer.
     pub ki: Reg<U<4>>,
     pub ji: Reg<U<4>>,
+    /// All 144 pairs have been issued to the comparator pipeline.
+    pub idone: Reg<Bit>,
+    /// Comparator pipeline, stage E: the pair (j, k) issued in the previous
+    /// cycle and its two edges.
+    pub e_v: Reg<Bit>,
+    pub e_j: Reg<U<4>>,
+    pub e_k: Reg<U<4>>,
+    pub e_ej: Reg<U<66>>,
+    pub e_ek: Reg<U<66>>,
+    /// Stage C: the pair and its comparison (edge j < edge k signed; tuple j
+    /// before tuple k in the total order; same tuple).
+    pub c_v: Reg<Bit>,
+    pub c_j: Reg<U<4>>,
+    pub c_k: Reg<U<4>>,
+    pub c_lt: Reg<Bit>,
+    pub c_klt: Reg<Bit>,
+    pub c_keq: Reg<Bit>,
     /// Counts over j so far, for tuple k: rank (tuples before k), lows/highs
     /// at or before k, highs/lows at or after k, mids before/after k.
     pub rk: Reg<U<4>>,
@@ -403,6 +428,8 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
             let s_divj = Bit::from(st == DIVJ);
             let s_sqrt = Bit::from(st == SQRT);
             let s_out = Bit::from(st == OUT);
+            let s_fina = Bit::from(st == FINA);
+            let s_finb = Bit::from(st == FINB);
 
             let off0 = self.off0.get();
             let off1 = self.off1.get();
@@ -515,27 +542,50 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
             let dist_end = dist_w & Bit::from(ia == 3);
 
             // ------------------------------------------------ tuple comparator
+            // Issue: the pair (ji, ki) during the intersection, the decision
+            // pairs in FINA / FINB. Stage E registers the two edges, stage C
+            // their comparison; the counts use stage C.
             let ki = self.ki.get();
             let ji = self.ji.get();
             let lk0 = self.lk0.get();
             let lk1 = self.lk1.get();
             let hk0 = self.hk0.get();
             let hk1 = self.hk1.get();
-            let je = mux(s_fin0, lk0, mux(s_fin1, lk1, ji));
-            let ke = mux(s_fin0, hk0, mux(s_fin1, hk1, ki));
+            let idone = self.idone.get();
+            let issue_i = s_inter & !idone;
+            let ie = issue_i | s_fina | s_finb;
+            let je_i = mux(s_fina, lk0, mux(s_finb, lk1, ji));
+            let ke_i = mux(s_fina, hk0, mux(s_finb, hk1, ki));
+            let ijp = je_i.slice::<0, 2>();
+            let ikp = ke_i.slice::<0, 2>();
+            let ijt = je_i.slice::<2, 2>();
+            let ikt = ke_i.slice::<2, 2>();
+            let jth = pick64(ijp, off0, off1, off2, off3).sext::<66>();
+            let kth = pick64(ikp, off0, off1, off2, off3).sext::<66>();
+            let jrd = pick33(ijp, rd0, rd1, rd2, rd3).zext::<66>();
+            let krd = pick33(ikp, rd0, rd1, rd2, rd3).zext::<66>();
+            let ej = mux(ijt == 0, jth - jrd, mux(ijt == 2, jth + jrd, jth));
+            let ek = mux(ikt == 0, kth - krd, mux(ikt == 2, kth + krd, kth));
+            let i_last = Bit::from(ji == 11);
+            // Stage C, from the registered edges.
+            let e_ej = self.e_ej.get();
+            let e_ek = self.e_ek.get();
+            let e_j = self.e_j.get();
+            let e_k = self.e_k.get();
+            let n_lt = e_ej.lt_signed(e_ek);
+            let n_klt = n_lt | (Bit::from(e_ej == e_ek) & Bit::from(e_j < e_k));
+            let n_keq = Bit::from(e_j == e_k);
+            // The pair whose comparison is used in this cycle.
+            let c_v = self.c_v.get();
+            let je = self.c_j.get();
+            let ke = self.c_k.get();
             let jp = je.slice::<0, 2>();
             let kp = ke.slice::<0, 2>();
             let jt = je.slice::<2, 2>();
             let kt = ke.slice::<2, 2>();
-            let jth = pick64(jp, off0, off1, off2, off3).sext::<66>();
-            let kth = pick64(kp, off0, off1, off2, off3).sext::<66>();
-            let jrd = pick33(jp, rd0, rd1, rd2, rd3).zext::<66>();
-            let krd = pick33(kp, rd0, rd1, rd2, rd3).zext::<66>();
-            let ej = mux(jt == 0, jth - jrd, mux(jt == 2, jth + jrd, jth));
-            let ek = mux(kt == 0, kth - krd, mux(kt == 2, kth + krd, kth));
-            let elt = ej.lt_signed(ek);
-            let klt = elt | (Bit::from(ej == ek) & Bit::from(je < ke));
-            let keq = Bit::from(je == ke);
+            let elt = self.c_lt.get();
+            let klt = self.c_klt.get();
+            let keq = self.c_keq.get();
 
             // ------------------------------------------------ intersection counts
             let el_j = pickb(jp, el0, el1, el2, el3);
@@ -558,9 +608,10 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
             let n_mgt = self.a_mgt.get() + (jmid & gt).zext::<3>();
             let c_lo = n_lole - n_hile;
             let c_hi = n_hige - n_loge;
-            let jlast = Bit::from(ji == 11);
-            let kend = s_inter & jlast;
-            let inter_end = kend & Bit::from(ki == 11);
+            let jlast = Bit::from(je == 11);
+            let acc_v = s_inter & c_v;
+            let kend = acc_v & jlast;
+            let inter_end = kend & Bit::from(ke == 11);
             let k_lo = kend & el_k & Bit::from(kt == 0);
             let k_mid = kend & el_k & Bit::from(kt == 1);
             let k_hi = kend & el_k & Bit::from(kt == 2);
@@ -917,14 +968,33 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
                     a_loge: U::<3>::from(0u8),
                     a_mlt: U::<3>::from(0u8),
                     a_mgt: U::<3>::from(0u8),
+                    idone: Bit::Zero,
                     lv0: Bit::Zero,
                     lv1: Bit::Zero,
                     hv0: Bit::Zero,
                     hv1: Bit::Zero,
                 },
-                // Intersection: one comparison per cycle.
-                s_inter ? {
-                    ji: ji + 1,
+                // Comparator pipeline, every cycle.
+                e_v: ie,
+                e_j: je_i,
+                e_k: ke_i,
+                e_ej: ej,
+                e_ek: ek,
+                c_v: self.e_v.get(),
+                c_j: e_j,
+                c_k: e_k,
+                c_lt: n_lt,
+                c_klt: n_klt,
+                c_keq: n_keq,
+                // Intersection: one pair issued per cycle.
+                issue_i ? ji: ji + 1,
+                issue_i & i_last ? {
+                    ji: U::<4>::from(0u8),
+                    ki: ki + 1,
+                },
+                issue_i & i_last & Bit::from(ki == 11) ? idone: Bit::One,
+                // Counts, from the pair compared two cycles after its issue.
+                acc_v ? {
                     rk: n_rk,
                     a_lole: n_lole,
                     a_hile: n_hile,
@@ -934,8 +1004,6 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
                     a_mgt: n_mgt,
                 },
                 kend ? {
-                    ji: U::<4>::from(0u8),
-                    ki: ki + 1,
                     rk: U::<4>::from(0u8),
                     a_lole: U::<3>::from(0u8),
                     a_hile: U::<3>::from(0u8),
@@ -944,15 +1012,19 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
                     a_mlt: U::<3>::from(0u8),
                     a_mgt: U::<3>::from(0u8),
                 },
-                ul0 ? { lv0: Bit::One, lk0: ki, lr0: n_rk, lf0: n_mlt },
-                ul1 ? { lv1: Bit::One, lk1: ki, lr1: n_rk, lf1: n_mlt },
-                uh0 ? { hv0: Bit::One, hk0: ki, hr0: n_rk, hf0: n_mgt },
-                uh1 ? { hv1: Bit::One, hk1: ki, hr1: n_rk, hf1: n_mgt },
+                ul0 ? { lv0: Bit::One, lk0: ke, lr0: n_rk, lf0: n_mlt },
+                ul1 ? { lv1: Bit::One, lk1: ke, lr1: n_rk, lf1: n_mlt },
+                uh0 ? { hv0: Bit::One, hk0: ke, hr0: n_rk, hf0: n_mgt },
+                uh1 ? { hv1: Bit::One, hk1: ke, hr1: n_rk, hf1: n_mgt },
                 um0 ? mr0: n_rk,
                 um1 ? mr1: n_rk,
                 um2 ? mr2: n_rk,
                 um3 ? mr3: n_rk,
-                inter_end ? st: U::<5>::from(FIN0),
+                inter_end ? st: U::<5>::from(FINA),
+                // Decision: the pairs (lk0, hk0) and (lk1, hk1) are issued in
+                // FINA and FINB; their comparisons are read in FIN0 and FIN1.
+                s_fina ? st: U::<5>::from(FINB),
+                s_finb ? st: U::<5>::from(FIN0),
                 // Decision.
                 s_fin0 ? { s0: ok_a0, st: U::<5>::from(FIN1) },
                 fin_fail ? { ok: Bit::Zero, prev_v: Bit::Zero, st: U::<5>::from(OUT) },

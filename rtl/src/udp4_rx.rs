@@ -73,7 +73,7 @@
 //! when the output it feeds has room (byte 7 waits for room on `ntp_meta`,
 //! payload bytes for room on `ntp`). `ntp_meta` must be popped by the
 //! consumer independently of the payload.
-use crate::csum::{csum_add, csum_fold, pseudo_v4};
+use crate::csum::{csum_add, csum_fold, csum_ok, pseudo_v4};
 use crate::ipv4_rx::IpMeta;
 use crate::stream::{FrameByte, Meta};
 use txhdl::comp::{mux, Clock, DefaultClock, Reg, Rx, Tx, Unit};
@@ -167,7 +167,7 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp4Rx {
             // the pseudo-header seed off its path (task T5.3; same value
             // wherever it is used).
             let next_f = mux(add, csum_add(acc, word), acc);
-            let sum_ok = Bit::from(csum_fold(next_f) == U::<16>::from(0xFFFFu16));
+            let sum_ok = csum_ok(next_f);
             let ck_good = self.nock.get() | sum_ok;
 
             if (take & p7 & !last).to_bool() {

@@ -69,7 +69,7 @@
 //! is followed by exactly one frame on `out_payload`, which `ipv4_tx` needs.
 //! Throughput is one byte per cycle at best; the reply never starts before
 //! `req` is accepted, so a full `req` channel stalls the input.
-use crate::csum::{csum_add, csum_fold};
+use crate::csum::{csum_add, csum_fold, csum_ok};
 use crate::ipv4_rx::IpMeta;
 use crate::ipv4_tx::IpTxReq;
 use crate::stream::FrameByte;
@@ -162,7 +162,7 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<IpTxReq>, Tx<FrameByte>)> for IcmpEch
             let word = mux(odd, (hi.zext::<16>() << 8u32) | lo, lo << 8u32);
             let add = odd | last;
             let next = mux(add, csum_add(acc, word), acc);
-            let sum_ok = Bit::from(csum_fold(next) == U::<16>::from(0xFFFFu16));
+            let sum_ok = csum_ok(next);
 
             // New checksum from the old one (RFC 1624), known at byte 3.
             let ck_old = (hi.zext::<16>() << 8u32) | lo;
