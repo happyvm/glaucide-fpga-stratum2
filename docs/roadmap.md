@@ -12,7 +12,7 @@ Le modèle est une recommandation, pas une contrainte. Si un agent bloque, il le
 ## Conventions (valables pour toutes les tâches)
 
 1. **Une tâche = un fichier source principal** dans `rtl/src/`, déclaré dans `rtl/src/lib.rs`, plus un test dans `rtl/tests/` (`cargo test -p ntp_fpga`). Ne pas toucher aux fichiers des autres tâches, sauf `lib.rs` (ajout d'une ligne `pub mod`).
-2. **Définition de « fini »** : (a) `cargo test -p ntp_fpga` passe, (b) `tools/gen_verilog.sh` produit le Verilog du module sans erreur, (c) le critère d'acceptation de la tâche est vérifié par un test, (d) un commit par tâche, message `T<id>: <titre>`.
+2. **Définition de « fini »** : (a) `cargo test -p ntp_fpga` passe, (b) `tools/gen_verilog.sh` produit le Verilog du module sans erreur, (c) le critère d'acceptation de la tâche est vérifié par un test, (d) **les propriétés du catalogue `docs/formal.md` qui concernent le module sont écrites en `check!`/`assume!`/`cover!` dans l'unité et prouvées (`tools/formal/prove.sh <unité> prove` → PASS)**, avec un test de mutation qui les fait échouer, (e) un commit par tâche, message `T<id>: <titre>`. Une propriété hors de portée de l'induction est prouvée en `bmc` borné, avec la borne justifiée dans le commit.
 3. **Branches** : une branche `task/T<id>` par tâche, fusion par l'humain ou par la tâche d'intégration. Pas de force-push.
 4. **Interfaces** : les modules se parlent uniquement par les types de `rtl/src/stream.rs` (tâche T0.1). Pas de port ad hoc.
 5. **Référence** : tout comportement protocolaire est comparé au modèle Python `tools/golden/` (tâche T0.3) ou à un vecteur de test réel (pcap hexadécimal).
@@ -91,6 +91,28 @@ Le modèle est une recommandation, pas une contrainte. Si un agent bloque, il le
 | T5.4 | Procédure de test réelle (chrony/ntpd/`ntpq`) sur carte, mesures d'offset et de jitter | Sonnet | T4.7 | `docs/bringup.md` | Procédure pas à pas, tableau de résultats à remplir |
 | T5.5 | Revue de sécurité : amplification, spoofing, taille des réponses, KoD | Opus | T2.5, T4.7 | `docs/security.md` | Liste de risques et décisions |
 | T5.6 | Documentation utilisateur finale | Haiku | tout | `README.md`, `docs/` | Un lecteur reproduit la génération et le flash |
+
+## Piste F — Preuves formelles
+
+Voir `docs/formal.md` (méthode, catalogue de propriétés, règles anti-vacuité). Les tâches RTL prouvent leurs propres propriétés (définition de « fini », point 2d) ; cette piste construit l'outillage et prouve les propriétés transverses.
+
+| ID | Tâche | Modèle | Dépend de | Livrable | Critère d'acceptation |
+|---|---|---|---|---|---|
+| F0.1 | Outillage de preuve (fait) : `prove.sh`, `formal_gen`, unité `formal_smoke` | — | — | `tools/formal/prove.sh`, `rtl/src/formal_smoke.rs` | PASS sur `formal_smoke` ; propriété fausse → FAIL |
+| F0.2 | Étendre `formal_gen` : registre d'unités, prise en charge des unités composées (vérifier que TxHDL génère l'`ifdef FORMAL` pour les sous-unités) | Sonnet | T0.1 | `rtl/src/bin/formal_gen.rs` | Une unité composée de deux sous-unités prouvée |
+| F0.3 | Vérificateur de garantie/hypothèse : chaque `assume!` a un `check!` de même message ailleurs, sinon échec | Haiku | F0.2 | `tools/formal/contracts.py` | Détecte une hypothèse orpheline sur un cas de test |
+| F0.4 | Job CI : preuves de toutes les unités + `cover`, temps limité, résumé PASS/FAIL/UNKNOWN | Haiku | T0.4, F0.2 | `.github/workflows/formal.yml` | UNKNOWN fait échouer le job |
+| F0.5 | Moniteurs de flux : unité réutilisable portant les propriétés « flux d'octets » du catalogue | Opus | T0.1, F0.2 | `rtl/src/monitors/stream_mon.rs` | Branchée sur un producteur correct : PASS ; sur un producteur mutant : FAIL |
+| F1.1 | Équivalence CRC-32 : le module de T1.3 égale un modèle bit à bit | Opus | T1.3, F0.2 | `rtl/src/formal/crc_equiv.rs` | Preuve non bornée PASS sur le CRC 8 bits/cycle |
+| F1.2 | Propriétés MII RX/TX (préambule/SFD, IFG, fidélité des octets) | Opus | T1.1, T1.2, F0.5 | dans `mii_rx.rs`, `mii_tx.rs` | Tableau « MII » du catalogue entièrement couvert |
+| F1.3 | Propriétés Ethernet/ARP/IPv4/ICMP (champs, checksums, rejets) | Sonnet | T1.5–T1.10, F0.5 | dans chaque module | Tableaux correspondants couverts, tous les `cover!` atteints |
+| F2.1 | Propriétés UDP et checksum v4/v6 (équivalence avec modèle RFC 1071) | Sonnet | T2.2, T3.2, F0.2 | `rtl/src/formal/csum_equiv.rs` | Preuve PASS |
+| F2.2 | Propriétés du serveur NTP (origin/transmit, stratum, LI, taille, pas d'amplification) | Opus | T2.3, T2.4, F0.5 | dans `ntp_server.rs`, `ntp_policy.rs` | Ligne « NTP serveur » et « Politique/KoD » couvertes |
+| F3.1 | Propriétés IPv6 / ICMPv6 / NDP | Sonnet | T3.1–T3.5, F0.5 | dans chaque module | Lignes correspondantes couvertes |
+| F4.1 | Propriétés de l'horloge : monotonie, bornes de trim, absence de dépassement (invariant) | Opus | T2.1, F0.2 | dans `clock.rs` | Preuve non bornée PASS, ou invariant documenté et prouvé |
+| F4.2 | Propriétés du client, filtre, sélection, servo, état de synchro | Opus | T4.2–T4.6 | dans chaque module | Lignes « Client », « Filtre », « Servo », « État » couvertes |
+| F5.1 | Top formel de bout en bout : hypothèses sur l'environnement seulement, vivacité bornée (réponse en ≤ N cycles) | Opus | F2.2, F3.1, T1.11 | `rtl/src/formal/top_formal.rs` | PASS ; borne N justifiée |
+| F5.2 | Rapport de couverture des preuves : propriétés du catalogue ↔ preuves ↔ `cover!` ; trous listés | Haiku | tout F | `docs/formal-report.md` | Chaque ligne du catalogue est cochée ou justifiée |
 
 ## Graphe critique
 

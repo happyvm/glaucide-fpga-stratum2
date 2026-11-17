@@ -5,7 +5,7 @@ Serveur NTP **stratum 2**, **IPv4 + IPv6**, entièrement en logique FPGA, sur **
 - Langage : [TxHDL](https://github.com/filmil/hdl-txhdl) (HDL transactionnel embarqué en Rust, sortie Verilog), épinglé au commit de `tools/setup.sh`.
 - Le FPGA est client NTP de serveurs stratum 1 (amont) et sert ses clients avec des timestamps matériels au niveau MAC.
 
-Voir [docs/architecture.md](docs/architecture.md) et la [roadmap par tâches/agents](docs/roadmap.md).
+Voir [docs/architecture.md](docs/architecture.md) , la [roadmap par tâches/agents](docs/roadmap.md) et les [preuves formelles](docs/formal.md).
 
 ## Démarrage
 
@@ -13,6 +13,7 @@ Voir [docs/architecture.md](docs/architecture.md) et la [roadmap par tâches/age
 tools/setup.sh                              # clone TxHDL au commit épinglé
 cargo run -p ntp_fpga --bin clock_sim       # simule l'horloge NTP (1 ms)
 tools/gen_verilog.sh                        # génère out/*.v pour Vivado
+tools/formal/prove.sh formal_smoke prove    # preuve formelle (pip install yowasp-yosys z3-solver)
 ```
 
 Cargo sert à simuler et générer le Verilog rapidement. TxHDL amont utilise Bazel (9.2.0) ; la chaîne Bazel complète n'a pas pu être testée ici (dépendance `filmil/bazel-rules-bid` bloquée par le proxy du conteneur).
