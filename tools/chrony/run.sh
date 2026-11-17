@@ -21,6 +21,9 @@
 #   extfield    chrony's experimental extension field F323 (76-byte requests)
 #   version3    NTPv3 requests
 #   version2    NTPv2 requests (the server answers VN 3 and 4 only)
+#   sync-loss   fixed stratum 2 for 40 virtual s, then the server loses its
+#               synchronisation (stratum 16, LI 3), 100 virtual s: chronyd must
+#               stop selecting it and must not follow its time
 #   noff        no fast-forward: every one of the 3e7 cycles of 0.3 virtual s
 #               simulated (minpoll -7 = 7.8 ms, noselect; chronyd's first
 #               request leaves at 0.2 s): validates the skipping of idle
@@ -69,6 +72,7 @@ spec() {
     extfield) echo "--sync fixed --rate-limit 8|minpoll 0 maxpoll 0 extfield F323|30" ;;
     version3) echo "--sync fixed --rate-limit 8|minpoll 0 maxpoll 0 version 3|30" ;;
     noff) echo "--sync fixed --rate-limit 8 --no-ff|minpoll -7 maxpoll -7 noselect|0.3" ;;
+    sync-loss) echo "--sync fixed --rate-limit 8 --sync-loss-at 40|minpoll 0 maxpoll 0 iburst|100" ;;
     version2) echo "--sync fixed --rate-limit 8|minpoll 0 maxpoll 0 version 2|20" ;;
     *) echo "unknown scenario $1" >&2; exit 2 ;;
     esac

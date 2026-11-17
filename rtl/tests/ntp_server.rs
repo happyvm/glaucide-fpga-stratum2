@@ -1122,6 +1122,66 @@ fn leak_rate_over_the_limit() {
     assert_eq!(outs.len(), 8);
 }
 
+/// Long-running device: the limiter keeps the low 16 bits of the NTP seconds, which wrap
+/// every 18 h 12 min, and the NTP seconds themselves wrap at the end of era 0
+/// (2036-02-07). Across both boundaries the window must still roll over (a source that
+/// used its allowance gets a fresh one, one that has not is not penalised), and the
+/// replies carry the right 64-bit timestamps (T2 before, T3 after the era boundary).
+#[test]
+fn seconds_counter_and_era_wraparound() {
+    let base = Cfg { rate_limit: 3, tx_latency: 0x1234, ..vcfg() };
+    let a = 0xC000_0202u128;
+    let mk = |n: usize, tag: u16| -> Vec<Req> {
+        (0..n)
+            .map(|i| {
+                let mut r = req4(ntp_req(0x23, 6, (tag as u64) << 16 | i as u64, 0), tag + i as u16);
+                r.src = a;
+                r.rx_ts = 0; // T3 is clamped to T2: keep T2 out of the way
+                r
+            })
+            .collect()
+    };
+    // Second boundaries to cross: low 16 bits 0xFFFF -> 0x0000 (inside an era) and the era
+    // boundary 0xFFFF_FFFF -> 0 (which is also a 16-bit wrap).
+    for (before, after) in [(0xECC5_FFFFu64, 0xECC6_0000u64), (0xFFFF_FFFFu64, 0u64), (0x0001_FFFEu64, 0x0001_FFFFu64)] {
+        let reqs = mk(10, 100);
+        let n = cycles_for(&reqs, 0, 1);
+        let cut = 400;
+        let roll = move |t: usize| (((if t < cut { before } else { after }) as u128) << 32) << 32;
+        let ro = run(&reqs, &base, 0, roll, |_| true, |_| true, n);
+        let b = ro.outs.iter().filter(|o| o.t_last < cut).count();
+        let af = ro.outs.iter().filter(|o| o.t_last >= cut).count();
+        assert!(ro.sent_t[3] < cut && ro.sent_t[9] > cut + 200, "burst spans the boundary");
+        assert_eq!((b, af), (3, 3), "window {before:#x}->{after:#x}: 3 per second");
+        // Transmit Timestamp seconds follow the clock across the boundary (replies well away
+        // from the cut; T3 is sampled a little before the last byte leaves).
+        for o in &ro.outs {
+            let t3s = (o.t3() >> 32) as u32;
+            if o.t_last + 100 < cut {
+                assert_eq!(t3s, before as u32, "T3 seconds before {before:#x}");
+            } else if o.t_last >= cut + 100 {
+                assert_eq!(t3s, after as u32, "T3 seconds after {after:#x}");
+            }
+        }
+    }
+}
+
+/// Rate-limiter hash on IPv6 /64 prefixes in arithmetic progression (consecutive subnets of
+/// a /48, of /32s, /16s): same bucket-use requirement as for IPv4 (finding N1).
+#[test]
+fn ipv6_prefix_progressions_spread() {
+    for secret in [Test::RATE_SECRET, ntp_fpga::config::Board::RATE_SECRET] {
+        for (stride, n, min) in [(1u64, 4096usize, 2330usize), (1 << 16, 4096, 2330), (1 << 32, 2048, 1450)] {
+            let mut seen = vec![false; RL_ENTRIES];
+            for i in 0..n as u64 {
+                seen[rl_index(0x2001_0DB8_0000_0000u64.wrapping_add(i * stride), secret)] = true;
+            }
+            let d = seen.iter().filter(|&&x| x).count();
+            assert!(d >= min, "secret {secret:#x} stride {stride:#x}: {d} buckets < {min}");
+        }
+    }
+}
+
 /// F2, victim view: 400 independent victims, each with 8 forged requests
 /// (which exhaust its allowance) followed by its real request in the same
 /// second. The real request is answered about once in 16: 25 +- 4.8 expected

@@ -393,6 +393,29 @@ def sc_version2(d):
     check(src is not None and src["reach"] == "0" and src["state"] != "*", "chrony: unreachable, not selected")
 
 
+def sc_sync_loss(d):
+    """The server is synchronised (stratum 2) for 40 virtual s, then reports stratum 16 / LI 3.
+    chronyd must select it first, then stop: after the loss no source is selected, reach
+    drains to 0 and chronyd's tracking does not stay on it."""
+    lines, msgs = chronyd_log(d)
+    say(f"  bridge: {bridge_done(d).replace('chrony_bridge: done: ', '')}")
+    src = source_line(d)
+    say(f"  chronyc sources: {src['line'] if src else None}")
+    check(any("Selected source" in m for m in msgs), "chronyd selected the source while it was synchronised")
+    check(src is not None and src["state"] not in "*+", "at the end chrony no longer selects it")
+    check(src is not None and src["reach"] == "0", "reach drained to 0 (unsynchronised replies are not counted)")
+    reps = [(t, p) for k, _, t, _, _, p in hexdump(d) if k == "rep"]
+    before = [p for t, p in reps if t < 39]
+    after = [p for t, p in reps if t > 42]
+    check(len(before) >= 30 and all(p[1] == 2 and p[0] >> 6 == 0 for p in before),
+          f"{len(before)} replies before the loss: stratum 2, LI 0")
+    check(len(after) >= 30 and all(p[1] == 16 and p[0] >> 6 == 3 for p in after),
+          f"{len(after)} replies after the loss: stratum 16, LI 3")
+    sel = [m for m in msgs if "Selected source" in m]
+    say(f"  chronyd log: {len(sel)} selection(s); last non-selection message: "
+        f"{[m for m in msgs if 'synchronise' in m or 'No selectable' in m][-1:]}")
+
+
 SCEN = {
     "fixed": sc_fixed,
     "offset": sc_offset,
@@ -405,6 +428,7 @@ SCEN = {
     "version3": sc_version3,
     "version2": sc_version2,
     "noff": sc_noff,
+    "sync-loss": sc_sync_loss,
 }
 
 

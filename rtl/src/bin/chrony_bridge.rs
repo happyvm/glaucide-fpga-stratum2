@@ -433,6 +433,8 @@ struct Opts {
     fixed: bool,
     rate_limit: u16,
     duration_s: f64,
+    /// Virtual second at which the server loses its synchronisation (stratum 16, LI 3).
+    loss_at_s: Option<f64>,
     shm: String,
     log: Option<String>,
     hexdump: bool,
@@ -444,7 +446,7 @@ struct Opts {
 fn usage() -> ! {
     eprintln!(
         "usage: chrony_bridge --shm FILE [--port P (12300)] [--sync fixed|standalone] \
-         [--rate-limit 0|1|2|4|8 (8)] [--duration VIRTUAL_S (60)] [--log CSV] [--hexdump] \
+         [--sync-loss-at VIRTUAL_S] [--rate-limit 0|1|2|4|8 (8)] [--duration VIRTUAL_S (60)] [--log CSV] [--hexdump] \
          [--no-ff] [--status WALL_S (5)] [--max-wall WALL_S (3600)]"
     );
     std::process::exit(2)
@@ -456,6 +458,7 @@ fn opts() -> Opts {
         fixed: true,
         rate_limit: 8,
         duration_s: 60.0,
+        loss_at_s: None,
         shm: String::new(),
         log: None,
         hexdump: false,
@@ -477,6 +480,7 @@ fn opts() -> Opts {
                 }
             }
             "--rate-limit" => o.rate_limit = val(i).parse().unwrap_or_else(|_| usage()),
+            "--sync-loss-at" => o.loss_at_s = Some(val(i).parse().unwrap_or_else(|_| usage())),
             "--duration" => o.duration_s = val(i).parse().unwrap_or_else(|_| usage()),
             "--shm" => o.shm = val(i),
             "--log" => o.log = Some(val(i)),
@@ -653,6 +657,11 @@ fn run<C: ConfigSet + 'static>(o: &Opts) {
                     d => (d as f64 - vt as f64) / 1e9,
                 }
             );
+        }
+        if let Some(l) = o.loss_at_s {
+            if (vt - t0_ns) as f64 >= l * 1e9 {
+                ctl.fixed.set(false);
+            }
         }
         // May the simulation advance? Only while chronyd waits, and not
         // again in the same wait after a delivery or its deadline.

@@ -121,6 +121,7 @@ avance de 10 ns par cycle simulé, environ 800 à 1 000 fois plus lentement que 
 | `xleave` | strate 2 | `minpoll 0 maxpoll 0 xleave` | 30 s |
 | `extfield` | strate 2 | `minpoll 0 maxpoll 0 extfield F323` | 30 s |
 | `version3` / `version2` | strate 2 | `… version 3` / `… version 2` | 30 s / 20 s |
+| `sync-loss` | strate 2 pendant 40 s puis strate 16 / LI 3 (`--sync-loss-at 40`) | `minpoll 0 maxpoll 0 iburst` | 100 s |
 | `noff` | strate 2, **sans saut** | `minpoll -7 maxpoll -7 noselect` | 0,3 s |
 
 Configuration commune : `clockprecision 0.000000001`, `cmdport 0`, socket de commande UNIX dans un répertoire privé
@@ -372,3 +373,10 @@ chrony l'affiche (`Response time`) sans conséquence.
 - La carte avec client (`ArtyBoardWithClient`, horloge réellement disciplinée, `ref_ts` et dispersion vivants) : le
   pont utilise le top serveur seul, avec les champs de référence fixes de `FixedSync`.
 - NTS / authentification (non pris en charge par le design ; chrony compilé sans).
+
+## Perte de synchronisation en cours de route (`sync-loss`)
+
+Le serveur est synchronisé (strate 2) pendant 40 s virtuelles, puis annonce strate 16 / LI 3 (`--sync-loss-at 40` du pont). Résultat : chronyd
+sélectionne la source (1 sélection), puis, après la perte, affiche « Can't synchronise: no selectable sources », la sélection disparaît, `reach`
+retombe à 0 (les réponses non synchronisées ne comptent pas) ; 41 réponses avant la perte (strate 2, LI 0) et 57 après (strate 16, LI 3), toutes
+conformes. Un client chrony ne suit donc pas un serveur qui perd sa référence.

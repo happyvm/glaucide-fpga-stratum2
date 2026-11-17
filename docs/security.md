@@ -225,3 +225,5 @@ Effet attendu : la capacité totale passe à 4 096 × 8 = 32 768 réponses/s (�
 ## N1 — répartition du hash du limiteur (trouvé par ntpperf)
 
 Le hash multiply-shift répartit mal les adresses consécutives pour certains secrets (jeu Test : 1 498 buckets pour 3 000 sources). Correctif : `ntp_server::rl_secret_ok` (const fn) rejette à la compilation, via `config::Checks`, tout `RATE_SECRET` qui n'utilise pas ≥ ~90 % des buckets attendus pour des progressions d'adresses (pas 1, 2, 256, 65536). `tools/gen_rate_secret.py` choisit/vérifie un secret (≈ 4 sur 10 passent). Secrets Board et Test remplacés.
+
+Tests ajoutés après ntpperf/chrony : `seconds_counter_and_era_wraparound` (le compteur de secondes 16 bits du limiteur et le passage d'ère NTP de 2036 : la fenêtre se renouvelle, T3 suit l'horloge ; T3 est ramené à T2 si T2 est juste avant le passage et T3 juste après, erreur de l'ordre de la durée de réponse, sans conséquence), `ipv6_prefix_progressions_spread` (progressions de préfixes /64 IPv6, même exigence que N1), scénario chrony `sync-loss`.
