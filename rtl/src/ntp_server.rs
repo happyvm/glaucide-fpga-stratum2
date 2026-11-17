@@ -57,7 +57,8 @@
 //! States: IDLE → RECV → (META → OUT) → IDLE.
 //!
 //! 1. **IDLE**: if `meta4` or `meta6` has a `Meta`, one is popped (round
-//!    robin: when both are pending, the family *not* served last wins; when
+//!    robin: when both are pending, the family *not* served last wins, IPv6
+//!    first after reset (`rr` = 0 reads as "IPv4 served last"); when
 //!    only one is pending it is taken). Its fields are registered, together
 //!    with the rate-limiter index of the source (see « Rate limiter »). No
 //!    payload byte is taken in this cycle.

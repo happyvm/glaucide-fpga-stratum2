@@ -239,6 +239,7 @@ fn run(
     let mut done: VecDeque<(Vec<FrameByte>, usize, usize, usize)> = VecDeque::new();
     for t in 0..cycles {
         time_o.set(U::<96>::new(time(t) & ((1u128 << 96) - 1)));
+        #[allow(clippy::needless_range_loop)]
         for f in 0..2 {
             if let Some(&(i, k)) = qs[f].front() {
                 let r = &reqs[i];
@@ -726,7 +727,7 @@ fn precision_field() {
             precision: p,
             ..vcfg()
         };
-        let outs = run_simple(&[r.clone()], &cfg);
+        let outs = run_simple(std::slice::from_ref(&r), &cfg);
         assert_eq!(outs[0].data()[3], p);
     }
     assert_eq!(DEFAULT_PRECISION as i8, -24);
@@ -1291,7 +1292,13 @@ fn chain_ntp4_basic() {
     let d = dgram_of(&rx);
     // Frozen clock at T_RECV, K = T_XMIT - T_RECV: the vector's timestamps.
     let cfg = vcfg();
-    let frames = chain4(&[d.clone()], &cfg, T_RECV, |_| (T_RECV as u128) << 32, 800);
+    let frames = chain4(
+        std::slice::from_ref(&d),
+        &cfg,
+        T_RECV,
+        |_| (T_RECV as u128) << 32,
+        800,
+    );
     assert_eq!(frames.len(), 1);
     check_frame(&frames[0].0, &tx, "ntp4_basic reply frame");
     // Back to back.
