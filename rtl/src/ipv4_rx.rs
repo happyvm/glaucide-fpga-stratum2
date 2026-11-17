@@ -87,7 +87,7 @@ use crate::eth_rx::EthMeta;
 use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
+use txhdl::{assume, check, cover, lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
 
 /// IP protocol numbers.
 pub const PROTO_ICMP: u8 = 1;
@@ -135,6 +135,15 @@ pub struct Ipv4Rx {
     /// The final packet byte is held, the padding is being swallowed.
     pub sw: Reg<Bit>,
     pub held: Reg<U<8>>,
+    // Monitors (only read by check!/cover!; pruned in synthesis): the raw header bytes the
+    // verdict must rest on, the group bit of the Ethernet destination, and the number of
+    // payload bytes sent for the packet in progress.
+    pub m_b0: Reg<U<8>>,
+    pub m_b6: Reg<U<8>>,
+    pub m_b7: Reg<U<8>>,
+    pub m_mc: Reg<Bit>,
+    pub m_cnt: Reg<U<16>>,
+    pub m_lip: Reg<U<32>>,
 }
 
 #[lower]
@@ -259,6 +268,56 @@ impl
                 udp_p.send(ob);
             }
 
+            // ---- formal properties (orchestrator; docs/formal.md, rows "IPv4" and "Flux") ----
+            assume!(!have | !b.err | last, "payload: err only together with last (stream contract 2)");
+            assume!(!(have & Bit::from(pos >= 1517)) | last, "a frame has at most 1518 bytes (stream contract 3)");
+            assume!(Bit::from(local_ip.get() == self.m_lip.get()), "local_ip is constant (configuration wire)");
+            let m_any = m_icmp | m_udp;
+            let m_dec = take & dec_fwd;
+            let p_any = p_icmp | p_udp;
+            let m_cnt = self.m_cnt.get();
+            let fwd_any = f_icmp | f_udp;
+            let src_hi = src >> 24u32;
+            // The verdict, restated from the raw bytes (independent of `ok`, `src_ok_r`, `accept`).
+            check!(!m_any | p19, "a packet is forwarded on byte 20 of the header only");
+            check!(!m_any | (Bit::from(self.m_b0.get() == 0x45u8) & !self.m_mc.get() & !self.esrc.get().bit(40)), "version 4, IHL 5, Ethernet destination and source not group addressed (I0, I1, E1)");
+            check!(!m_any | (Bit::from((self.m_b6.get() & 0x3Fu8) == 0u8) & Bit::from(self.m_b7.get() == 0u8)), "no fragment: MF clear and offset 0 (I3)");
+            check!(!m_any | !Bit::from(self.ttl.get() == 0u8), "TTL not 0 (I4)");
+            check!(!m_any | Bit::from(tl > 20), "total length above 20 (I1)");
+            check!(!m_any | Bit::from(dst_fin == local_ip.get()), "destination is our address (I5)");
+            check!(!m_any | (!Bit::from(src_hi == 0u8) & !Bit::from(src_hi == 127u8) & Bit::from(src_hi < 224u8) & !Bit::from(src == local_ip.get())), "source is a valid unicast host address (I6)");
+            check!(!m_any | !last, "a packet has a byte after the header");
+            check!(!m_icmp | Bit::from(proto == 1u8), "ICMP meta only for protocol 1");
+            check!(!m_udp | Bit::from(proto == 17u8), "UDP meta only for protocol 17");
+            check!(!(m_icmp & m_udp), "a packet goes to one protocol");
+            check!(!(f_icmp & f_udp), "forwarding to one protocol at a time");
+            check!(!(m_any & fwd_any), "a new packet is not decided while one is being forwarded");
+            // Invariants tying `ok` to the raw bytes (the induction needs them).
+            check!(!(ok & Bit::from(pos >= 1)) | (Bit::from(self.m_b0.get() == 0x45u8) & !self.m_mc.get() & !self.esrc.get().bit(40)), "ok: byte 0 and the group bits were good");
+            check!(!(ok & Bit::from(pos >= 7)) | Bit::from((self.m_b6.get() & 0x3Fu8) == 0u8), "ok: flags and offset high were good");
+            check!(!(ok & Bit::from(pos >= 8)) | Bit::from(self.m_b7.get() == 0u8), "ok: offset low was good");
+            check!(!(ok & Bit::from(pos >= 9)) | !Bit::from(self.ttl.get() == 0u8), "ok: TTL was not 0");
+            // Payload.
+            check!(!p_any | fwd_any, "a payload byte is sent only for a forwarded packet");
+            check!(!p_icmp | f_icmp, "ICMP payload only on the ICMP channel");
+            check!(!p_udp | f_udp, "UDP payload only on the UDP channel");
+            check!(!(p_icmp & p_udp), "one channel per byte");
+            check!(!p_any | !sw | last, "while the final byte is held only it is sent, with the frame's last");
+            check!(!(p_any & o_last) | last, "the packet ends with the frame (last of the input)");
+            check!(!(p_any & o_err) | o_last, "err only together with last (stream contract 2)");
+            check!(!(p_any & o_last & !o_err) | Bit::from(m_cnt + 1 == tl - 20), "a good packet carries exactly total length - 20 payload bytes");
+            check!(!(fwd_any & !sw) | (Bit::from(pos >= 20) & Bit::from(pos < tl)), "forwarding: past the header and before the end");
+            check!(!(fwd_any & !sw) | Bit::from(m_cnt + 20 == pos), "forwarding: the byte count follows the position");
+            check!(!sw | Bit::from(m_cnt + 21 == tl), "final byte held: all others were sent");
+            check!(!sw | fwd_any, "a held byte belongs to a forwarded packet");
+            check!(!sw | (Bit::from(pos >= tl) & Bit::from(tl > 20)), "final byte held: the position is at or past the total length");
+            cover!(m_icmp, "an ICMP packet is forwarded");
+            cover!(m_udp, "a UDP packet is forwarded");
+            cover!(take & p19 & !accept & !last, "a header is rejected on byte 20");
+            cover!(send_held, "a held final byte is sent after the padding");
+            cover!(p_any & o_last & o_err & !b.err, "a packet longer than its frame is aborted");
+            cover!(p_any & o_last & !o_err, "a good packet is completed");
+
             with!(self <= {
                 src_ok_r: src_ok_n,
                 take ? pos: pos + U::<16>::from(1u16),
@@ -270,7 +329,14 @@ impl
                 take & p0 ? {
                     esrc: m.src,
                     ets: m.ts,
+                    m_b0: b.data,
+                    m_mc: m.multicast,
                 },
+                take & p6 ? m_b6: b.data,
+                take & p7 ? m_b7: b.data,
+                m_lip: local_ip.get(),
+                m_dec ? m_cnt: U::<16>::from(0u16),
+                p_any ? m_cnt: m_cnt + U::<16>::from(1u16),
                 take & in_src ? src: (src << 8u32) | b.data.zext::<32>(),
                 take & in_dst ? dst: dst_fin,
                 take & in_h & !odd ? hi: b.data,
