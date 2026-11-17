@@ -31,7 +31,7 @@ Un cœur distinct plutôt qu'un marqueur sur `S` : le client coupe des canaux du
 | `arp.lookup_rsp` | `client.arp_rsp` | `ArpEntry` |
 | `client.nd_lookup` / `nbr.rsp` | `nbr.lookup` / `client.nd_rsp` (`NbrCache`, `flush` = 0) | `U<128>` / `ArpEntry` |
 | `client.nd_resolve` | `icmp6.resolve` (émission des NS) | `U<128>` |
-| `icmp6.learn` | `nbr.learn` (appris des NA et des NS) | `NdLearn` |
+| `icmp6.learn` | `nbr.learn` (appris des seuls NA sollicités, F5) | `NdLearn` |
 | `client.samples`, `.miss` | `sync.samples`, `.miss` (`ClientSync`) | `Sample`, `U<2>` |
 | configuration | tous les fils du client (`up0..3`, adresses, masque, passerelles, `poll_log2`, `precision`) | fils |
 | `clock.time` | client (`time`) | fil |

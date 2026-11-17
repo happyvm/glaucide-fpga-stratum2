@@ -12,7 +12,9 @@
 //!
 //! # Behaviour
 //!
-//! * `learn(ip, mac)`: always taken (never held back). If `ip` is already in a
+//! * `learn(ip, mac)` (F5/F6: `icmpv6` now only emits it for an NA that
+//!   answers its own solicitation, so no host of the link can create entries or
+//!   evict the gateway): always taken (never held back). If `ip` is already in a
 //!   valid entry, that entry is updated in place (a MAC change replaces the old
 //!   one; no duplicate address ever exists). Otherwise the entry at the
 //!   round-robin pointer `rr` is replaced (valid or not) and `rr` advances
