@@ -14,11 +14,12 @@
 # Then tools/ntpperf/analyse.py checks everything and writes
 # out/ntpperf/results/summary.md (exit code 1 if a check fails).
 #
-# Default set (about 15 minutes of wall time on 4 cores): ntpperf's own
+# Default set (626 s of wall time on 4 cores, 46 s more for build.sh): ntpperf's own
 # sampling interval is set to its minimum, 0.2 s of VIRTUAL time (each rate
 # point lasts 0.5 virtual s with ntpperf's warm-up), 1.0 s for the
 # rate-limiter jobs (whole one-second windows). --long adds full sweeps
-# (several hours) and the validation of the idle-cycle skipping.
+# (34 minutes each) and the validation of the idle-cycle skipping (about
+# 40 minutes in total on 4 cores).
 #
 # Jobs (name: bridge options | ntpperf options):
 #   a-sweep    no limiter | -B -r 1000-11390 -x 1.5   response time, 7 rates

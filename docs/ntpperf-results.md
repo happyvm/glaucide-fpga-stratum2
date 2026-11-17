@@ -27,12 +27,25 @@ le saut des cycles inactifs est validé bit à bit contre une simulation de chaq
 
 ```
 tools/ntpperf/build.sh     # libpcap de remplacement, shim de temps, clone + make de ntpperf, pont (cargo --release)
-tools/ntpperf/run.sh       # 12 tâches, 4 en parallèle, puis tools/ntpperf/analyse.py (code 1 si un contrôle échoue)
+tools/ntpperf/run.sh       # 13 tâches, 4 en parallèle, puis tools/ntpperf/analyse.py (code 1 si un contrôle échoue)
 tools/ntpperf/run.sh c-10k d-kod-1k     # seulement certaines tâches
-tools/ntpperf/run.sh --long             # + balayages complets de ntpperf, limiteur à 30 k et 80 req/s, validation du saut
+tools/ntpperf/run.sh --long             # + balayages complets de ntpperf, limiteur à 30 000 et 80 000 req/s, KoD à 10 000, validation du saut
 ```
 
-DUREES
+Durées mesurées (4 cœurs, `out/ntpperf/` et `target/` vidés au préalable) : `build.sh` **46 s** (clone de ntpperf,
+deux fichiers C, compilation Rust `--release` de la bibliothèque et du pont), `run.sh` **626 s**, soit **11 min 12 s**
+au total, « all checks passed ». Les tâches au-delà de 45 000 req/s coûtent ≈ 5 min chacune (§2.5) ; l'ordre « la
+plus chère d'abord » sur 4 processus les fait passer en parallèle. Une seconde exécution complète redonne
+**exactement** les mêmes fichiers (`ntpperf.txt` et `requests.csv` identiques octet pour octet pour les 13 tâches).
+`--long` : `la-full` et `lb-full` 34 min chacune, `lc-80k` 15 min, `lc-30k` 8 min, `ld-kod-10k` 3,5 min, `l-noff`
+6,5 min (≈ 40 min sur 4 cœurs). Résultats dans `out/ntpperf/results/<tâche>/` (ignoré par git) : `ntpperf.txt`,
+`bridge.log`, `requests.csv`, `cmd.txt` ; synthèse `out/ntpperf/results/summary.md`.
+
+Tâches par défaut : `a-sweep` (`-B -t 0.2 -r 1000-11390 -x 1.5`), `a-25k`, `a-60k`, `a-105k`, `a-125k` (`-B -t 0.2
+-r N`), `b-sweep` (`-B -t 0.2 -o 1e-12 -H -r 1000-3375 -x 1.5`), `b-105k`, `b-125k`, toutes sans limiteur ;
+`c-1k`, `c-10k` (limiteur 8/s, `-B -t 1.0`), `d-kod-1k`, `d-kod-o-1k` (limiteur 8/s et KoD, `-B -t 1.0 [-o 1e-12
+-H] -r 1000`), `x-xleave-1k` (`-I -t 0.2 -r 1000`). Réseau commun : `-i sim0 -m 02:00:00:00:00:01 -d
+192.168.123.1 -s 172.18.0.0/16`.
 
 Fichiers ajoutés : `rtl/src/bin/ntpperf_bridge.rs` (le pont), `tools/ntpperf/pcap_shim/` (`pcap.h`, `pcap/pcap.h`,
 `pcap.c` : la libpcap de remplacement ; `vtime.c` : le shim de temps ; `simlink.h` : le contrat avec le pont),
@@ -152,13 +165,13 @@ Mesuré (release, 3 à 4 ponts en parallèle sur 4 cœurs) : **121 000 à 140 00
 par pont (≈ 7,5 µs réelles par cycle de 10 ns : ≈ 750 fois plus lent que le matériel), la coordination avec
 ntpperf coûtant moins de 1 % (a-105k : 40,0 M cycles simulés en 316 s de simulation pour 317 s au total ; 42 118
 avances du temps pour 40 001 requêtes). Une requête isolée coûte ≈ 2 225 cycles simulés (préambule et requête :
-816 cycles sur `rxd`, 253 cycles jusqu'au SFD de la réponse, 760 de réponse, 400 de seuil d'inactivité), le reste
+816 cycles sur `rxd`, 253 cycles jusqu'au SFD de la réponse (son préambule compris), 752 de réponse, 400 de seuil d'inactivité), le reste
 est sauté. Au-delà de ≈ 45 000 req/s le fil n'est jamais au repos : un point de ntpperf (0,5 s virtuelle avec son
 échauffement, dont les 0,1 s finales d'attente sont sautées) coûte alors **4·10⁷ cycles ≈ 5 à 5,5 min**, quel
 que soit le débit. D'où le choix de l'intervalle d'échantillonnage minimal de ntpperf (`-t 0.2`), d'un point par
 processus pour les débits élevés (exécutés en parallèle) et d'un balayage de ntpperf lui-même (`-r 1000-11390 -x
 1.5`, 7 points en une exécution) pour les faibles débits. Le balayage complet par défaut de ntpperf (`-r
-1000-200000 -x 1.5`, 15 points) prend **34 min** (2 018 s, 2,6·10⁸ cycles simulés, 4,4·10⁸ sautés, 6,98 s virtuelles) en un seul processus : il est dans `--long`.
+1000-200000 -x 1.5`, 14 points) prend **34 min** (2 018 s, 2,6·10⁸ cycles simulés, 4,4·10⁸ sautés, 6,98 s virtuelles) en un seul processus : il est dans `--long`.
 
 ## 3. Résultats
 

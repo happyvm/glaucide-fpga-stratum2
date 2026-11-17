@@ -22,7 +22,7 @@
 set -euo pipefail
 
 REPO=https://github.com/mlichvar/ntpperf.git
-# Commit tested (2024-..., "fix aliasing issue breaking IP checksum").
+# Commit tested (upstream HEAD when this was written: "fix aliasing issue breaking IP checksum").
 PIN=${NTPPERF_PIN:-aee5446}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT="$ROOT/out/ntpperf"
