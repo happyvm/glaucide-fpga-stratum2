@@ -158,7 +158,7 @@ est sauté. Au-delà de ≈ 45 000 req/s le fil n'est jamais au repos : un point
 que soit le débit. D'où le choix de l'intervalle d'échantillonnage minimal de ntpperf (`-t 0.2`), d'un point par
 processus pour les débits élevés (exécutés en parallèle) et d'un balayage de ntpperf lui-même (`-r 1000-11390 -x
 1.5`, 7 points en une exécution) pour les faibles débits. Le balayage complet par défaut de ntpperf (`-r
-1000-200000 -x 1.5`, 15 points) prend ≈ LAWALL en un seul processus : il est dans `--long`.
+1000-200000 -x 1.5`, 15 points) prend **34 min** (2 018 s, 2,6·10⁸ cycles simulés, 4,4·10⁸ sautés, 6,98 s virtuelles) en un seul processus : il est dans `--long`.
 
 ## 3. Résultats
 
@@ -198,7 +198,22 @@ rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
 Balayage complet de ntpperf (`--long`, tâche `la-full`, un seul processus, `-B -t 0.2 -r 1000-200000 -x 1.5`) :
 
 ```
-LA_TABLE
+               |          responses            |        response time (ns)
+rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
+1000       100   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+1500       150   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+2250       225   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+3375       337   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+5062       506   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+7593       759   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+11389     1138   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+17083     1708   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+25624     2562   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+38436     3843   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+57654     5765   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+86481     8648   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+129721   12972  15.48%   0.00%  84.52%   0.00%   +10020  +10020  +10020      0
+194581   16384  43.65%   0.00%  56.35%   0.00%   +10020  +10020  +10020      0
 ```
 
 Interprétation :
@@ -208,8 +223,9 @@ Interprétation :
   requêtes mesurées rejetées par la file, aucune requête parvenue au design sans réponse), 15,66 % mesuré à
   130 000 req/s pour 15,65 % attendus (essai préliminaire). Le design répond à **toutes** les requêtes qui
   arrivent sur `rxd`, trames dos à dos avec l'écart minimal de 12 octets compris : **c'est le lien à 100 Mb/s qui
-  limite, pas le design**. Plus haut débit sans perte : le débit de ligne, 109 649 req/s (le point de ntpperf
-  immédiatement inférieur, 86 497 ou 105 000, est sans perte ; le suivant, 125 000 ou 129 746, perd 1 − L/R).
+  limite, pas le design**. Plus haut débit sans perte : le débit de ligne, 109 649 req/s (dans le balayage de
+  ntpperf, 86 481 est sans perte ; 129 721 perd 15,48 % pour 15,47 % attendus, 194 581 perd 43,65 % pour 43,65 % ;
+  ntpperf s'arrête là, le point suivant dépassant le maximum de 200 000 demandé).
 - **Marge du design** : le serveur consomme n + 50 = 98 cycles par requête de 48 octets (`ntp_server.rs`,
   « Throughput », test `throughput_back_to_back`) pour 912 cycles disponibles entre deux requêtes au débit de ligne
   (9,12 µs) : ≈ 11 % d'occupation, marge ≈ 9,3. Côté émission la réponse a exactement la taille de la requête
@@ -242,7 +258,22 @@ rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
 Balayage complet (`--long`, `lb-full`, `-B -t 0.2 -o 1e-12 -H -r 1000-200000 -x 1.5`) :
 
 ```
-LB_TABLE
+               |          responses            |     TX timestamp offset (ns)
+rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
+1000       100   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+1500       150   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+2250       225   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+3375       337   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+5062       506   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+7593       759   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+11389     1138   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+17083     1708   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+25624     2562   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+38436     3843   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+57654     5765   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+86481     8648   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+129721   12972  15.48%   0.00%  84.52%   0.00%       -9      -9      -9      0
+194581   16384  43.65%   0.00%  56.35%   0.00%       -9      -9      -9      0
 ```
 
 | Débit (req/s) | ntpperf min / moyenne / max / σ (ns) | vérité du banc SFD − T3 : min / moyenne / max / σ (ns) |
