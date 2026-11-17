@@ -19,6 +19,7 @@ pub mod ipv6_rx;
 pub mod ipv6_tx;
 pub mod mii_rx;
 pub mod mii_tx;
+pub mod ntp_server;
 pub mod phy_init;
 pub mod rx_path;
 pub mod stream;
