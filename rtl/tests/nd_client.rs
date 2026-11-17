@@ -434,16 +434,36 @@ fn resolve_waits_for_an_na_in_progress() {
 
 // ------------------------------------------------------------ learning from NA
 
-fn learns(frames: Vec<Vec<u8>>) -> Out {
+/// Frames fed 120 cycles apart, starting at 200; `resolve` (a target) is
+/// solicited at cycle 0 (F5: a Neighbor Advertisement is learnt only as the
+/// answer to our own solicitation).
+fn learns_for(resolve: Option<u128>, frames: Vec<Vec<u8>>) -> Out {
     let n = frames.len();
-    run(&bench(frames.into_iter().enumerate().map(|(k, f)| (k * 120, f)).collect(), vec![], n * 120 + 300))
+    run(&bench(
+        frames.into_iter().enumerate().map(|(k, f)| (200 + k * 120, f)).collect(),
+        resolve.into_iter().map(|t| (0, t)).collect(),
+        200 + n * 120 + 300,
+    ))
+}
+
+fn learns(frames: Vec<Vec<u8>>) -> Out {
+    learns_for(None, frames)
+}
+
+/// Source address of the solicitation for `t`.
+fn ns_src(t: u128) -> u128 {
+    if t >> 118 == 0x3fa {
+        LL
+    } else {
+        GUA
+    }
 }
 
 #[test]
 fn na_learning_table() {
     let tlla = opt(2, AA_MAC);
     let ok_msg = |t: u128, o: &[u8], d: u128| na_msg(t, 0x60, o, if d == LL { PEER_LL } else { PEER }, d);
-    // (what, frame, expected learn)
+    // (what, frame, target being resolved, expected learn)
     let mut bad_ck = eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &tlla, GUA));
     bad_ck[14 + 40 + 2] ^= 0x10;
     let mut bad_ck_last = eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &tlla, GUA));
@@ -461,52 +481,94 @@ fn na_learning_table() {
     let mut long = vec![2, 2];
     long.extend_from_slice(&[0, 0, 0, 0, 0, 0xaa]);
     long.extend_from_slice(&[0; 8]);
-    let cases: Vec<(&str, Vec<u8>, Option<(u128, u64)>)> = vec![
-        ("tlla to gua", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &tlla, GUA)), Some((PEER, AA_MAC))),
-        ("no tlla: eth src", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &[], GUA)), Some((PEER, PEER_MAC))),
-        ("tlla to ll", eth6(MAC, PEER_LL, LL, 255, &ok_msg(PEER_LL, &tlla, LL)), Some((PEER_LL, AA_MAC))),
-        ("S=0 O=0", eth6(MAC, PEER, GUA, 255, &na_msg(PEER, 0, &tlla, PEER, GUA)), Some((PEER, AA_MAC))),
-        ("R flag", eth6(MAC, PEER, GUA, 255, &na_msg(PEER, 0x80, &[], PEER, GUA)), Some((PEER, PEER_MAC))),
-        ("target differs from source", eth6(MAC, PEER, GUA, 255, &ok_msg(FAR, &tlla, GUA)), Some((FAR, AA_MAC))),
-        ("SLLA ignored in NA", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &opt(1, AA_MAC), GUA)), Some((PEER, PEER_MAC))),
-        ("unknown option skipped", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &[9, 1, 0, 0, 0, 0, 0, 0], GUA)), Some((PEER, PEER_MAC))),
-        ("bad checksum (type word)", bad_ck, None),
-        ("bad checksum (last byte)", bad_ck_last, None),
-        ("hop limit 254", eth6(MAC, PEER, GUA, 254, &ok_msg(PEER, &tlla, GUA)), None),
-        ("hop limit 64", eth6(MAC, PEER, GUA, 64, &ok_msg(PEER, &tlla, GUA)), None),
-        ("multicast target", eth6(MAC, PEER, GUA, 255, &ok_msg(ALL_NODES, &tlla, GUA)), None),
-        ("solicited-node target", eth6(MAC, PEER, GUA, 255, &ok_msg(sn_of(PEER), &[], GUA)), None),
-        ("code 1", eth6(MAC, PEER, GUA, 255, &code1), None),
-        ("short NA", eth6(MAC, PEER, GUA, 255, &short), None),
-        ("option length 0", eth6(MAC, PEER, GUA, 255, &zero_len), None),
-        ("duplicate TLLA", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &dup, GUA)), None),
-        ("TLLA of length 2", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &long, GUA)), None),
+    let cases: Vec<(&str, Vec<u8>, u128, Option<(u128, u64)>)> = vec![
+        ("tlla to gua", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &tlla, GUA)), PEER, Some((PEER, AA_MAC))),
+        ("no tlla: eth src", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &[], GUA)), PEER, Some((PEER, PEER_MAC))),
+        ("tlla to ll", eth6(MAC, PEER_LL, LL, 255, &ok_msg(PEER_LL, &tlla, LL)), PEER_LL, Some((PEER_LL, AA_MAC))),
+        ("S=1 R=1 O=0", eth6(MAC, PEER, GUA, 255, &na_msg(PEER, 0xc0, &[], PEER, GUA)), PEER, Some((PEER, PEER_MAC))),
+        ("SLLA ignored in NA", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &opt(1, AA_MAC), GUA)), PEER, Some((PEER, PEER_MAC))),
+        ("unknown option skipped", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &[9, 1, 0, 0, 0, 0, 0, 0], GUA)), PEER, Some((PEER, PEER_MAC))),
+        // F5: not solicited.
+        ("S=0 O=0", eth6(MAC, PEER, GUA, 255, &na_msg(PEER, 0, &tlla, PEER, GUA)), PEER, None),
+        ("S=0 O=1", eth6(MAC, PEER, GUA, 255, &na_msg(PEER, 0x20, &tlla, PEER, GUA)), PEER, None),
+        ("R flag only", eth6(MAC, PEER, GUA, 255, &na_msg(PEER, 0x80, &[], PEER, GUA)), PEER, None),
+        ("target differs from source", eth6(MAC, PEER, GUA, 255, &ok_msg(FAR, &tlla, GUA)), FAR, None),
+        ("NA for another target than the one resolved", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &tlla, GUA)), PEER_LL, None),
+        ("bad checksum (type word)", bad_ck, PEER, None),
+        ("bad checksum (last byte)", bad_ck_last, PEER, None),
+        ("hop limit 254", eth6(MAC, PEER, GUA, 254, &ok_msg(PEER, &tlla, GUA)), PEER, None),
+        ("hop limit 64", eth6(MAC, PEER, GUA, 64, &ok_msg(PEER, &tlla, GUA)), PEER, None),
+        ("multicast target", eth6(MAC, PEER, GUA, 255, &ok_msg(ALL_NODES, &tlla, GUA)), ALL_NODES, None),
+        ("solicited-node target", eth6(MAC, PEER, GUA, 255, &ok_msg(sn_of(PEER), &[], GUA)), sn_of(PEER), None),
+        ("code 1", eth6(MAC, PEER, GUA, 255, &code1), PEER, None),
+        ("short NA", eth6(MAC, PEER, GUA, 255, &short), PEER, None),
+        ("option length 0", eth6(MAC, PEER, GUA, 255, &zero_len), PEER, None),
+        ("duplicate TLLA", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &dup, GUA)), PEER, None),
+        ("TLLA of length 2", eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &long, GUA)), PEER, None),
     ];
-    for (what, f, want) in cases {
-        // Each case alone, then the good case right after (the unit recovers).
-        let good = eth6(MAC, PEER, GUA, 255, &ok_msg(FAR, &tlla, GUA));
-        let o = learns(vec![f, good]);
-        assert!(o.sent.is_empty(), "{what}: a learning never sends a frame");
-        let mut w: Vec<(u128, u64)> = want.into_iter().collect();
-        w.push((FAR, AA_MAC));
+    for (what, f, resolving, want) in cases {
+        // Each case alone, then the good NA for the same target right after
+        // (the unit recovers; after a learn the second NA is ignored: one learn
+        // per solicitation).
+        let good = na_frame(resolving, &tlla, GUA);
+        let o = learns_for(Some(resolving), vec![f, good]);
+        check_frames(what, &o.sent, &[exp_ns(resolving, ns_src(resolving))]);
+        let w = want.unwrap_or((resolving, AA_MAC));
         let got: Vec<(u128, u64)> = o.learns.iter().map(|(_, i, m)| (*i, *m)).collect();
-        assert_eq!(got, w, "{what}");
+        // A multicast or malformed case still ends with the valid NA: learnt
+        // only if the target is not multicast.
+        let exp = if what == "multicast target" || what == "solicited-node target" { vec![] } else { vec![w] };
+        assert_eq!(got, exp, "{what}");
     }
 }
 
 #[test]
-fn na_back_to_back_learning() {
-    // Frames 0 cycles apart: every NA learnt, in order.
-    let fr: Vec<(usize, Vec<u8>)> = (0..6u128)
-        .map(|k| (0usize, na_frame(PEER + 16 * k, &opt(2, AA_MAC + k as u64), GUA)))
-        .collect();
-    let o = run(&bench(fr, vec![], 1500));
+fn na_unsolicited_is_never_learnt() {
+    // F5: no solicitation outstanding: a perfect NA teaches nothing, before, during
+    // or after another resolution.
+    let tlla = opt(2, AA_MAC);
+    let o = learns(vec![na_frame(PEER, &tlla, GUA), na_frame(PEER_LL, &tlla, LL)]);
+    assert!(o.learns.is_empty() && o.sent.is_empty());
+    // A solicitation for PEER does not let an NA for FAR through.
+    let o = learns_for(Some(PEER), vec![na_frame(FAR, &tlla, GUA), na_frame(PEER, &tlla, GUA)]);
     let got: Vec<(u128, u64)> = o.learns.iter().map(|(_, i, m)| (*i, *m)).collect();
-    let want: Vec<(u128, u64)> = (0..6u128).map(|k| (PEER + 16 * k, AA_MAC + k as u64)).collect();
-    assert_eq!(got, want);
+    assert_eq!(got, vec![(PEER, AA_MAC)]);
 }
 
-// ------------------------------------------------------------ learning from NS
+#[test]
+fn na_after_a_learn_is_ignored() {
+    // One learn per solicitation: the entry is not rebound by a second solicited-looking NA.
+    let o = learns_for(
+        Some(PEER),
+        vec![na_frame(PEER, &opt(2, AA_MAC), GUA), na_frame(PEER, &opt(2, PEER_MAC), GUA)],
+    );
+    let got: Vec<(u128, u64)> = o.learns.iter().map(|(_, i, m)| (*i, *m)).collect();
+    assert_eq!(got, vec![(PEER, AA_MAC)]);
+    // A new solicitation re-arms the unit.
+    let b = Bench {
+        frames: vec![(200, na_frame(PEER, &opt(2, AA_MAC), GUA)), (500, na_frame(PEER, &opt(2, PEER_MAC), GUA))],
+        resolves: vec![(0, PEER), (400, PEER)],
+        cycles: 900,
+        ..Default::default()
+    };
+    let o = run(&b);
+    let got: Vec<(u128, u64)> = o.learns.iter().map(|(_, i, m)| (*i, *m)).collect();
+    assert_eq!(got, vec![(PEER, AA_MAC), (PEER, PEER_MAC)]);
+}
+
+#[test]
+fn na_back_to_back_learning() {
+    // Six NAs for different targets 0 cycles apart; only the one for the
+    // target being resolved (the third) is learnt.
+    let fr: Vec<(usize, Vec<u8>)> = (0..6u128)
+        .map(|k| (200usize, na_frame(PEER + 16 * k, &opt(2, AA_MAC + k as u64), GUA)))
+        .collect();
+    let o = run(&bench(fr, vec![(0, PEER + 32)], 1700));
+    let got: Vec<(u128, u64)> = o.learns.iter().map(|(_, i, m)| (*i, *m)).collect();
+    assert_eq!(got, vec![(PEER + 32, AA_MAC + 2)]);
+}
+
+// ------------------------------------------------------------ NS never teaches (F5)
 
 fn ns_frame(src: u128, dst: u128, target: u128, opts: &[u8], hop: u8) -> Vec<u8> {
     let dmac = if dst >> 120 == 0xff { sn_mac(dst) } else { MAC };
@@ -516,23 +578,28 @@ fn ns_frame(src: u128, dst: u128, target: u128, opts: &[u8], hop: u8) -> Vec<u8>
 #[test]
 fn ns_learning_table() {
     let slla = opt(1, AA_MAC);
-    // (what, frame, expected learn, expected NA)
+    // (what, frame, expected NA): F5, no case learns, answers are unchanged.
     let na = |dst, mac| Some(exp_na(GUA, dst, mac));
-    let cases: Vec<(&str, Vec<u8>, Option<(u128, u64)>, Option<(u64, Vec<u8>)>)> = vec![
-        ("multicast NS with SLLA", ns_frame(PEER, sn_of(GUA), GUA, &slla, 255), Some((PEER, AA_MAC)), na(PEER, AA_MAC)),
-        ("unicast NS with SLLA", ns_frame(PEER, GUA, GUA, &slla, 255), Some((PEER, AA_MAC)), na(PEER, AA_MAC)),
-        ("NS without SLLA", ns_frame(PEER, sn_of(GUA), GUA, &[], 255), None, na(PEER, PEER_MAC)),
-        ("NS with TLLA only", ns_frame(PEER, sn_of(GUA), GUA, &opt(2, AA_MAC), 255), None, na(PEER, PEER_MAC)),
-        ("DAD probe", ns_frame(0, sn_of(GUA), GUA, &[], 255), None, Some(exp_dad_na())),
-        ("hop limit 254", ns_frame(PEER, sn_of(GUA), GUA, &slla, 254), None, None),
-        ("not our target", ns_frame(PEER, sn_of(GUA), FAR, &slla, 255), None, None),
-        ("duplicate SLLA", ns_frame(PEER, sn_of(GUA), GUA, &[slla.clone(), slla.clone()].concat(), 255), None, None),
+    let cases: Vec<(&str, Vec<u8>, Option<(u64, Vec<u8>)>)> = vec![
+        ("multicast NS with SLLA", ns_frame(PEER, sn_of(GUA), GUA, &slla, 255), na(PEER, AA_MAC)),
+        ("unicast NS with SLLA", ns_frame(PEER, GUA, GUA, &slla, 255), na(PEER, AA_MAC)),
+        ("NS without SLLA", ns_frame(PEER, sn_of(GUA), GUA, &[], 255), na(PEER, PEER_MAC)),
+        ("NS with TLLA only", ns_frame(PEER, sn_of(GUA), GUA, &opt(2, AA_MAC), 255), na(PEER, PEER_MAC)),
+        ("DAD probe", ns_frame(0, sn_of(GUA), GUA, &[], 255), Some(exp_dad_na())),
+        ("hop limit 254", ns_frame(PEER, sn_of(GUA), GUA, &slla, 254), None),
+        ("not our target", ns_frame(PEER, sn_of(GUA), FAR, &slla, 255), None),
+        ("duplicate SLLA", ns_frame(PEER, sn_of(GUA), GUA, &[slla.clone(), slla.clone()].concat(), 255), None),
     ];
-    for (what, f, lrn, na) in cases {
-        let o = learns(vec![f]);
-        let got: Vec<(u128, u64)> = o.learns.iter().map(|(_, i, m)| (*i, *m)).collect();
-        assert_eq!(got, lrn.into_iter().collect::<Vec<_>>(), "{what}: learn");
-        check_frames(what, &o.sent, &na.into_iter().collect::<Vec<_>>());
+    for (what, f, na) in cases {
+        // Without and with an outstanding solicitation for the NS's own source.
+        let o = learns(vec![f.clone()]);
+        assert!(o.learns.is_empty(), "{what}: an NS teaches nothing");
+        check_frames(what, &o.sent, &na.clone().into_iter().collect::<Vec<_>>());
+        let o = learns_for(Some(PEER), vec![f]);
+        assert!(o.learns.is_empty(), "{what}: an NS teaches nothing (resolving its source)");
+        let mut want = vec![exp_ns(PEER, GUA)];
+        want.extend(na);
+        check_frames(what, &o.sent, &want);
     }
     // Bad checksum: neither answered nor learnt.
     let mut f = ns_frame(PEER, sn_of(GUA), GUA, &slla, 255);
@@ -550,9 +617,10 @@ fn exp_dad_na() -> (u64, Vec<u8>) {
 
 #[test]
 fn ns_learning_through_link_local_target() {
+    // Still answered, to the SLLA, but nothing is learnt.
     let f = ns_frame(PEER_LL, sn_of(LL), LL, &opt(1, AA_MAC), 255);
     let o = learns(vec![f]);
-    assert_eq!(o.learns.iter().map(|(_, i, m)| (*i, *m)).collect::<Vec<_>>(), vec![(PEER_LL, AA_MAC)]);
+    assert!(o.learns.is_empty());
     check_frames("na", &o.sent, &[exp_na(LL, PEER_LL, AA_MAC)]);
 }
 
