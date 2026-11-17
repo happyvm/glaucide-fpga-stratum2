@@ -653,7 +653,10 @@ fn request_bytes() {
             if v6 {
                 assert_eq!((q.dst_ip, q.src_ip, q.dst_mac), (PEER6, GUA, mac_of(PEER6)));
             } else {
-                assert_eq!((q.dst_ip, q.dst_mac), (PEER4 as u128, mac_of(PEER4 as u128)));
+                assert_eq!(
+                    (q.dst_ip, q.dst_mac),
+                    (PEER4 as u128, mac_of(PEER4 as u128))
+                );
             }
             assert!(q.t_req < q.t40);
             n += 1;
@@ -711,7 +714,12 @@ fn t1_era_wrap() {
     let q = b.reqs[0].clone();
     b.feed(good_reply(&q, PEER4 as u128, 0));
     assert_eq!(b.samples_got.len(), 1);
-    check_good(&b.samples_got[0].0, &q, &good_reply(&q, PEER4 as u128, 0), 0);
+    check_good(
+        &b.samples_got[0].0,
+        &q,
+        &good_reply(&q, PEER4 as u128, 0),
+        0,
+    );
 }
 
 // ------------------------------------------------------------ schedule
@@ -777,11 +785,23 @@ fn first_request(slot_addr: u128, v6: bool, gua_valid: bool) -> (Vec<(bool, u128
 #[test]
 fn next_hop_ipv4() {
     let (l, q) = first_request(PEER4 as u128, false, true);
-    assert_eq!(l.iter().map(|x| (x.0, x.1)).collect::<Vec<_>>(), vec![(false, PEER4 as u128)]);
-    assert_eq!((q.dst_ip, q.dst_mac), (PEER4 as u128, mac_of(PEER4 as u128)));
+    assert_eq!(
+        l.iter().map(|x| (x.0, x.1)).collect::<Vec<_>>(),
+        vec![(false, PEER4 as u128)]
+    );
+    assert_eq!(
+        (q.dst_ip, q.dst_mac),
+        (PEER4 as u128, mac_of(PEER4 as u128))
+    );
     let (l, q) = first_request(PEER4_OFF as u128, false, true);
-    assert_eq!(l.iter().map(|x| (x.0, x.1)).collect::<Vec<_>>(), vec![(false, GW4 as u128)]);
-    assert_eq!((q.dst_ip, q.dst_mac), (PEER4_OFF as u128, mac_of(GW4 as u128)));
+    assert_eq!(
+        l.iter().map(|x| (x.0, x.1)).collect::<Vec<_>>(),
+        vec![(false, GW4 as u128)]
+    );
+    assert_eq!(
+        (q.dst_ip, q.dst_mac),
+        (PEER4_OFF as u128, mac_of(GW4 as u128))
+    );
 }
 
 #[test]
@@ -796,8 +816,14 @@ fn next_hop_ipv6() {
     ];
     for (peer, gv, nh, src) in cases {
         let (l, q) = first_request(peer, true, gv);
-        assert_eq!(l.iter().map(|x| (x.0, x.1)).collect::<Vec<_>>(), vec![(true, nh)]);
-        assert_eq!((q.v6, q.dst_ip, q.src_ip, q.dst_mac), (true, peer, src, mac_of(nh)));
+        assert_eq!(
+            l.iter().map(|x| (x.0, x.1)).collect::<Vec<_>>(),
+            vec![(true, nh)]
+        );
+        assert_eq!(
+            (q.v6, q.dst_ip, q.src_ip, q.dst_mac),
+            (true, peer, src, mac_of(nh))
+        );
     }
 }
 
@@ -814,7 +840,10 @@ fn lookup_miss_resolve_hit() {
         b.slot(0, peer, v6, true);
         b.run(200);
         assert_eq!(b.lookups.len(), 1);
-        assert_eq!(b.resolves.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![(v6, peer)]);
+        assert_eq!(
+            b.resolves.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(),
+            vec![(v6, peer)]
+        );
         assert!(b.reqs.is_empty());
         // one tick (2^-6 s) is not enough, two are
         b.advance(SEC / 64, 1, 200);

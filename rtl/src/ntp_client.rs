@@ -273,7 +273,11 @@ pub fn prec_pow(pr: U<8>) -> U<64> {
 pub fn poll_secs(p: U<8>) -> U<32> {
     let lo = Bit::from(p < U::<8>::from(POLL_MIN));
     let hi = Bit::from(p > U::<8>::from(POLL_MAX));
-    let c = mux(lo, U::<8>::from(POLL_MIN), mux(hi, U::<8>::from(POLL_MAX), p));
+    let c = mux(
+        lo,
+        U::<8>::from(POLL_MIN),
+        mux(hi, U::<8>::from(POLL_MAX), p),
+    );
     let sh = c.slice::<0, 5>();
     let x0 = U::<32>::from(1u32);
     let x1 = mux(sh.bit(0), x0 << 1u32, x0);
@@ -533,8 +537,7 @@ impl
                 U::<32>::from(IBURST_GAP_S),
                 poll_secs(poll_log2.get()),
             );
-            let due = Bit::from(f_burst == U::<3>::from(0u8))
-                | Bit::from((now_s - m_last) >= ival);
+            let due = Bit::from(f_burst == U::<3>::from(0u8)) | Bit::from((now_s - m_last) >= ival);
             let rt_ok = Bit::from(f_tries == U::<4>::from(0u8))
                 | Bit::from((now_t - m_rt) >= U::<32>::from(RETRY_TICKS));
             let sc_dis = !s_en & Bit::from(fl != U::<10>::from(0u8));
@@ -555,21 +558,41 @@ impl
             let p_ok = Bit::from(mh.sport == U::<16>::from(NTP_PORT));
             let mt0 = e0
                 & Bit::from(v0 == fam)
-                & mux(v0, Bit::from(a0 == src), Bit::from(a0.slice::<0, 32>() == src.slice::<0, 32>()));
+                & mux(
+                    v0,
+                    Bit::from(a0 == src),
+                    Bit::from(a0.slice::<0, 32>() == src.slice::<0, 32>()),
+                );
             let mt1 = e1
                 & Bit::from(v1 == fam)
-                & mux(v1, Bit::from(a1 == src), Bit::from(a1.slice::<0, 32>() == src.slice::<0, 32>()));
+                & mux(
+                    v1,
+                    Bit::from(a1 == src),
+                    Bit::from(a1.slice::<0, 32>() == src.slice::<0, 32>()),
+                );
             let mt2 = e2
                 & Bit::from(v2 == fam)
-                & mux(v2, Bit::from(a2 == src), Bit::from(a2.slice::<0, 32>() == src.slice::<0, 32>()));
+                & mux(
+                    v2,
+                    Bit::from(a2 == src),
+                    Bit::from(a2.slice::<0, 32>() == src.slice::<0, 32>()),
+                );
             let mt3 = e3
                 & Bit::from(v3 == fam)
-                & mux(v3, Bit::from(a3 == src), Bit::from(a3.slice::<0, 32>() == src.slice::<0, 32>()));
+                & mux(
+                    v3,
+                    Bit::from(a3 == src),
+                    Bit::from(a3.slice::<0, 32>() == src.slice::<0, 32>()),
+                );
             let m_hit = p_ok & (mt0 | mt1 | mt2 | mt3);
             let m_idx = mux(
                 mt0,
                 U::<2>::from(0u8),
-                mux(mt1, U::<2>::from(1u8), mux(mt2, U::<2>::from(2u8), U::<2>::from(3u8))),
+                mux(
+                    mt1,
+                    U::<2>::from(1u8),
+                    mux(mt2, U::<2>::from(2u8), U::<2>::from(3u8)),
+                ),
             );
 
             // ------------------------------------------- RX
@@ -764,16 +787,19 @@ impl
             let tm_we = w_fire | fail | w_t40;
             let tm_fire = (now_s.zext::<96>() << 64u32) | tm.slice::<0, 64>().zext::<96>();
             let tm_fail = (tm.slice::<32, 64>().zext::<96>() << 32u32) | now_t.zext::<96>();
-            let tm_t40 = (m_last.zext::<96>() << 64u32)
-                | (now_s.zext::<96>() << 32u32)
-                | m_rt.zext::<96>();
+            let tm_t40 =
+                (m_last.zext::<96>() << 64u32) | (now_s.zext::<96>() << 32u32) | m_rt.zext::<96>();
             let tm_wd = mux(w_fire, tm_fire, mux(fail, tm_fail, tm_t40));
 
             // ------------------------------------------- next state
             let sc_next = mux(
                 sc_dis | sc_fire,
                 U::<4>::from(S_SCAN),
-                mux(sc_dl, U::<4>::from(S_MISS), mux(sc_lkp, U::<4>::from(S_LKP), U::<4>::from(S_SCAN))),
+                mux(
+                    sc_dl,
+                    U::<4>::from(S_MISS),
+                    mux(sc_lkp, U::<4>::from(S_LKP), U::<4>::from(S_SCAN)),
+                ),
             );
             let lwt_next = mux(
                 found,
