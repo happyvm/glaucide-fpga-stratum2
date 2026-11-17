@@ -23,6 +23,10 @@ fn main() {
             "{}",
             ntp_fpga::config::Config::<ntp_fpga::config::Board>::verilog("config_board")
         ),
+        Some("udp4_rx") => print!("{}", ntp_fpga::udp4_rx::Udp4Rx::verilog("udp4_rx")),
+        Some("udp4_tx") => print!("{}", ntp_fpga::udp4_tx::Udp4Tx::verilog("udp4_tx")),
+        Some("ipv6_rx") => print!("{}", ntp_fpga::ipv6_rx::Ipv6Rx::verilog("ipv6_rx")),
+        Some("ipv6_tx") => print!("{}", ntp_fpga::ipv6_tx::Ipv6Tx::verilog("ipv6_tx")),
         Some("ntp_clock") => print!("{}", NtpClock::verilog("ntp_clock")),
         Some("disciplined_clock") => print!("{}", DisciplinedClock::verilog("disciplined_clock")),
         Some("frame_counter") => print!("{}", FrameCounter::verilog("frame_counter")),
