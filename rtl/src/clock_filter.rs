@@ -367,6 +367,14 @@ pub struct ClockFilter {
     /// The run accepted a result (set in `S_ACC`); age of the rank 0 stage.
     pub m_acc: Reg<Bit>,
     pub m_b0: Reg<U<3>>,
+    /// Witness age of the sorting properties: they are stated for the stage of
+    /// age `m_w` only, and `m_w` counts the idle cycles (mod 8) and is frozen
+    /// during a run. An idle unit changes nothing else and the environment may
+    /// wait any number of cycles before an event, so every reachable state of
+    /// the unit is reached with each of the eight values: the properties hold
+    /// for every age (one symbolic age instead of eight copies: the solver
+    /// does not finish on the eight copies together).
+    pub m_w: Reg<U<3>>,
     // Per stage storage, index {peer, slot}.
     #[distributed]
     pub m_off: Mem<U<64>, 32, DefaultClock>,
@@ -598,21 +606,19 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
             let ub0 = shr8v(um, b0.zext::<4>()).bit(0);
             let pb0 = shr8v(pm, b0.zext::<4>()).bit(0);
             let sx_0 = sidx(cp, head, b0);
-            let dk0 = self.m_dly.read(sidx(cp, head, U::<3>::from(0u8)));
+            // Witness age `w`: any of the eight ages, constant during a run (see `m_w`).
+            let w = self.m_w.get();
+            let w4 = w.zext::<4>();
+            let dw = self.m_dly.read(sidx(cp, head, w));
+            let cand_w = shr8v(cand, w4).bit(0);
+            let um_w = shr8v(um, w4).bit(0);
             let ek0 = self.m_eff.read(U::<3>::from(0u8));
-            let dk1 = self.m_dly.read(sidx(cp, head, U::<3>::from(1u8)));
             let ek1 = self.m_eff.read(U::<3>::from(1u8));
-            let dk2 = self.m_dly.read(sidx(cp, head, U::<3>::from(2u8)));
             let ek2 = self.m_eff.read(U::<3>::from(2u8));
-            let dk3 = self.m_dly.read(sidx(cp, head, U::<3>::from(3u8)));
             let ek3 = self.m_eff.read(U::<3>::from(3u8));
-            let dk4 = self.m_dly.read(sidx(cp, head, U::<3>::from(4u8)));
             let ek4 = self.m_eff.read(U::<3>::from(4u8));
-            let dk5 = self.m_dly.read(sidx(cp, head, U::<3>::from(5u8)));
             let ek5 = self.m_eff.read(U::<3>::from(5u8));
-            let dk6 = self.m_dly.read(sidx(cp, head, U::<3>::from(6u8)));
             let ek6 = self.m_eff.read(U::<3>::from(6u8));
-            let dk7 = self.m_dly.read(sidx(cp, head, U::<3>::from(7u8)));
             let ek7 = self.m_eff.read(U::<3>::from(7u8));
             check!(Bit::from(st <= S_OUT), "the sequencer is in one of its 14 states");
             check!(!(m_busy ^ run), "an event is being processed exactly from its intake to its PeerStat");
@@ -653,34 +659,13 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
             check!(!post | Bit::from(mcnt == r) | Bit::from(pm == um), "ranks are filled in order: a rank is left empty only when every usable stage is ranked");
             check!(!s_scan | (Bit::from(r < 8) & !Bit::from(cm == 0) & Bit::from(jj <= 7) & Bit::from(cm == shr8v(cand, jj)) & Bit::from(oh == onehot8(jj))), "scan: candidates left from age jj on, at least one");
             check!(!(s_scan & found) | (Bit::from(bm == onehot8(bj.zext::<4>())) & Bit::from(bj.zext::<4>() < jj) & jb & Bit::from(bdly == self.m_dly.read(sx_b))), "scan: the best so far is a candidate already scanned, bdly is its delay");
-            check!(!(s_scan & Bit::from(jj > 0) & cand.bit(0)) | (found & minrel(bdly, bj, dk0, U::<3>::from(0u8))), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (0)");
-            check!(!(s_scan & Bit::from(jj > 1) & cand.bit(1)) | (found & minrel(bdly, bj, dk1, U::<3>::from(1u8))), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (1)");
-            check!(!(s_scan & Bit::from(jj > 2) & cand.bit(2)) | (found & minrel(bdly, bj, dk2, U::<3>::from(2u8))), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (2)");
-            check!(!(s_scan & Bit::from(jj > 3) & cand.bit(3)) | (found & minrel(bdly, bj, dk3, U::<3>::from(3u8))), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (3)");
-            check!(!(s_scan & Bit::from(jj > 4) & cand.bit(4)) | (found & minrel(bdly, bj, dk4, U::<3>::from(4u8))), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (4)");
-            check!(!(s_scan & Bit::from(jj > 5) & cand.bit(5)) | (found & minrel(bdly, bj, dk5, U::<3>::from(5u8))), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (5)");
-            check!(!(s_scan & Bit::from(jj > 6) & cand.bit(6)) | (found & minrel(bdly, bj, dk6, U::<3>::from(6u8))), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (6)");
-            check!(!(s_scan & Bit::from(jj > 7) & cand.bit(7)) | (found & minrel(bdly, bj, dk7, U::<3>::from(7u8))), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (7)");
+            check!(!(s_scan & Bit::from(jj > w4) & cand_w) | (found & minrel(bdly, bj, dw, w)), "scan: the best so far has the minimum delay of the candidates scanned, the newest of equals (any age w)");
             check!(!s_pick | (Bit::from(r < 8) & found & Bit::from(bm == onehot8(bj.zext::<4>())) & jb & Bit::from(bdly == self.m_dly.read(sx_b))), "pick: the stage picked is a candidate, bdly is its delay");
-            check!(!(s_pick & cand.bit(0)) | minrel(bdly, bj, dk0, U::<3>::from(0u8)), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (0)");
-            check!(!(s_pick & cand.bit(1)) | minrel(bdly, bj, dk1, U::<3>::from(1u8)), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (1)");
-            check!(!(s_pick & cand.bit(2)) | minrel(bdly, bj, dk2, U::<3>::from(2u8)), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (2)");
-            check!(!(s_pick & cand.bit(3)) | minrel(bdly, bj, dk3, U::<3>::from(3u8)), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (3)");
-            check!(!(s_pick & cand.bit(4)) | minrel(bdly, bj, dk4, U::<3>::from(4u8)), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (4)");
-            check!(!(s_pick & cand.bit(5)) | minrel(bdly, bj, dk5, U::<3>::from(5u8)), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (5)");
-            check!(!(s_pick & cand.bit(6)) | minrel(bdly, bj, dk6, U::<3>::from(6u8)), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (6)");
-            check!(!(s_pick & cand.bit(7)) | minrel(bdly, bj, dk7, U::<3>::from(7u8)), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (7)");
+            check!(!(s_pick & cand_w) | minrel(bdly, bj, dw, w), "pick: the stage picked has the minimum delay of the candidates, the newest of equals (any age w)");
             // Rank 0: the result (RFC 5905 §10: the minimum-delay sample of the usable stages).
             let have0 = post & !Bit::from(mcnt == 0);
             check!(!have0 | (ub0 & pb0 & Bit::from(dly0 == self.m_dly.read(sx_0)) & Bit::from(off0 == self.m_off.read(sx_0)) & Bit::from(t40 == self.m_t4.read(sx_0))), "rank 0: offset, delay and t4 are those of one usable stage");
-            check!(!(have0 & um.bit(0)) | minrel(dly0, b0, dk0, U::<3>::from(0u8)), "rank 0 has the minimum delay of the usable stages, the newest of equals (0)");
-            check!(!(have0 & um.bit(1)) | minrel(dly0, b0, dk1, U::<3>::from(1u8)), "rank 0 has the minimum delay of the usable stages, the newest of equals (1)");
-            check!(!(have0 & um.bit(2)) | minrel(dly0, b0, dk2, U::<3>::from(2u8)), "rank 0 has the minimum delay of the usable stages, the newest of equals (2)");
-            check!(!(have0 & um.bit(3)) | minrel(dly0, b0, dk3, U::<3>::from(3u8)), "rank 0 has the minimum delay of the usable stages, the newest of equals (3)");
-            check!(!(have0 & um.bit(4)) | minrel(dly0, b0, dk4, U::<3>::from(4u8)), "rank 0 has the minimum delay of the usable stages, the newest of equals (4)");
-            check!(!(have0 & um.bit(5)) | minrel(dly0, b0, dk5, U::<3>::from(5u8)), "rank 0 has the minimum delay of the usable stages, the newest of equals (5)");
-            check!(!(have0 & um.bit(6)) | minrel(dly0, b0, dk6, U::<3>::from(6u8)), "rank 0 has the minimum delay of the usable stages, the newest of equals (6)");
-            check!(!(have0 & um.bit(7)) | minrel(dly0, b0, dk7, U::<3>::from(7u8)), "rank 0 has the minimum delay of the usable stages, the newest of equals (7)");
+            check!(!(have0 & um_w) | minrel(dly0, b0, dw, w), "rank 0 has the minimum delay of the usable stages, the newest of equals (any age w)");
             // Acceptance.
             let jit = s_div | s_sq0 | s_sq;
             check!(!(jit | s_acc) | (!Bit::from(mcnt == 0) & !m_acc), "a result is computed only with a usable stage, once per event");
@@ -697,14 +682,7 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
             check!(!(send_o & m_s & (Bit::from(self.m_sstr.get() == 0) | Bit::from(self.m_sstr.get() > 15) | Bit::from(self.m_slp.get() == 3))) | !valid, "a sample of an unusable peer (stratum 0 or above 15, leap 3) gives valid = 0");
             check!(!(send_o & !m_s & Bit::from((self.m_pr.get() & 0x7Fu8) == 0)) | !valid, "a miss that empties reach gives valid = 0");
             check!(!(send_o & m_acc) | (ub0 & Bit::from(o_dly == self.m_dly.read(sx_0)) & Bit::from(self.p_roff.read(cp) == self.m_off.read(sx_0)) & Bit::from(tlast == self.m_t4.read(sx_0))), "PeerStat after an accepted update: offset, delay and t4 of one usable stage");
-            check!(!(send_o & m_acc & um.bit(0)) | Bit::from(o_dly <= dk0), "PeerStat after an accepted update: its delay is the minimum of the usable stages (0)");
-            check!(!(send_o & m_acc & um.bit(1)) | Bit::from(o_dly <= dk1), "PeerStat after an accepted update: its delay is the minimum of the usable stages (1)");
-            check!(!(send_o & m_acc & um.bit(2)) | Bit::from(o_dly <= dk2), "PeerStat after an accepted update: its delay is the minimum of the usable stages (2)");
-            check!(!(send_o & m_acc & um.bit(3)) | Bit::from(o_dly <= dk3), "PeerStat after an accepted update: its delay is the minimum of the usable stages (3)");
-            check!(!(send_o & m_acc & um.bit(4)) | Bit::from(o_dly <= dk4), "PeerStat after an accepted update: its delay is the minimum of the usable stages (4)");
-            check!(!(send_o & m_acc & um.bit(5)) | Bit::from(o_dly <= dk5), "PeerStat after an accepted update: its delay is the minimum of the usable stages (5)");
-            check!(!(send_o & m_acc & um.bit(6)) | Bit::from(o_dly <= dk6), "PeerStat after an accepted update: its delay is the minimum of the usable stages (6)");
-            check!(!(send_o & m_acc & um.bit(7)) | Bit::from(o_dly <= dk7), "PeerStat after an accepted update: its delay is the minimum of the usable stages (7)");
+            check!(!(send_o & m_acc & um_w) | Bit::from(o_dly <= dw), "PeerStat after an accepted update: its delay is the minimum of the usable stages (any age w)");
             cover!(send_o & m_s & valid & m_acc, "a sample is accepted and reported valid");
             cover!(send_o & !m_s & !valid, "a miss is reported with valid = 0");
             cover!(send_o & m_s & !m_acc, "a sample that is not usable leaves the result unchanged");
@@ -883,6 +861,7 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
                     m_srds: sh.root_disp,
                 },
                 pick0 ? m_b0: bj,
+                s_idle ? m_w: w + U::<3>::from(1u8),
                 s_acc ? m_acc: Bit::One,
                 send_o ? {
                     m_busy: Bit::Zero,
