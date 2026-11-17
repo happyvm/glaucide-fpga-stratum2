@@ -19,7 +19,11 @@ SBY=sby
 work=out/formal/$unit
 mkdir -p "$work"
 cargo run -q -p ntp_fpga --bin formal_gen -- "$unit" > "$work/$unit.v"
+# PDR (mode `pdr`) needs a native yosys-abc: YOSYS_ABC=/path/to/yosys-abc (e.g. from
+# `pip install pyosys` in a venv: <venv>/lib/pythonX/site-packages/pyosys/yosys-abc).
+if [ -n "${YOSYS_ABC:-}" ]; then ln -sf "$YOSYS_ABC" "$shim/yosys-abc"; fi
 case $mode in
+  pdr)   engine="abc pdr"; smtmode=prove; aig="aigsmt none" ;;
   prove) engine="smtbmc z3"; smtmode=prove ;;
   bmc)   engine="smtbmc z3"; smtmode=bmc ;;
   cover) engine="smtbmc z3"; smtmode=cover ;;
@@ -28,6 +32,7 @@ cat > "$work/$unit.sby" <<SBYEOF
 [options]
 mode $smtmode
 depth $depth
+${aig:-}
 [engines]
 $engine
 [script]
