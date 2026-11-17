@@ -8,6 +8,7 @@ use ntp_fpga::{
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
+        Some("arp") => print!("{}", ntp_fpga::arp::Arp::verilog("arp")),
         Some("formal_smoke") => print!("{}", Digit::verilog("formal_smoke")),
         Some("crc_equiv") => print!("{}", ntp_fpga::crc_equiv::CrcEquiv::verilog("crc_equiv")),
         Some("frame_crc") => print!("{}", FrameCrc::verilog("frame_crc")),

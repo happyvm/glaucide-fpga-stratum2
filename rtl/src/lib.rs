@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! NTP server on Arty A7-100T, written in TxHDL.
+pub mod arp;
 pub mod clock;
 pub mod clocks;
 pub mod arp;

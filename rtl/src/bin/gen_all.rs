@@ -15,6 +15,7 @@ use ntp_fpga::{
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
+        Some("arp") => print!("{}", ntp_fpga::arp::Arp::verilog("arp")),
         Some("ntp_clock") => print!("{}", NtpClock::verilog("ntp_clock")),
         Some("disciplined_clock") => print!("{}", DisciplinedClock::verilog("disciplined_clock")),
         Some("frame_counter") => print!("{}", FrameCounter::verilog("frame_counter")),
