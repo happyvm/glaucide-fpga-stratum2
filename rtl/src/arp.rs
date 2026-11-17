@@ -31,17 +31,33 @@
 //! only once its 28 payload bytes are all available in the unit and they go
 //! out one per cycle (`tx_arb` rule: a `hdr` is always completed).
 //!
-//! # Cache (4 entries, IPv4 to MAC)
+//! # Cache (4 entries, IPv4 to MAC): solicited-only learning (F5, F6)
 //!
-//! The model is silent about learning; decision (RFC 826 "merge" step, only
-//! for packets for us): a packet accepted by the same rules (no `err`, A1, E1,
-//! A2, sender MAC unicast, 28 bytes) with target IP = `local_ip` and op 1 *or*
-//! op 2 teaches (spa, sha); a sender IP of 0.0.0.0 (probe) is not learned.
-//! An existing entry with the same IP is updated in place (no duplicate IP),
-//! otherwise the entry at the round-robin pointer is replaced and the pointer
-//! advances. `flush` invalidates all entries (and drops a pending or waiting
+//! The model is silent about learning; decision (security finding F5): an
+//! entry is learned **only from the reply to our own resolution**. A packet
+//! accepted by the same rules (no `err`, A1, E1, A2, sender MAC unicast, 28
+//! bytes) teaches (spa, sha) iff: op 2 (reply); target IP = `local_ip` and
+//! target hardware address = `local_mac` (the reply is addressed to us);
+//! a resolution is outstanding (`wait`) and spa equals the address being
+//! resolved (`req_ip`); spa is not 0.0.0.0. Nothing else ever creates or
+//! rebinds an entry: an unsolicited reply, a gratuitous ARP (spa = tpa, not
+//! for us anyway), a reply for another address, a reply arriving after the
+//! pending timeout or a request (op 1) from any host, even one whose sender
+//! is the gateway. A request addressed to us is still ANSWERED (we are a
+//! server), but its sender is not learned: the client resolves its next hop
+//! itself (`resolve` then `lookup`), which is all it needs. The write logic still
+//! updates an existing entry with the same IP in place (no duplicate IP; a
+//! safety net: a `resolve` of a cached address is consumed without a request,
+//! so a second reply finds no pending resolution), otherwise the entry at the
+//! round-robin pointer is replaced and the pointer advances. `flush` invalidates all entries (and drops a pending or waiting
 //! resolution). **No aging in v1**: an entry lives until it is replaced or
 //! flushed; `flush` is the escape hatch.
+//!
+//! F6 (eviction): as only the next hop being resolved is ever inserted, a
+//! host of the link can no longer evict the gateway entry by flooding
+//! requests or replies; only a legitimate solicited reply can replace an
+//! entry. Residual risk: an attacker answering our own request before the
+//! gateway does (no DAI/SEND); recommend ARP inspection on the switch.
 //!
 //! # Client
 //!
@@ -71,9 +87,9 @@
 //!   therefore delays another address by at most `T::TIMEOUT` cycles, and a
 //!   client that retries `resolve` more often than that keeps its own
 //!   resolution alive. After the abandon `lookup` of that IP answers
-//!   `found = 0` (it was never cached). A reply that arrives later is still
-//!   learned (cache update, as any packet for us) but matches no pending
-//!   request: it neither unblocks nor disturbs the resolution of another IP.
+//!   `found = 0` (it was never cached). A reply that arrives later is
+//!   ignored (F5: no pending request, nothing learned) and does not disturb
+//!   the resolution of another IP.
 //!   `flush` also resets the timer (it drops the resolution).
 //! * Output sharing: one frame at a time; a reply to a request has priority
 //!   over a pending resolve request; the choice is made when the output is
@@ -166,6 +182,9 @@ pub struct ArpWith<T: ArpTiming> {
     pub m_ok: Reg<Bit>,
     pub op: Reg<U<8>>,
     pub sha: Reg<U<48>>,
+    /// The target hardware address of the frame in progress equals `local_mac`
+    /// (bytes 18..24 compared as they stream).
+    pub tha_ok: Reg<Bit>,
     pub spa: Reg<U<32>>,
     pub tpa: Reg<U<32>>,
     // Reply queued.
@@ -305,6 +324,8 @@ impl<T: ArpTiming>
             let bad_c = take_p & Bit::from(ci <= 6) & !Bit::from(b.data == want);
             let in_sha = Bit::from(ci >= 8) & Bit::from(ci < 14);
             let in_spa = Bit::from(ci >= 14) & Bit::from(ci < 18);
+            let in_tha = Bit::from(ci >= 18) & Bit::from(ci < 24);
+            let mac_b = mux(ci == 18, mac.slice::<40, 8>(), mux(ci == 19, mac.slice::<32, 8>(), mux(ci == 20, mac.slice::<24, 8>(), mux(ci == 21, mac.slice::<16, 8>(), mux(ci == 22, mac.slice::<8, 8>(), mac.slice::<0, 8>())))));
             let in_tpa = Bit::from(ci >= 24) & Bit::from(ci < 28);
             // Target address including the byte being taken (the 28th may be the last).
             let tpa_eff = mux(ci == 27, (tpa << 8u32) | b.data.zext::<32>(), tpa);
@@ -316,7 +337,9 @@ impl<T: ArpTiming>
             let dec_rep = dec & Bit::from(op == 1);
 
             // ---------------------------------------------------- cache
-            let learn = dec & !Bit::from(spa == 0u32);
+            // F5: only the reply (op 2, addressed to our MAC and IP) that answers
+            // the outstanding resolution is learned.
+            let learn = dec & Bit::from(op == 2) & self.tha_ok.get() & wait & Bit::from(spa == req_ip) & !Bit::from(spa == 0u32);
             let lh0 = v0 & Bit::from(ip0 == spa);
             let lh1 = v1 & Bit::from(ip1 == spa);
             let lh2 = v2 & Bit::from(ip2 == spa);
@@ -358,7 +381,7 @@ impl<T: ArpTiming>
             let set_new = take_rs & !rs_hit & fresh;
             let set_re = take_rs & !rs_hit & same & !inflight & !req_pend;
             // The awaited address was learned.
-            let got = learn & wait & Bit::from(spa == req_ip);
+            let got = learn;
             // Pending timeout: abandon the resolution (a retransmission, which
             // restarts the timer, wins over the expiry of the same cycle).
             let expire = wait & Bit::from(tmo == T::TIMEOUT - 1) & !set_re;
@@ -445,7 +468,7 @@ impl<T: ArpTiming>
             cover!(take_h & send_rq, "a request is sent (hdr)");
             cover!(t_end & tx_req, "a request is sent completely");
             cover!(dec & Bit::from(op == 2), "an entry is learned from a reply");
-            cover!(dec_rep & learn, "an entry is learned from a request");
+            cover!(dec_rep & !learn, "a request for us is answered but its sender is not learned");
             cover!(lk_take & lfound, "a lookup hits");
             cover!(lk_take & !lfound, "a lookup misses");
             cover!(take_rs & rs_hit, "a resolve of a cached address sends nothing");
@@ -455,7 +478,8 @@ impl<T: ArpTiming>
 
             with!(self <= {
                 // Reception.
-                take_m ? { rx_st: U::<1>::from(1u8), good: Bit::One, m_ok: mok, cnt: U::<5>::from(0u8) },
+                take_m ? { rx_st: U::<1>::from(1u8), good: Bit::One, m_ok: mok, cnt: U::<5>::from(0u8), tha_ok: Bit::One },
+                take_p & in_tha & !Bit::from(b.data == mac_b) ? tha_ok: Bit::Zero,
                 take_p & bad_c ? good: Bit::Zero,
                 take_p & Bit::from(ci == 7) ? op: b.data,
                 take_p & in_sha ? sha: (sha << 8u32) | b.data.zext::<48>(),

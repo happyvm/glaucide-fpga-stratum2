@@ -227,19 +227,20 @@ fn request_for_another_address_gets_nothing() {
 }
 
 #[test]
-fn request_for_us_replies_and_is_learned() {
+fn request_for_us_replies_and_is_not_learned() {
+    // F5: a request addressed to us is answered but its sender is not learned.
     let s = Script { frames: vec![rxf(0, request_for(IP))], lookups: vec![(150, RIP)], ..Default::default() };
     let o = run(&s, 300, always);
     assert_eq!(strip(&o), vec![expected_reply()]);
     assert_eq!(o.rsp.len(), 1);
-    assert_eq!((o.rsp[0].1, o.rsp[0].2), (true, REMOTE));
+    assert_eq!((o.rsp[0].1, o.rsp[0].2), (false, 0));
 }
 
 #[test]
 fn reply_is_learned_then_lookup_hits() {
-    let s = Script { frames: vec![rxf(0, reply_to_us())], lookups: vec![(0, RIP), (150, RIP), (160, RIP + 1)], ..Default::default() };
-    let o = run(&s, 300, always);
-    assert!(o.frames.is_empty(), "a reply is never answered");
+    let s = Script { resolves: vec![(0, RIP)], frames: vec![rxf(100, reply_to_us())], lookups: vec![(0, RIP), (250, RIP), (260, RIP + 1)], ..Default::default() };
+    let o = run(&s, 400, always);
+    assert_eq!(strip(&o), vec![request_frame(RIP)], "a reply is never answered");
     assert_eq!(o.rsp.len(), 3);
     assert!(!o.rsp[0].1, "miss before learning");
     assert_eq!((o.rsp[1].1, o.rsp[1].2), (true, REMOTE));
@@ -260,7 +261,8 @@ fn cache_replacement_is_round_robin() {
     let mut s = Script::default();
     for k in 0..5u32 {
         let m = 0x0200_0000_0100 + k as u64;
-        s.frames.push(rxf(k as usize * 120, eth(MAC, m, &arp(2, m, 0xC000_0300 + k, MAC, IP))));
+        s.resolves.push((k as usize * 120, 0xC000_0300 + k));
+        s.frames.push(rxf(k as usize * 120 + 50, eth(MAC, m, &arp(2, m, 0xC000_0300 + k, MAC, IP))));
     }
     for k in 0..5u32 {
         s.lookups.push((700 + 3 * k as usize, 0xC000_0300 + k));
@@ -273,14 +275,16 @@ fn cache_replacement_is_round_robin() {
 }
 
 #[test]
-fn learning_same_ip_updates_in_place() {
-    let mut s = Script::default();
+fn second_reply_does_not_rebind_the_entry() {
+    // The first reply answers the resolution; a later one for the same IP is
+    // unsolicited and must not change the entry (F5).
+    let mut s = Script { resolves: vec![(0, RIP)], ..Default::default() };
     for (k, m) in [0x0200_0000_0101u64, 0x0200_0000_0102].iter().enumerate() {
-        s.frames.push(rxf(k * 120, eth(MAC, *m, &arp(2, *m, RIP, MAC, IP))));
+        s.frames.push(rxf(100 + k * 120, eth(MAC, *m, &arp(2, *m, RIP, MAC, IP))));
     }
     s.lookups.push((400, RIP));
     let o = run(&s, 500, always);
-    assert_eq!((o.rsp[0].1, o.rsp[0].2), (true, 0x0200_0000_0102));
+    assert_eq!((o.rsp[0].1, o.rsp[0].2), (true, 0x0200_0000_0101));
 }
 
 #[test]
@@ -292,9 +296,9 @@ fn resolve_emits_one_broadcast_request() {
 
 #[test]
 fn resolve_of_cached_ip_emits_nothing() {
-    let s = Script { frames: vec![rxf(0, reply_to_us())], resolves: vec![(150, RIP)], lookups: vec![(250, RIP)], ..Default::default() };
-    let o = run(&s, 400, always);
-    assert!(o.frames.is_empty());
+    let s = Script { resolves: vec![(0, RIP), (200, RIP)], frames: vec![rxf(100, reply_to_us())], lookups: vec![(350, RIP)], ..Default::default() };
+    let o = run(&s, 500, always);
+    assert_eq!(strip(&o), vec![request_frame(RIP)], "only the first resolve sends a request");
     assert!(o.rsp[0].1);
 }
 
@@ -320,12 +324,13 @@ fn second_resolve_waits_for_the_first_and_retransmit_is_allowed() {
 #[test]
 fn flush_clears_the_cache_and_the_resolution() {
     let s = Script {
-        frames: vec![rxf(0, reply_to_us())],
-        lookups: vec![(150, RIP), (250, RIP)],
-        flush: vec![200],
+        resolves: vec![(0, RIP)],
+        frames: vec![rxf(100, reply_to_us())],
+        lookups: vec![(250, RIP), (350, RIP)],
+        flush: vec![300],
         ..Default::default()
     };
-    let o = run(&s, 400, always);
+    let o = run(&s, 450, always);
     assert!(o.rsp[0].1);
     assert!(!o.rsp[1].1);
     // After a flush a new resolution can start.
@@ -341,9 +346,9 @@ fn err_frame_is_ignored() {
     f.err = true;
     let mut g = rxf(120, reply_to_us());
     g.err = true;
-    let s = Script { frames: vec![f, g], lookups: vec![(300, RIP)], ..Default::default() };
+    let s = Script { resolves: vec![(0, RIP)], frames: vec![f, g], lookups: vec![(300, RIP)], ..Default::default() };
     let o = run(&s, 400, always);
-    assert!(o.frames.is_empty());
+    assert_eq!(strip(&o), vec![request_frame(RIP)]);
     assert!(!o.rsp[0].1);
 }
 
@@ -371,12 +376,13 @@ fn short_and_garbage_arp_is_ignored() {
     cases.push(eth(0x0200_0000_0099, REMOTE, &good));
     let n = cases.len();
     let s = Script {
+        resolves: vec![(0, RIP)],
         frames: cases.into_iter().enumerate().map(|(i, f)| rxf(i * 100, f)).collect(),
         lookups: vec![(n * 100 + 50, RIP)],
         ..Default::default()
     };
     let o = run(&s, n * 100 + 200, always);
-    assert!(o.frames.is_empty(), "{:?}", o.frames);
+    assert_eq!(strip(&o), vec![request_frame(RIP)], "only our own request goes out");
     assert!(!o.rsp[0].1, "nothing learned");
 }
 
@@ -444,7 +450,7 @@ fn pending_resolution_times_out_and_unblocks_the_next() {
     // and the second resolves normally.
     let s = Script {
         resolves: vec![(0, SILENT), (1, RIP)],
-        frames: vec![rxf(1000, reply_to_us())],
+        frames: vec![rxf(500, reply_to_us())],
         lookups: vec![(1200, RIP), (1210, SILENT)],
         ..Default::default()
     };
@@ -463,10 +469,10 @@ fn nothing_is_abandoned_before_the_timeout() {
 }
 
 #[test]
-fn reply_after_the_timeout_is_learned_but_matches_no_pending_request() {
+fn reply_after_the_timeout_is_ignored_and_matches_no_pending_request() {
     // SILENT times out; RIP is then resolved (pending). A late reply from
-    // SILENT arrives while RIP waits: it is learned (lookup hits) and does
-    // not complete RIP's resolution (a third address stays blocked
+    // SILENT arrives while RIP waits: it is NOT learned (F5: lookup misses)
+    // and does not complete RIP's resolution (a third address stays blocked
     // until RIP's own timeout).
     let late = eth(MAC, 0x0200_0000_0060, &arp(2, 0x0200_0000_0060, SILENT, MAC, IP));
     let s = Script {
@@ -476,7 +482,7 @@ fn reply_after_the_timeout_is_learned_but_matches_no_pending_request() {
         ..Default::default()
     };
     let o = run_t::<Sim>(&s, 1200, always);
-    assert_eq!(o.rsp.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>(), vec![(true, 0x0200_0000_0060), (false, 0)]);
+    assert_eq!(o.rsp.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>(), vec![(false, 0), (false, 0)]);
     // RIP's request at ~300, then RIP times out at ~600: the third address
     // (offered at 450, after the late reply) goes out only then.
     let f = strip(&o);
@@ -499,4 +505,119 @@ fn retransmission_restarts_the_timer() {
     let o = run_t::<Sim>(&s, 900, always);
     assert_eq!(strip(&o).last().unwrap(), &request_frame(RIP));
     assert!(o.frames[3].3 >= 700, "RIP only after the last restart + timeout");
+}
+
+// ---- F5/F6: solicited-only learning ----
+
+const GW: u32 = 0xC000_0201 + 0x100; // 192.0.2.1 + 256 = 192.0.3.1 (the gateway)
+const GW_MAC: u64 = 0x0200_0000_00aa;
+const EVIL: u64 = 0x0200_0000_00ee;
+
+fn gw_reply(sha: u64, spa: u32, tha: u64, tpa: u32) -> Vec<u8> {
+    eth(MAC, sha, &arp(2, sha, spa, tha, tpa))
+}
+
+fn rsp(o: &Out) -> Vec<(bool, u64)> {
+    o.rsp.iter().map(|r| (r.1, r.2)).collect()
+}
+
+#[test]
+fn arp_poisoning_attempts_never_change_the_cache() {
+    // Phase 1 (no resolution outstanding): every attack is ignored.
+    // Phase 2: the gateway is resolved and a valid reply is learned.
+    // Phase 3: the same attacks (and unsolicited replies for the learned
+    // address) never rebind it.
+    let attacks = |t0: usize| -> Vec<Rx> {
+        let fr = vec![
+            // Unsolicited unicast reply for the gateway.
+            gw_reply(EVIL, GW, MAC, IP),
+            // Gratuitous ARP (broadcast request and reply forms, spa = tpa).
+            eth(BCAST, EVIL, &arp(1, EVIL, GW, 0, GW)),
+            eth(BCAST, EVIL, &arp(2, EVIL, GW, EVIL, GW)),
+            // A request for us carrying the gateway as sender.
+            eth(BCAST, EVIL, &arp(1, EVIL, GW, 0, IP)),
+            // Reply with the wrong target IP, the wrong target MAC, both.
+            gw_reply(EVIL, GW, MAC, IP + 5),
+            gw_reply(EVIL, GW, EVIL, IP),
+            // Reply sent to broadcast with the right target fields.
+            eth(BCAST, EVIL, &arp(2, EVIL, GW, MAC, IP)),
+        ];
+        fr.into_iter().enumerate().map(|(i, f)| rxf(t0 + i * 90, f)).collect()
+    };
+    let mut s = Script::default();
+    s.frames.extend(attacks(0)); // phase 1: 0..630
+    s.lookups.push((700, GW));
+    s.resolves.push((710, GW));
+    s.frames.push(rxf(1000, gw_reply(GW_MAC, GW, MAC, IP)));
+    s.lookups.push((1200, GW));
+    s.frames.extend(attacks(1300)); // phase 3: 1300..1930
+    s.lookups.push((2100, GW));
+    let o = run(&s, 2200, always);
+    assert_eq!(rsp(&o), vec![(false, 0), (true, GW_MAC), (true, GW_MAC)]);
+    // The request for us (carrying the gateway as sender) is answered twice (we are a server).
+    let replies: Vec<_> = strip(&o).into_iter().filter(|f| f.2[7] == 2).collect();
+    assert_eq!(replies.len(), 2);
+    assert!(replies.iter().all(|f| f.0 == EVIL));
+}
+
+#[test]
+fn arp_attacks_while_resolving_do_not_win_but_a_valid_reply_does() {
+    // The gateway is being resolved; the attacker's malformed or off-target
+    // replies arrive first, the genuine one afterwards.
+    let s = Script {
+        resolves: vec![(0, GW)],
+        frames: vec![
+            rxf(100, gw_reply(EVIL, GW, MAC, IP + 5)),
+            rxf(200, gw_reply(EVIL, GW, EVIL, IP)),
+            rxf(300, gw_reply(EVIL, GW + 1, MAC, IP)), // reply for another address
+            rxf(400, eth(BCAST, EVIL, &arp(1, EVIL, GW, 0, IP))), // request from "the gateway"
+            rxf(500, gw_reply(GW_MAC, GW, MAC, IP)),
+        ],
+        lookups: vec![(450, GW), (450, GW + 1), (700, GW), (710, GW + 1)],
+        ..Default::default()
+    };
+    let o = run(&s, 800, always);
+    assert_eq!(rsp(&o), vec![(false, 0), (false, 0), (true, GW_MAC), (false, 0)]);
+}
+
+#[test]
+fn arp_flooding_cannot_evict_the_gateway() {
+    // F6: 8 distinct hosts send requests and unsolicited replies: the
+    // gateway entry survives.
+    let mut s = Script { resolves: vec![(0, GW)], ..Default::default() };
+    s.frames.push(rxf(100, gw_reply(GW_MAC, GW, MAC, IP)));
+    for k in 0..8u32 {
+        let m = 0x0200_0000_0300 + k as u64;
+        let t = 300 + 100 * k as usize;
+        if k % 2 == 0 {
+            s.frames.push(rxf(t, eth(BCAST, m, &arp(1, m, 0xC000_0400 + k, 0, IP))));
+        } else {
+            s.frames.push(rxf(t, gw_reply(m, 0xC000_0400 + k, MAC, IP)));
+        }
+    }
+    s.lookups.push((1500, GW));
+    s.lookups.push((1510, 0xC000_0400));
+    let o = run(&s, 1600, always);
+    assert_eq!(rsp(&o), vec![(true, GW_MAC), (false, 0)]);
+}
+
+#[test]
+fn arp_reply_after_the_timeout_is_not_learned() {
+    let s = Script {
+        resolves: vec![(0, GW)],
+        frames: vec![rxf(400, gw_reply(GW_MAC, GW, MAC, IP))],
+        lookups: vec![(600, GW)],
+        ..Default::default()
+    };
+    let o = run_t::<Sim>(&s, 700, always);
+    assert_eq!(rsp(&o), vec![(false, 0)]);
+    // On time (before the 300-cycle timeout) the same reply is learned.
+    let s = Script {
+        resolves: vec![(0, GW)],
+        frames: vec![rxf(150, gw_reply(GW_MAC, GW, MAC, IP))],
+        lookups: vec![(600, GW)],
+        ..Default::default()
+    };
+    let o = run_t::<Sim>(&s, 700, always);
+    assert_eq!(rsp(&o), vec![(true, GW_MAC)]);
 }
