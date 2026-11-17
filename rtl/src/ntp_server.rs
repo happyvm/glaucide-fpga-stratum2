@@ -29,12 +29,14 @@
 //! | `tx_latency` | `In<U<64>>` | constant K added to the sampled time for T3, units of 2^-32 s (see « Transmit timestamp ») |
 //! | `rate_limit` | `In<U<16>>` | replies per second allowed per source, 0 = unlimited |
 //! | `kod_enable` | `In<Bit>` | over the limit: 0 = silence, 1 = a 48-byte KoD `RATE` |
+//! | `hash_key` | `In<U<64>>` | multiplier of the rate-limiter hash, `rl_mult(ConfigSet::RATE_SECRET)` (a constant) |
+//! | `leak` | `In<U<16>>` | over the limit, still answer with probability `leak / 2^16` ([`RL_LEAK_Q16`] = 1/16), 0 = never |
 //!
 //! Outputs: `reply_meta: Tx<NtpReplyMeta>` (one per reply, sent before its
 //! first byte) and `reply: Tx<FrameByte>` (exactly 48 bytes per reply,
 //! `last` on the 48th).
 //!
-//! Every wire input (`synced` .. `kod_enable`) is sampled in the cycle
+//! Every wire input (`synced` .. `leak`) is sampled in the cycle
 //! named below for it; they may change at any time otherwise.
 //!
 //! # Input contract
@@ -60,7 +62,7 @@
 //!    robin: when both are pending, the family *not* served last wins, IPv6
 //!    first after reset (`rr` = 0 reads as "IPv4 served last"); when
 //!    only one is pending it is taken). Its fields are registered, together
-//!    with the rate-limiter index of the source (see « Rate limiter »). No
+//!    with the rate-limiter key of the source (see « Rate limiter »). No
 //!    payload byte is taken in this cycle.
 //! 2. **RECV**: the payload of the chosen source is taken, one byte per
 //!    cycle when present, never stalled (the other source is not touched).
@@ -68,7 +70,9 @@
 //!    (the client's Transmit Timestamp, kept as Origin). Bytes after the
 //!    48th (extension fields, MAC) are taken and ignored. In the cycle the
 //!    byte with `last` is taken (**cycle L**), the unit decides:
-//!    * the request is *valid* iff (N1) it has at least 48 bytes, (N2)
+//!    * the request is *valid* iff (N1) it has at least 48 bytes and its
+//!      UDP source port is not 0, 7, 13, 17, 19 or 37 (F8, « Source port
+//!      rule »), (N2)
 //!      Mode = 3, (N3) VN = 3 or 4 (the model's set: VN 0, 1, 2, 5, 6, 7 are
 //!      dropped), and its `last` came without `err`;
 //!    * a valid request goes through the rate limiter (below): *allowed* or
@@ -82,7 +86,7 @@
 //!    carries `err`: the reply stream's `err` is constant 0).
 //!    In cycle L the unit samples `synced`, `stratum`, `ref_id`/`ref_id6`,
 //!    `ref_ts`, `root_delay`, `root_disp`, `precision`, `rate_limit`,
-//!    `kod_enable` and the seconds of `time` (for the rate limiter), and
+//!    `kod_enable`, `leak` and the seconds of `time` (for the rate limiter), and
 //!    builds bytes 0-39 of the reply into registers.
 //! 3. **META**: `reply_meta` is sent as soon as it has room:
 //!    `family` = the source channel (0 IPv4, 1 IPv6), `dst_ip` = `Meta.src`
@@ -189,36 +193,114 @@
 //! Every limited request gets one KoD when enabled (the KoD itself is not
 //! further limited): the reply volume equals the request volume at most.
 //!
-//! # Rate limiter (T2.4/T2.5)
+//! # Rate limiter (T2.4/T2.5, hardened by findings F1 and F2)
 //!
-//! A table of [`RL_ENTRIES`] = 64 words in distributed RAM, indexed by a
-//! 6-bit hash of the source: the XOR fold of a 64-bit key into 6 bits
-//! ([`src_hash`]), key = the IPv4 address (zero extended) for IPv4, the
-//! upper 64 bits (the /64 prefix) for IPv6 (an IPv6 host normally owns a
-//! whole /64, so limiting per address would be no limit). The index is
-//! computed and registered in IDLE when the `Meta` is popped.
-//!
+//! **Table.** [`RL_ENTRIES`] = 4096 words (12-bit index), `#[ram_style("block")]`:
+//! the read address is a register (`hacc`), the pattern a synthesis tool
+//! maps to block RAM (4 RAMB36 of 4096 x 9; if the tool does not infer it
+//! the same table is about 1 400 LUTs of distributed RAM, see `docs/resources.md`).
 //! Each word is `{sec: U<16>, cnt: U<16>}`: the low 16 bits of the NTP
-//! seconds of the window it counts, and the replies counted in it. In
-//! cycle L, for a *valid* request only (invalid ones do not touch the
-//! table), with `now` = bits 64..79 of `time` (low 16 bits of the NTP
-//! seconds) and `lim` = `rate_limit`:
+//! seconds of the window it counts, and the replies counted in it. The table
+//! starts at zero (bitstream initial value) and has no reset.
+//!
+//! **Key.** The IPv4 address (zero extended to 64 bits) for IPv4, the upper
+//! 64 bits (the /64 prefix) for IPv6 (an IPv6 host normally owns a whole
+//! /64, so limiting per address would be no limit).
+//!
+//! **Hash** ([`rl_index`]): `bucket = ((m * key + b) mod 2^64) >> 52`, i.e.
+//! the top 12 bits of a 64-bit multiply-add (multiply-shift hashing; for a
+//! random odd `m` any two distinct keys collide with probability at most
+//! 2/4096). `m = rl_mult(RATE_SECRET)` is SplitMix64 of the per-device secret
+//! `ConfigSet::RATE_SECRET`, made odd (computed at elaboration: the
+//! `hash_key` wire carries it as a constant), and `b = rotl32(m) xor
+//! 0x9E3779B97F4A7C15`. The function is NOT linear over GF(2) (carries), so
+//! unlike the old XOR fold sources cannot be chosen to collide by a public
+//! formula: without `m`, nothing predicts which sources share a bucket.
+//! The product is computed serially, two multiplier bits per cycle, 32
+//! steps (registers `hx`, `hm`, `hacc`, `hs`), starting in the IDLE cycle
+//! that pops the `Meta`; a *valid* request has at least 48 payload bytes,
+//! so the bucket is ready (cycle >= 49 after the pop) long before cycle L.
+//! A request that ends earlier is invalid and never reads the table.
+//!
+//! **Rate semantics.** In cycle L, for a *valid* request only (invalid ones,
+//! including those dropped by the source-port rule, do not touch the table),
+//! with `now` = bits 64..79 of `time` (low 16 bits of the NTP seconds) and
+//! `lim` = `rate_limit`:
 //!
 //! * `c` = `cnt` if `sec == now`, else 0 (a new one-second window);
-//! * allowed iff `lim == 0` (unlimited) or `c < lim`;
-//! * the word becomes `{now, c + 1}` if allowed and `lim != 0`, else
-//!   `{now, c}` (a limited request, or an unlimited one, does not count).
+//! * allowed iff `lim == 0` (unlimited) or `c < lim`; the word becomes
+//!   `{now, c + 1}` if allowed and `lim != 0`, else `{now, c}`;
+//! * **leak (F2)**: a request over the limit is nevertheless answered with
+//!   probability `leak / 2^16` = 2^-[`RL_LEAK_LOG2`] = 1/16 (wire `leak`,
+//!   [`RL_LEAK_Q16`] in the integration, 0 = never, used by the
+//!   deterministic tests). A leaked request gets a normal reply (not a KoD)
+//!   and is *not* counted. Otherwise it is silence, or a KoD if `kod_enable`.
 //!
-//! So a source gets at most `lim` normal replies per NTP second (fixed
-//! windows aligned on whole seconds: up to `2 lim` in a sliding second
-//! that straddles a boundary). Hash collisions merge the counters of the
-//! sources that share a word: a source can only be limited *earlier*
-//! because of another one, never get more than `lim` replies per window
-//! from its own word, by construction (every allowed reply increments the
-//! word it was counted on). Across all sources, at most `64 lim` normal
-//! replies per second leave the unit. A word whose window is exactly
-//! 65536 s old is taken for the current one (only early limiting again).
-//! The table starts at zero (bitstream initial value) and has no reset.
+//! The leak decision is `rng[39:24] < leak`, `rng` being a 64-bit state
+//! advanced every cycle (`rng <= xorshift64(rng) xor weyl`, a Weyl counter
+//! `weyl += 0x9E3779B97F4A7C15` so the state never sticks at 0) into which
+//! the receive timestamp of each request is xored when it is popped (the
+//! low bits are the phase of the asynchronous PHY clock, a few bits of noise
+//! per request that the sender does not control). It is not a cryptographic
+//! generator: its only job is to make "which of the requests over the limit
+//! leaks" unpredictable to a remote sender without cycle-exact knowledge of
+//! the arrival time, a state that moves 10^8 times per second.
+//!
+//! **Guarantees (worst case, `lim` = `rate_limit`, `p` = 2^-4, `n` requests
+//! of one source in one NTP second window, all valid and answered or not).**
+//! * Replies to one source key per window: `lim + B`, with `B` binomial
+//!   `(n - lim, p)`, expectation `lim + (n - lim) p`, never more than `n`.
+//!   With `lim` = 8 and a flood at line rate (109 000 requests/s) that is
+//!   `8 + 6 812` = 6 820 replies/s on average (6 820 x 94 bytes = 5.1 Mb/s
+//!   for a flood of 80 Mb/s: a reduction by 16, never an amplification), at
+//!   2 000 requests/s `8 + 124.5` = 132 +- 11. The test
+//!   `leak_rate_over_the_limit` measures 123 and 128 normal replies for 2 000
+//!   requests (expected 132.5 for the first window).
+//! * Replies in the whole table per window: at most `4096 lim + N p` for `N`
+//!   requests in total (`lim` = 8: 32 768 + `N`/16, against 64 x 8 = 512
+//!   before the fix). A flood that makes every bucket reach its limit needs
+//!   about 4096 x 9 = 36 900 requests/s from at least as many distinct
+//!   sources (the old limiter fell to 576), and even then each legitimate
+//!   request keeps a 1/16 chance.
+//! * The leak does not defeat the purpose: it lowers the reflected volume
+//!   by 16 at best (a flood of `N` requests/s produces at most `lim + N/16`
+//!   replies/s per source) and the victim of a spoofed flood still receives
+//!   at most the same.
+//!
+//! **What an attacker can do.** Flood from one source: that source gets
+//! `lim + n/16` replies per second. Spoof a victim V: V's real requests
+//! are then answered with probability 1/16 each (they were never answered
+//! before the fix, F2); a client that retries (ntpd, chrony: every 1 to 8
+//! seconds in burst mode) gets through. Shares of a bucket with V: needs
+//! the secret. Deny the whole service: needs about 37 000 forged requests/s
+//! from varied sources, and even then every legitimate request has a 1/16
+//! chance. **What it cannot do**: choose sources that collide (without
+//! `RATE_SECRET`; the 2/4096 universality bound holds for any pair), make the
+//! unit send more than one 48-byte reply per request, or exceed the
+//! per-window bound above. **Limits**: the secret is a build constant, so
+//! it is the same for the whole life of a bitstream and can in principle be
+//! learned by an adversary who can run many chosen probe floods against
+//! the live device (an oracle: flood X, then watch whether a source Y of its
+//! own is limited; a pair per test, thousands of probes to map one bucket);
+//! it is not secret from whoever has the bitstream or the source; it must be
+//! chosen per deployment (`config.rs`). Window edges: fixed windows aligned
+//! on whole seconds allow up to `2 lim` replies in a sliding second that
+//! straddles a boundary. A word whose window is exactly 65536 s old is taken
+//! for the current one (only early limiting, never extra replies).
+//!
+//! # Source port rule (F8, server part)
+//!
+//! Rule N1 is extended: a request whose UDP source port is 0 (reserved),
+//! 7 (echo), 13 (daytime), 17 (quote of the day), 19 (chargen) or 37 (time),
+//! [`src_port_denied`], is invalid: nothing is emitted and the limiter is not
+//! touched. These are the classic small services (RFC 862, 867, 865, 864,
+//! 868) that echo or answer text to whoever sends them a datagram: a request
+//! with such a source port is either a reflection towards the service or the
+//! start of a loop with it (a chargen line starting with `c` is itself a valid
+//! mode 3 request; our mode 4 reply echoed back is dropped by N2). 123 and
+//! every other port, including the neighbouring ones and all ports above
+//! 1023, are served. The source-ADDRESS filters of F8 are in `ipv4_rx` and
+//! `udp6_rx`, not here.
 //!
 //! # Throughput
 //!

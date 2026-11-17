@@ -149,6 +149,28 @@ fn every_set_has_a_unicast_mac_and_a_valid_poll() {
     check::<Test>();
 }
 
+/// F1: the rate limiter's secret is a build constant of the set, different
+/// in `Board` and `Test`, never 0 nor trivially structured, and the hash
+/// multiplier derived from it (`ntp_server::rl_mult`) is odd and differs.
+#[test]
+fn rate_secret_is_set_per_configuration() {
+    use ntp_fpga::ntp_server::{rl_index, rl_mult};
+    assert_eq!(Board::RATE_SECRET, 0xA5C3_9E27_4B1D_6F83);
+    assert_eq!(Test::RATE_SECRET, 0x1F2E_3D4C_5B6A_7988);
+    assert_ne!(Board::RATE_SECRET, Test::RATE_SECRET);
+    for s in [Board::RATE_SECRET, Test::RATE_SECRET] {
+        assert_ne!(s, 0);
+        assert_eq!(rl_mult(s) & 1, 1, "the multiplier is odd");
+        assert!(s.count_ones() > 16 && s.count_ones() < 48, "balanced bits");
+    }
+    assert_ne!(rl_mult(Board::RATE_SECRET), rl_mult(Test::RATE_SECRET));
+    // Two secrets map the same source to different buckets (almost always).
+    let differ = (0..1000u64)
+        .filter(|&k| rl_index(0xC000_0000 + k, Board::RATE_SECRET) != rl_index(0xC000_0000 + k, Test::RATE_SECRET))
+        .count();
+    assert!(differ > 990, "{differ}");
+}
+
 #[test]
 fn test_set_is_the_golden_model() {
     // tools/golden/vectors.py: SRV_MAC, SRV_IP4, SRV_LL.
