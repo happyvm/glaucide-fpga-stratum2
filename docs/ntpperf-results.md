@@ -8,7 +8,20 @@ la fraction de réponses perdues/invalides et le temps de réponse T3 − T2 du 
 l'horodatage de réception local. ntpperf tourne entièrement dans le **temps virtuel** de la simulation, sur une
 **libpcap de remplacement** (notre code) dont l'« interface » est le pont de simulation.
 
-**En bref** — RESUME
+**En bref** — Le design est limité par le **lien à 100 Mb/s, pas par sa logique** : **aucune perte jusqu'au débit de
+ligne** (109 649 requêtes IPv4 de 90 octets par seconde ; 0,00 % jusqu'à 105 000 req/s) et, au-delà, exactement la
+perte de la file d'émission (1 − L/R : 12,28 % à 125 000 req/s) ; toutes les requêtes qui atteignent les broches
+reçoivent leur réponse, trames dos à dos comprises (le cœur n'est occupé que ≈ 11 % du temps : 98 cycles sur 912).
+**Temps de réponse T3 − T2 = 10 020 ns, σ 0, constant** de 1 000 req/s à la saturation : aucune file d'attente
+dans le serveur. **Erreur de T3 contre le SFD émis : +9,88 ns (σ 0,12), indépendante de la charge** (ntpperf
+`-o -H` affiche −9 ns à tous les débits). Le **limiteur par défaut** (8/s par source, fuite 1/16) produit exactement
+la perte prévue : 18,75 % pour les clients de ntpperf (10 req/s chacun) tant qu'ils ont chacun leur case ; mais
+**constat N1** : le hachage multiplicatif répartit mal les **sources consécutives** pour certains secrets —
+avec celui de `Test`, 3 000 clients consécutifs n'occupent que 1 498 cases et ntpperf mesure 56,5 % de perte au
+lieu de 18,75 % (40,7 % avec un hachage aléatoire) ; correctif proposé (second tour de mélange). Avec le KoD,
+ntpperf compte les KoD comme des réponses valides (0 % perdu). IPv6 : non couvert (ntpperf est IPv4 seulement).
+Le couplage des temps est exact (chaque requête part à l'instant virtuel prévu par ntpperf) et **déterministe** ;
+le saut des cycles inactifs est validé bit à bit contre une simulation de chaque cycle.
 
 ## 1. Reproduire
 
