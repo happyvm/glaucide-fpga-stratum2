@@ -195,10 +195,13 @@
 //!
 //! # Rate limiter (T2.4/T2.5, hardened by findings F1 and F2)
 //!
-//! **Table.** [`RL_ENTRIES`] = 4096 words (12-bit index), `#[ram_style("block")]`:
-//! the read address is a register (`hacc`), the pattern a synthesis tool
-//! maps to block RAM (4 RAMB36 of 4096 x 9; if the tool does not infer it
-//! the same table is about 1 400 LUTs of distributed RAM, see `docs/resources.md`).
+//! **Table.** [`RL_ENTRIES`] = 4096 words (12-bit index) in distributed RAM
+//! (`#[distributed]`, 512 RAM256X1S = about 2 050 LUT-RAM; the read is
+//! asynchronous and Yosys refuses to map this memory to block RAM even with a
+//! dedicated address register, so block RAM (4 RAMB36) is left to a later
+//! change that makes the read synchronous. Estimate for the whole unit with
+//! `tools/estimate_resources.py`: about 1 800 LUT of logic, 2 050 LUT-RAM,
+//! 1 200 FF, against 1 224 LUT, 32 LUT-RAM, 866 FF before: about +2 600 LUTs, 4 % of the device).
 //! Each word is `{sec: U<16>, cnt: U<16>}`: the low 16 bits of the NTP
 //! seconds of the window it counts, and the replies counted in it. The table
 //! starts at zero (bitstream initial value) and has no reset.
@@ -471,6 +474,9 @@ pub struct NtpServer {
     pub hacc: Reg<U<64>>,
     /// Hash steps done, saturates at 32.
     pub hs: Reg<U<6>>,
+    /// Bucket index, loaded when the product is complete; the only user of
+    /// it is the table's address (read and write).
+    pub bix: Reg<U<12>>,
     /// Leak generator: xorshift state and Weyl counter.
     pub rng_x: Reg<U<64>>,
     pub rng_w: Reg<U<64>>,
@@ -485,9 +491,10 @@ pub struct NtpServer {
     pub k: Reg<U<6>>,
     /// `(time >> 32) + tx_latency` of the previous cycle.
     pub t3p: Reg<U<64>>,
-    /// Rate limiter: `{sec[31:16], cnt[15:0]}` per bucket. The read address
-    /// is a register (`hacc`), so a synthesis tool may map it to block RAM.
-    #[ram_style("block")]
+    /// Rate limiter: `{sec[31:16], cnt[15:0]}` per bucket (distributed RAM:
+    /// the read is asynchronous; Yosys 0.5x refuses to map it to block RAM,
+    /// see the header).
+    #[distributed]
     pub rl: Mem<U<32>, 4096, DefaultClock>,
 }
 
@@ -644,7 +651,8 @@ impl
             let hp0 = mux(hx.bit(0), hm, zero64);
             let hp1 = mux(hx.bit(1), hm << 1u32, zero64);
             let hacc_n = hacc + hp0 + hp1;
-            let bucket = hacc.slice::<52, 12>();
+            let bucket = self.bix.get();
+            let bix_n = hacc_n.slice::<52, 12>();
 
             // Leak generator: xorshift64 step xor a Weyl counter (so the
             // state never sticks at 0), the receive timestamp of each
@@ -757,6 +765,7 @@ impl
                     hm: hm << 2u32,
                     hacc: hacc_n,
                     hs: hs + U::<6>::from(1u8),
+                    bix: bix_n,
                 },
                 Bit::One ? {
                     rng_x: rng_n,
