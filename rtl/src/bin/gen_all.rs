@@ -15,6 +15,10 @@ fn main() {
         Some("eth_rx") => print!("{}", EthRx::verilog("eth_rx")),
         Some("eth_tx") => print!("{}", EthTx::verilog("eth_tx")),
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
+        Some("phy_init") => print!(
+            "{}",
+            ntp_fpga::phy_init::PhyInit::<ntp_fpga::phy_init::Board>::verilog("phy_init")
+        ),
         other => {
             eprintln!("unknown module {other:?}");
             std::process::exit(1);

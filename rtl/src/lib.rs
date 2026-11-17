@@ -9,4 +9,5 @@ pub mod fcs_check;
 pub mod formal_smoke;
 pub mod mii_rx;
 pub mod mii_tx;
+pub mod phy_init;
 pub mod stream;
