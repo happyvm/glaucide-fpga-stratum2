@@ -38,11 +38,11 @@
 //! are checked separately against the simulated SFD instants (pins bench:
 //! plausibility, within a few microseconds and T3 > T2; clocks bench: the
 //! measured error, printed, under the 100 ns design target).
-use ntp_fpga::clocks::{ClkRx, ClkTx};
+use ntp_fpga::clocks::{ClkRx, ClkRx25, ClkRx45, ClkRxP, ClkTx, ClkTx25, ClkTx35, ClkTxP};
 use ntp_fpga::config::Test;
 use ntp_fpga::phy_init;
 use ntp_fpga::stream::FrameByte;
-use ntp_fpga::top::{ArtyCore, ArtyTop, FixedSync, FixedUnsync, Standalone, SyncSource};
+use ntp_fpga::top::{ArtyCore, ArtyTop, ArtyTopClk, FixedSync, FixedUnsync, Standalone, SyncSource};
 use std::cell::RefCell;
 use std::rc::Rc;
 use txhdl::comp::{chan, join2, now, signal, Clock, In, Out, Reg, Running, Rx, Tx, Unit};
@@ -817,6 +817,280 @@ fn other_clock_ratio() {
     println!("45/35 ns MII: T2 error {a2:+.1}..{b2:+.1} ns, T3 error {a3:+.1}..{b3:+.1} ns");
     for x in e.t2.iter().chain(&e.t3) {
         assert!(x.abs() < 200.0, "timestamp error {x} ns");
+    }
+}
+
+// ------------------------------------------------------------ real-ratio pins
+
+/// The pins bench at the REAL clock ratio: the whole top (real `mii_rx`,
+/// `mii_tx`) with MII clocks `R`, `T` of their own period, stepped tick by
+/// tick. The wire holds one entry per `R` edge, applied just before that
+/// edge; `txd`/`tx_en` are read right after each `T` edge.
+struct RealBench {
+    /// Per `R` edge: (rxd, rx_dv, rx_er).
+    wire: Vec<(u8, bool, bool)>,
+    /// Wire index of each frame's SFD nibble.
+    rx_sfd_idx: Vec<usize>,
+}
+
+impl RealBench {
+    fn new() -> Self {
+        RealBench {
+            wire: vec![(0, false, false); 40],
+            rx_sfd_idx: vec![],
+        }
+    }
+
+    /// As [`PinBench::frame`], gap in `clk_rx` cycles.
+    fn frame(&mut self, f: &[u8], gap: usize, fcs_flip: bool) {
+        self.wire
+            .extend(std::iter::repeat_n((0, false, false), gap));
+        let mut w = with_fcs(f);
+        if fcs_flip {
+            let n = w.len();
+            w[n - 1] ^= 0x10;
+        }
+        self.wire.extend(std::iter::repeat_n((5, true, false), 15));
+        self.rx_sfd_idx.push(self.wire.len());
+        self.wire.push((0xd, true, false));
+        for b in w {
+            self.wire.push((b & 15, true, false));
+            self.wire.push((b >> 4, true, false));
+        }
+    }
+
+    /// Runs the wire then `tail` `clk_sys` cycles; returns the frames on
+    /// `txd` (SFD tick relative to the run start, an even tick) and the
+    /// tick of the `R` edge that samples each frame's SFD nibble.
+    fn run<R: Clock, T: Clock, S: SyncSource>(&self, tail: usize) -> (Vec<TxFrame>, Vec<u64>) {
+        let (rxd_o, rxd) = signal::<U<4>, R>();
+        let (dv_o, dv) = signal::<Bit, R>();
+        let (er_o, er) = signal::<Bit, R>();
+        let (mdio_o_, mdio_i) = signal::<Bit, txhdl::comp::DefaultClock>();
+        let (txd_o, txd) = signal::<U<4>, T>();
+        let (en_o, en) = signal::<Bit, T>();
+        let outs: Vec<(Out<Bit>, In<Bit>)> = (0..7)
+            .map(|_| signal::<Bit, txhdl::comp::DefaultClock>())
+            .collect();
+        let mut outs = outs.into_iter();
+        let mut o = || outs.next().unwrap().0;
+        let mut top = ArtyTopClk::<R, T, Test, S, phy_init::Sim>::default();
+        start_clock(&mut top.core.clock);
+        mdio_o_.set(Bit::One); // no PHY: the pulled-up line
+        // The clock's accumulator reads CLOCK_START at the run's first
+        // clk_sys edge: the run starts on one.
+        while now() % 2 != 0 {
+            txhdl::comp::settle();
+        }
+        let t0 = now();
+        let mut sim = Running::new(top.run(
+            (rxd, dv, er, mdio_i),
+            (txd_o, en_o, o(), o(), o(), o(), o(), o(), o()),
+        ));
+        let mut frames = vec![];
+        let mut rx_sfd = vec![];
+        let mut nib: Vec<u8> = vec![];
+        let mut sfd_at = 0u64;
+        let mut ri = 0usize;
+        let mut end_at = None;
+        loop {
+            let t = now();
+            if R::rising_at(t) {
+                if self.rx_sfd_idx.contains(&ri) {
+                    rx_sfd.push(t - t0);
+                }
+                let (d, v, e) = self.wire.get(ri).copied().unwrap_or((0, false, false));
+                rxd_o.set(U::<4>::from(d));
+                dv_o.set(Bit::from_bool(v));
+                er_o.set(Bit::from_bool(e));
+                ri += 1;
+                if ri == self.wire.len() {
+                    end_at = Some(t + 2 * tail as u64);
+                }
+            }
+            sim.step();
+            if T::rising_at(t) {
+                if en.get().to_bool() {
+                    if nib.len() == 15 {
+                        sfd_at = t - t0;
+                    }
+                    nib.push(txd.get().raw() as u8);
+                } else if !nib.is_empty() {
+                    frames.push(decode(&nib, sfd_at));
+                    nib.clear();
+                }
+            }
+            if end_at.is_some_and(|e| t >= e) {
+                break;
+            }
+        }
+        assert!(
+            nib.is_empty(),
+            "a frame still on the wire at the end of the run"
+        );
+        (frames, rx_sfd)
+    }
+}
+
+/// Gap before a lone request, in `clk_rx` cycles (16 us at 25 MHz: the
+/// previous reply, at most ~10 us on the wire, is over).
+const REAL_GAP: usize = 400;
+
+/// Plays the vectors with the real MII units at clocks `R`, `T`: every
+/// expected reply comes out in order, byte-exact modulo the NTP stamps,
+/// the stamps are within `|T2|, |T3|` bounds of the SFD instants.
+fn play_real<R: Clock, T: Clock, S: SyncSource>(files: &[&str]) -> Errs {
+    let mut b = RealBench::new();
+    let mut want: Vec<(String, Vec<u8>, usize)> = vec![];
+    let mut k = 0;
+    for name in files {
+        for (rx, txs) in exchanges(name) {
+            b.frame(&rx, REAL_GAP, false);
+            for t in txs {
+                want.push((name.to_string(), t, k));
+            }
+            k += 1;
+        }
+    }
+    let (got, rx_sfd) = b.run::<R, T, S>(1000);
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "number of transmitted frames ({files:?})"
+    );
+    let mut errs = Errs {
+        t2: vec![],
+        t3: vec![],
+    };
+    for (i, (g, (name, w, rxi))) in got.iter().zip(&want).enumerate() {
+        let what = format!("{name}, reply {i}");
+        if let Some((t2, t3)) = check_reply(&g.bytes, w, &what) {
+            let e2 = diff_ns(t2, ntp_at(rx_sfd[*rxi]));
+            let e3 = diff_ns(t3, ntp_at(g.sfd_tick));
+            println!("{what}: T2 - rx SFD = {e2:+.1} ns, T3 - tx SFD = {e3:+.1} ns (real 25 MHz MII)");
+            errs.t2.push(e2);
+            errs.t3.push(e3);
+        }
+    }
+    errs
+}
+
+#[test]
+fn real_ratio_arp_ping4_ping6() {
+    play_real::<ClkRx25, ClkTx25, FixedSync>(&["arp_request_reply.hex", "ping4.hex", "ping6.hex"]);
+}
+
+#[test]
+fn real_ratio_ntp4_ntp6() {
+    let e = play_real::<ClkRx25, ClkTx25, FixedSync>(&["ntp4_basic.hex", "ntp6_basic.hex"]);
+    assert_eq!(e.t2.len(), 2);
+    for x in &e.t2 {
+        assert!((-50.0..=50.0).contains(x), "T2 error {x} ns");
+    }
+    for x in &e.t3 {
+        assert!((-25.0..=10.0).contains(x), "T3 error {x} ns");
+    }
+}
+
+/// Ping, NTP and ARP back to back at the minimum inter-frame gap, at the
+/// real ratio.
+#[test]
+fn real_ratio_mixed_traffic_back_to_back() {
+    let ping = exchanges("ping4.hex").remove(0);
+    let ntp = exchanges("ntp4_basic.hex").remove(0);
+    let arp = exchanges("arp_request_reply.hex").remove(0);
+    let mut b = RealBench::new();
+    b.frame(&ping.0, 100, false);
+    b.frame(&ntp.0, 24, false);
+    b.frame(&arp.0, 24, false);
+    let (got, _) = b.run::<ClkRx25, ClkTx25, FixedSync>(1250);
+    assert_eq!(got.len(), 3, "three replies");
+    let mut seen = [false; 3];
+    for g in &got {
+        let et = u16::from_be_bytes([g.bytes[12], g.bytes[13]]);
+        let k = if et == 0x0806 {
+            2
+        } else if g.bytes[23] == 1 {
+            0
+        } else {
+            1
+        };
+        let w = [&ping.1[0], &ntp.1[0], &arp.1[0]][k];
+        check_reply(&g.bytes, w, &format!("mixed, reply of kind {k}"));
+        assert!(!seen[k], "two replies of kind {k}");
+        seen[k] = true;
+    }
+    for w in got.windows(2) {
+        let end = w[0].sfd_tick + ClkTx25::PERIOD * (w[0].bytes.len() as u64 * 2);
+        assert!(
+            w[1].sfd_tick >= end + ClkTx25::PERIOD * (24 + 15),
+            "inter-frame gap on txd"
+        );
+    }
+}
+
+/// A bad FCS is dropped at the real ratio too, the next good frame answered.
+#[test]
+fn real_ratio_bad_fcs_is_dropped() {
+    let (rx, txs) = exchanges("ntp4_basic.hex").remove(0);
+    let mut b = RealBench::new();
+    b.frame(&rx, 100, true);
+    b.frame(&rx, REAL_GAP, false);
+    let (got, rx_sfd) = b.run::<ClkRx25, ClkTx25, FixedSync>(1000);
+    assert_eq!(got.len(), 1, "only the good frame is answered");
+    assert!(got[0].sfd_tick > rx_sfd[1], "the reply is the second frame's");
+    check_reply(&got[0].bytes, &txs[0], "after a bad FCS");
+}
+
+/// Off-ratio MII clocks (45 ns / 35 ns) with the real units: replies still
+/// byte-exact, errors printed (the stamp biases assume 40 ns).
+#[test]
+fn real_ratio_other_clock_ratio() {
+    let e = play_real::<ClkRx45, ClkTx35, FixedSync>(&["ntp4_basic.hex", "ping4.hex"]);
+    let (a2, b2) = span(&e.t2);
+    let (a3, b3) = span(&e.t3);
+    println!("real units 45/35 ns MII: T2 error {a2:+.1}..{b2:+.1} ns, T3 error {a3:+.1}..{b3:+.1} ns");
+    for x in e.t2.iter().chain(&e.t3) {
+        assert!(x.abs() < 200.0, "timestamp error {x} ns");
+    }
+}
+
+/// T2 and T3 errors with the real units over eight phases of the MII
+/// clocks (first edges at ticks `P` and `(P + 3) % 8`, 5 ns steps over
+/// 40 ns), NTP over IPv4 and IPv6 at each: the same references as the
+/// model-based `t3_error_at_mii_granularity` (the `clk_rx` edge that samples
+/// the SFD nibble, the `clk_tx` edge that puts the SFD's 0xD on `txd`).
+#[test]
+fn real_ratio_timestamp_error_over_eight_phases() {
+    let mut e = Errs {
+        t2: vec![],
+        t3: vec![],
+    };
+    macro_rules! phase {
+        ($p:literal, $q:literal) => {{
+            let r = play_real::<ClkRxP<$p>, ClkTxP<$q>, FixedSync>(&["ntp4_basic.hex", "ntp6_basic.hex"]);
+            println!("phase rx {} tx {}: T2 {:?} T3 {:?}", $p, $q, r.t2, r.t3);
+            e.t2.extend(r.t2);
+            e.t3.extend(r.t3);
+        }};
+    }
+    phase!(0, 3);
+    phase!(1, 4);
+    phase!(2, 5);
+    phase!(3, 6);
+    phase!(4, 7);
+    phase!(5, 0);
+    phase!(6, 1);
+    phase!(7, 2);
+    let (a2, b2) = span(&e.t2);
+    let (a3, b3) = span(&e.t3);
+    println!("real units, 25 MHz MII, 8 phases: T2 error {a2:+.1}..{b2:+.1} ns, T3 error {a3:+.1}..{b3:+.1} ns");
+    assert_eq!(e.t3.len(), 16);
+    for x in &e.t2 {
+        assert!((-50.0..=50.0).contains(x), "T2 error {x} ns");
+    }
+    for x in &e.t3 {
+        assert!((-25.0..=10.0).contains(x), "T3 error {x} ns");
     }
 }
 
