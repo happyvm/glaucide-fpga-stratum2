@@ -51,6 +51,30 @@
 //! Not simulated during a skip: the free-running state that only matters
 //! with traffic (the leak generator of the rate limiter, the MDIO polling).
 //!
+//! # chronyd as one more client (`--chrony-port P --chrony-shm FILE`)
+//!
+//! Combined scenario of `tools/mixed/run.sh`: in the SAME simulation (same
+//! server instance, same MII wire, same virtual time) a chronyd, started by
+//! the caller under `tools/chrony/vtime_shim.so` with its own shared page
+//! (`FILE`, layout of that shim: `W_WAITING`, `W_WAIT_SEQ`, `W_DEADLINE`),
+//! polls the server over UDP 127.0.0.1:P. chronyd is one more participant of
+//! the lockstep: time advances only when every ntpperf process is ready AND
+//! chronyd is blocked in a wait (and not still taking a delivery), up to the
+//! earliest of all the deadlines; the same virtual time is published in both
+//! pages. A datagram of chronyd, picked up while it waits (it sent it while
+//! time stood still, so the current virtual time is its T1), becomes an
+//! Ethernet/IPv4/UDP frame from 192.168.123.2 (02:00:00:00:00:03, outside
+//! ntpperf's `-s` network) that joins the SAME sender-queue model as
+//! ntpperf's frames. Frames on `txd` are demultiplexed by destination IP: a
+//! reply to 192.168.123.2 goes back to chronyd as UDP from the bridge's
+//! socket at the virtual instant its last nibble leaves the pins (T4) and the
+//! simulation stops until chronyd has taken it (as `chrony_bridge`); the
+//! others go to ntpperf as usual. `--chrony-log` writes one CSV line per
+//! chronyd exchange (as `chrony_bridge`'s `exchanges.csv`, plus `wire_ns`,
+//! the instant its request starts on the wire: `wire_ns - t1_ns` is its wait
+//! in the queue). When ntpperf exits, chronyd's last requests get up to
+//! 200 us of virtual time to be answered.
+//!
 //! # Configuration
 //!
 //! `PerfCfg<RL, KOD>` = `config::Test` but for the IPv4 addresses

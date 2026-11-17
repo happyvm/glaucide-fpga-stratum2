@@ -14,6 +14,9 @@
 # Then tools/ntpperf/analyse.py checks everything and writes
 # out/ntpperf/results/summary.md (exit code 1 if a check fails).
 #
+# The combined scenario (the same load while a chronyd polls the same simulated
+# server) is tools/mixed/run.sh; it reuses this bridge and these checks.
+#
 # Default set (626 s of wall time on 4 cores, 46 s more for build.sh): ntpperf's own
 # sampling interval is set to its minimum, 0.2 s of VIRTUAL time (each rate
 # point lasts 0.5 virtual s with ntpperf's warm-up), 1.0 s for the

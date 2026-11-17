@@ -7,7 +7,10 @@
 # section "Scénario combiné", and docs/chrony-interop.md, section 8).
 # Run tools/chrony/build.sh and tools/ntpperf/build.sh first.
 #
-#   tools/mixed/run.sh [--long] [--jobs N] [JOB...]     (default: the jobs below, 3 at a time)
+#   tools/mixed/run.sh [--long] [--base] [--jobs N] [JOB...]     (default: the jobs below, 3 at a time)
+#
+# --base also runs, for each job, its twin without chronyd (results/<job>-base/): analyse.py then
+# checks that ntpperf's own per-request log is unchanged by chronyd's presence.
 #
 # The bridge is tools/ntpperf/ntpperf_bridge with --chrony-port: it owns the
 # virtual time of both clients (ntpperf under pcap_shim/vtime.c, chronyd under
@@ -20,6 +23,7 @@
 # Jobs (name: ntpperf options | chronyd `server` options), bridge --rate-limit 0:
 #   select    -B -t 12 -r 2000      | minpoll 0 maxpoll 0 iburst    chrony selects the server under load
 #   offset    -B -t 12 -r 2000      | minpoll 0 maxpoll 0 noselect  raw offsets vs. the bench's ground truth
+#   mid       -B -t 1  -r 20000     | minpoll -4 maxpoll -4 noselect  18 % of the line rate, 16 polls/s: some requests wait
 # --long adds (a one-second point of ntpperf near the line rate costs 4e7 cycles per half second):
 #   heavy     -B -t 1  -r 105000    | minpoll -3 maxpoll -3 noselect  just under the line rate (96 %)
 #   sel-heavy -B -t 1  -r 105000    | minpoll -3 maxpoll -3 iburst
@@ -44,6 +48,7 @@ PORT=${PORT:-12301}
 RATE=${RATE:-2000}
 TSEC=${TSEC:-12}
 NJOBS=3
+BASE=0
 LONG=0
 SEL=()
 while [ $# -gt 0 ]; do
@@ -51,6 +56,7 @@ while [ $# -gt 0 ]; do
     case "$a" in
     --long) LONG=1 ;;
     --jobs) NJOBS=$2; shift ;;
+    --base) BASE=1 ;;
     -h|--help) sed -n '3,30p' "$0"; exit 0 ;;
     *) SEL+=("$a") ;;
     esac
@@ -66,6 +72,7 @@ specs() {
     cat <<EOF
 select|-B -t $TSEC -r $RATE|minpoll 0 maxpoll 0 iburst
 offset|-B -t $TSEC -r $RATE|minpoll 0 maxpoll 0 noselect
+mid|-B -t 1 -r 20000|minpoll -4 maxpoll -4 noselect
 EOF
     if [ "$LONG" = 1 ]; then
         echo "heavy|-B -t 1 -r 105000|minpoll -3 maxpoll -3 noselect"
@@ -129,6 +136,25 @@ EOF
     echo "   wall time $((SECONDS - t0)) s"
 }
 
+# The same ntpperf load without chronyd (same bridge, no --chrony-*).
+run_base() {
+    local name=$1 nopts=$2
+    local R="$RES/$name-base"
+    rm -rf "$R"
+    mkdir -p "$R"
+    echo "== $name-base: ntpperf $nopts, no chronyd"
+    local t0=$SECONDS
+    # shellcheck disable=SC2086
+    echo "$BRIDGE --shim $NSHIM --shm $R/vtime.shm --rate-limit 0 --log $R/requests.csv -- $NTPPERF $NET $nopts" >"$R/cmd.txt"
+    # shellcheck disable=SC2086
+    "$BRIDGE" --shim "$NSHIM" --shm "$R/vtime.shm" --rate-limit 0 --log "$R/requests.csv" \
+        --status 30 --max-wall 7200 -- "$NTPPERF" $NET $nopts >"$R/ntpperf.txt" 2>"$R/bridge.log" ||
+        echo "bridge exited with $?" >>"$R/bridge.log"
+    rm -f "$R/vtime.shm"
+    echo "$((SECONDS - t0))" >"$R/wall_s.txt"
+    echo "   wall time $((SECONDS - t0)) s"
+}
+
 mkdir -p "$RES"
 i=0
 while IFS='|' read -r name n s; do
@@ -136,6 +162,10 @@ while IFS='|' read -r name n s; do
     # One port per job: the jobs run side by side.
     ( run_one "$name" "$n" "$s" $((PORT + i)) >"$RES/$name.out" 2>&1; cat "$RES/$name.out" ) &
     i=$((i + 1))
+    if [ "$BASE" = 1 ]; then
+        ( run_base "$name" "$n" >"$RES/$name-base.out" 2>&1; cat "$RES/$name-base.out" ) &
+        while [ "$(jobs -rp | wc -l)" -ge "$NJOBS" ]; do wait -n || true; done
+    fi
     while [ "$(jobs -rp | wc -l)" -ge "$NJOBS" ]; do wait -n || true; done
 done < <(specs)
 wait

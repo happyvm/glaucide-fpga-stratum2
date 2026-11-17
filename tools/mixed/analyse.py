@@ -145,6 +145,24 @@ def job(d, name):
               f"ntpperf replies: T2 error {s['e2']['mean']:+.2f}, T3 error {s['e3']['mean']:+.2f} ns "
               f"(idle {IDLE_E2:+.2f} / {IDLE_E3:+.2f})")
 
+    # Same ntpperf run without chronyd (run.sh --base): is ntpperf's own log unchanged?
+    bd_ = d + "-base"
+    if os.path.exists(os.path.join(bd_, "requests.csv")):
+        with open(os.path.join(d, "requests.csv"), newline="") as f1, \
+                open(os.path.join(bd_, "requests.csv"), newline="") as f2:
+            ra, rb = list(csv.DictReader(f1)), list(csv.DictReader(f2))
+        diff = [i for i in range(min(len(ra), len(rb))) if ra[i] != rb[i]]
+        same_cols = ("send_ns", "src_ip", "sport", "len", "bucket", "answered", "stratum", "resp_ns", "e2_ns", "e3_ns")
+        shifted = [i for i in diff if any(ra[i][k] != rb[i][k] for k in same_cols)]
+        say(f"  ntpperf twin without chronyd: {len(ra)} / {len(rb)} requests, {len(ra) - len(diff)} log lines "
+            f"byte-identical, {len(diff)} differ (instants on the wire), {len(shifted)} differ in a send instant, "
+            f"source, answer or error column")
+        check(len(ra) == len(rb) and not shifted,
+              "ntpperf's request log without chronyd: same requests, same answers, same T3-T2 and stamp errors")
+        for i in diff[:3]:
+            say(f"         line {i}: wire {rb[i]['wire_ns']} -> {ra[i]['wire_ns']}, rx SFD {rb[i]['rx_sfd_ns']} -> "
+                f"{ra[i]['rx_sfd_ns']}")
+
     # ------------------------------------------------ chronyd side
     c = chrony_counters(text)
     ex = chrony_rows(d)
