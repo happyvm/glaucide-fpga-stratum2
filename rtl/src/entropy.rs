@@ -84,7 +84,8 @@
 //!
 //! Timing: the state update is two levels of XOR (one LUT6 per bit plus the
 //! `init` multiplexer); each of the two 64-bit additions has its own
-//! pipeline stage. Cost: 5 × 64 + 1 flip-flops, two 64-bit adders.
+//! pipeline stage. Cost: 7 × 64 + 1 = 449 flip-flops (state, `init`, the
+//! three output registers), two 64-bit adders.
 use txhdl::comp::{mux, Clock, DefaultClock, In, Out, Reg, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{lower, with, Trace};
