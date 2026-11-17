@@ -39,6 +39,7 @@ fn main() {
         Some("udp_arb4") => print!("{}", ntp_fpga::udp_arb::UdpArb4::verilog("udp_arb4")),
         Some("udp_arb6") => print!("{}", ntp_fpga::udp_arb::UdpArb6::verilog("udp_arb6")),
         Some("meta_arb") => print!("{}", ntp_fpga::udp_arb::MetaArb::verilog("meta_arb")),
+        Some("ntp_reply_route") => print!("{}", ntp_fpga::ntp_reply_route::NtpReplyRoute::verilog("ntp_reply_route")),
         Some("nbr_cache") => print!("{}", ntp_fpga::nbr_cache::NbrCache::verilog("nbr_cache")),
         Some("formal_smoke") => print!("{}", Digit::verilog("formal_smoke")),
         Some("crc_equiv") => print!("{}", ntp_fpga::crc_equiv::CrcEquiv::verilog("crc_equiv")),

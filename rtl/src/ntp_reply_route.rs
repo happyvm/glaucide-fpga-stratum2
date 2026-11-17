@@ -54,7 +54,7 @@ use crate::udp4_tx::UdpTxReq;
 use crate::udp6_tx::Udp6TxReq;
 use txhdl::comp::{mux, Clock, DefaultClock, Out, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{check, cover, lower, with, Trace};
 
 /// Transmit latency K of an IPv4 reply in this top, picoseconds: from the
 /// server's sampling of `time` (cycle S - 1, `ntp_server.rs`) to the
@@ -168,6 +168,18 @@ impl
                 pay6.send(b);
             }
             let end = go & b.last;
+            // ---- formal properties (orchestrator; docs/formal.md, rows "NTP serveur" and "Flux d'octets") ----
+            check!(!take | is_idle, "a reply is routed only between replies");
+            check!(!go | is_pay, "reply bytes are forwarded only inside a routed reply");
+            check!(!(take & go), "a meta and a reply byte never share a cycle");
+            check!(!(take & !m.family & !req4.ready()), "an IPv4 reply waits for room on the IPv4 request channel");
+            check!(!(take & m.family & !req6.ready()), "an IPv6 reply waits for room on the IPv6 request channel");
+            check!(!(go & !fam & !pay4.ready()), "an IPv4 reply byte waits for room on the IPv4 payload channel");
+            check!(!(go & fam & !pay6.ready()), "an IPv6 reply byte waits for room on the IPv6 payload channel");
+            cover!(take & !m.family, "an IPv4 reply is routed");
+            cover!(take & m.family, "an IPv6 reply is routed");
+            cover!(end & fam, "an IPv6 reply is completed");
+            cover!(end & !fam, "an IPv4 reply is completed");
             with!(self <= {
                 take ? { st: U::<1>::from(PAY), fam: m.family },
                 end ? st: U::<1>::from(IDLE),
