@@ -57,14 +57,15 @@
 //! and written, at `ix` = `sp` in `SCAN`, `cs` in every other state.
 //! Per-slot state lives in three 4-word distributed RAMs read
 //! asynchronously at `ix`: `m_t1` (T1 of the outstanding request), `m_tm`
-//! (`last`: NTP second of the last poll start, bits 95..64; `tsent`: NTP
-//! second at which T1 was sampled, 63..32; `rt`: tick of the last failed
-//! lookup, 31..0, a tick being 2^-6 s, i.e. `time` bits 58..89) and `m_fl`
-//! (flags: bit 0 `out` = a request is outstanding, bit 1 `pend` = a poll
-//! started and waits for its MAC, bit 2 `sent` = a request was sent since
-//! the slot was enabled, bits 5..3 `burst` = polls started since enable
-//! (saturates at 4), bits 9..6 `tries` = failed lookups of the current
-//! poll). All memories start at zero (no reset). At most one write per
+//! (`last`: tick of the last poll start, or of the arming (see
+//! Scheduler), bits 95..64; `tsent`: NTP second at which T1 was sampled,
+//! 63..32; `rt`: tick of the last failed lookup, 31..0, a tick being 2^-6
+//! s, i.e. `time` bits 58..89) and `m_fl` (flags: bit 0 `out` = a request
+//! is outstanding, bit 1 `pend` = a poll started and waits for its MAC, bit
+//! 2 `sent` = a request was sent since the slot was enabled, bits 5..3
+//! `burst` = polls started since enable (saturates at 4), bits 9..6
+//! `tries` = failed lookups of the current poll, bit 10 `arm` = the slot's
+//! start time `last` was taken, meaningful while `burst` = 0). All memories start at zero (no reset). At most one write per
 //! memory per cycle.
 //!
 //! States: `SCAN` (idle: takes a reply or examines slot `sp`), reply path
@@ -76,34 +77,61 @@
 //!
 //! # Scheduler (state `SCAN`)
 //!
-//! Let `now_s` = `time` bits 64..95 (NTP seconds, wrapping), `now_t` =
-//! bits 58..89 (ticks of 2^-6 s). Each cycle in `SCAN` slot `sp` is
+//! Let `now_s` = `time` bits 64..95 (NTP seconds, wrapping; used by the reply
+//! deadline), `now_t` = bits 58..89 (ticks of 2^-6 s, wrapping, used by the
+//! poll schedule). Each cycle in `SCAN` slot `sp` is
 //! examined; its **action** is the first that applies of:
 //!
 //! 1. `up<sp>_en` = 0 and its flags are not all 0: they are cleared
-//!    (`out`, `pend`, `sent`, `burst`, `tries` = 0; an outstanding request
-//!    is forgotten, **no miss**); re-enabling restarts the iburst.
+//!    (`out`, `pend`, `sent`, `burst`, `tries`, `arm` = 0; an outstanding
+//!    request is forgotten, **no miss**); re-enabling restarts the iburst.
 //! 2. `out` and `now_s - tsent >= DEADLINE_S` (2, unsigned 32-bit wrapping
 //!    difference): `out` := 0, `cs` := `sp`, and `MISS` sends `miss(cs)`.
 //!    The deadline is thus 1 to 2 s after T1 (whole-second granularity). A
 //!    backward clock step makes the difference huge: the request expires at
 //!    once (a miss); a forward step likewise.
-//! 3. not `out`, not `pend` and **due**: `burst` = 0, or `now_s - last >=
-//!    I` with `I` = 2 s ([`IBURST_GAP_S`]) while `burst < 4`, else
-//!    `I = 2^clamp(poll_log2, 4, 17)` s (sampled then). The poll starts:
-//!    `last` := `now_s`, `pend` := 1, `tries` := 0, `burst` := min(burst +
-//!    1, 4). So after an enable (or reset with the slot enabled) polls start
-//!    at `t0`, `t0 + 2`, `t0 + 4`, `t0 + 6` (**iburst**, [`IBURST_COUNT`] =
-//!    4), then every `2^poll` s, each measured from the previous poll start
-//!    (not from the request), once that poll is finished (`out` = 0 and
-//!    `pend` = 0); a poll due while the previous one is still open waits for
-//!    it (deadline or reply) and starts at the next examination.
-//! 4. `pend` and (`tries` = 0 or `now_t - rt >= RETRY_TICKS` (2)):
+//! 3. **Arming**: `up<sp>_en` = 1, `burst` = 0 and `arm` = 0 (the slot was
+//!    just enabled, or the unit just left reset): `last` := `now_t` (this
+//!    instant is the slot's `t0`), `arm` := 1. Nothing is sent yet.
+//! 4. not `out`, not `pend` and **due**, where due means: `burst` = 0 (then
+//!    `arm` = 1 and) `now_t - last >= 16 * sp` ticks, i.e. the slot's own
+//!    **stagger** `sp * 2^-2 s` has elapsed since its arming; or `burst` >= 1
+//!    and `now_t - last >= I * 64` ticks with `I` = 2 s ([`IBURST_GAP_S`])
+//!    while `burst < 4`, else `I = 2^clamp(poll_log2, 4, 17)` s (sampled
+//!    then). The poll starts: `last` := `now_t`, `pend` := 1, `tries` := 0,
+//!    `arm` := 0, `burst` := min(burst + 1, 4).
+//!
+//!    **Staggered schedule.** All slots of a freshly enabled (or reset)
+//!    unit are armed within a few cycles of one another, at `t0` (to a few
+//!    cycles). Slot `i` then starts its iburst at `t0 + i * 2^-2 s` (a
+//!    quarter second per slot; to the tick granularity: the start is
+//!    between `i * 2^-2 - 2^-6` and `i * 2^-2` seconds after the arming),
+//!    then at `+ 2`, `+ 4`, `+ 6` s ([`IBURST_COUNT`] = 4, **iburst**), then
+//!    every `2^poll` s, each measured from the previous poll start of the
+//!    same slot (not from the request), once that poll is finished (`out` =
+//!    0 and `pend` = 0), so the per-slot phase offsets persist in the
+//!    regular schedule. Two slots are therefore never due at the same
+//!    instant (their polls differ by at least `2^-2 - 2^-6` s, much more
+//!    than a frame time of the transmit path, ~9 us at 100 Mbit/s), which
+//!    keeps T1 (predicted for an IDLE transmit path, like the server's T3)
+//!    accurate: no request is ever sent right behind another. The Python
+//!    model is `client.schedule(poll_log2, n, slot)`. A poll due while the
+//!    previous one of the same slot is still open waits for it (deadline or
+//!    reply) and starts at the next examination (a delay, which also moves
+//!    that slot's later polls).
+//!
+//!    **One request at a time.** The sequencer runs an event to completion
+//!    before taking another: a request (`LKP` ... `PAY`) is started only in
+//!    `SCAN`, i.e. after the previous request's 48 payload bytes were all
+//!    handed to `pay4` / `pay6` (`last` accepted). Two requests of different
+//!    slots are never interleaved, and when the channels do not stall the
+//!    stagger leaves the transmit path idle between them.
+//! 5. `pend` and (`tries` = 0 or `now_t - rt >= RETRY_TICKS` (2)):
 //!    `cs` := `sp`, go to `LKP`.
-//! 5. none (including a disabled slot with clear flags): no action.
+//! 6. none (including a disabled slot with clear flags): no action.
 //!
 //! `sp` advances (`sp + 1` mod 4) in each `SCAN` cycle where slot `sp` has
-//! no action, and stays otherwise (after actions 1 and 3 the slot is
+//! no action, and stays otherwise (after actions 1, 3 and 4 the slot is
 //! examined again in the next `SCAN` cycle). A waiting reply `Meta` is
 //! taken in a `SCAN` cycle when slot `sp` has no action, or when it has one
 //! and `pri` = 1; `pri` toggles in every `SCAN` cycle, so under a flood of
@@ -332,12 +360,12 @@ pub struct NtpClient {
     // Per-slot state.
     #[distributed]
     pub m_t1: Mem<U<64>, 4, DefaultClock>,
-    /// `{last[95:64], tsent[63:32], rt[31:0]}`.
+    /// `{last[95:64] (tick), tsent[63:32] (second), rt[31:0] (tick)}`.
     #[distributed]
     pub m_tm: Mem<U<96>, 4, DefaultClock>,
-    /// `{tries[9:6], burst[5:3], sent[2], pend[1], out[0]}`.
+    /// `{arm[10], tries[9:6], burst[5:3], sent[2], pend[1], out[0]}`.
     #[distributed]
-    pub m_fl: Mem<U<10>, 4, DefaultClock>,
+    pub m_fl: Mem<U<11>, 4, DefaultClock>,
 }
 
 #[lower]
@@ -516,6 +544,7 @@ impl
             let f_burst = fl.slice::<3, 3>();
             let f_tries = fl.slice::<6, 4>();
             let m_last = tm.slice::<64, 32>();
+            let f_arm = fl.bit(10);
             let m_tsent = tm.slice::<32, 32>();
             let m_rt = tm.slice::<0, 32>();
 
@@ -540,14 +569,23 @@ impl
                 U::<32>::from(IBURST_GAP_S),
                 poll_secs(poll_log2.get()),
             );
-            let due = Bit::from(f_burst == U::<3>::from(0u8)) | Bit::from((now_s - m_last) >= ival);
+            // Ticks since `last` (the arming or the previous poll start).
+            let since = now_t - m_last;
+            // First poll: `ix * 16` ticks (ix * 2^-2 s) after the arming.
+            let stagger = ix.zext::<32>() << 4u32;
+            let due = mux(
+                Bit::from(f_burst == U::<3>::from(0u8)),
+                f_arm & Bit::from(since >= stagger),
+                Bit::from(since >= (ival << 6u32)),
+            );
             let rt_ok = Bit::from(f_tries == U::<4>::from(0u8))
                 | Bit::from((now_t - m_rt) >= U::<32>::from(RETRY_TICKS));
-            let sc_dis = !s_en & Bit::from(fl != U::<10>::from(0u8));
+            let sc_dis = !s_en & Bit::from(fl != U::<11>::from(0u8));
+            let sc_arm = s_en & !f_out & !f_pend & Bit::from(f_burst == U::<3>::from(0u8)) & !f_arm;
             let sc_dl = s_en & f_out & dl_due;
             let sc_fire = s_en & !f_out & !f_pend & due;
             let sc_lkp = s_en & !f_out & f_pend & rt_ok;
-            let sc_act = sc_dis | sc_dl | sc_fire | sc_lkp;
+            let sc_act = sc_dis | sc_dl | sc_arm | sc_fire | sc_lkp;
 
             let have_m = Bit::from(meta.peek().is_some());
             let take_m = is_scan & have_m & (!sc_act | self.pri.get());
@@ -757,42 +795,47 @@ impl
 
             // ------------------------------------------- per-slot writes
             let burst_n = mux(in_burst, f_burst + U::<3>::from(1u8), f_burst);
-            // fire: pend 1, tries 0, burst + 1
-            let fl_fire = (burst_n.zext::<10>() << 3u32)
-                | (fl & U::<10>::from(0b0000000101u16))
-                | U::<10>::from(0b10u8);
+            // fire: pend 1, tries 0, burst + 1, arm 0
+            let fl_fire = (burst_n.zext::<11>() << 3u32)
+                | (fl & U::<11>::from(0b00000000101u16))
+                | U::<11>::from(0b10u8);
             // deadline / authentic reply: out 0
-            let fl_noout = fl & U::<10>::from(0b1111111110u16);
+            let fl_noout = fl & U::<11>::from(0b11111111110u16);
             // lookup failed: tries + 1, or abandon (pend 0, tries 0)
             let fl_fail = mux(
                 give_up,
-                fl & U::<10>::from(0b0000111101u16),
-                (fl & U::<10>::from(0b0000111111u16)) | (tries_n.zext::<10>() << 6u32),
+                fl & U::<11>::from(0b00000111101u16),
+                (fl & U::<11>::from(0b00000111111u16)) | (tries_n.zext::<11>() << 6u32),
             );
             // request sent: out 1, pend 0, sent 1, tries 0
-            let fl_sent = (fl & U::<10>::from(0b0000111000u16)) | U::<10>::from(0b101u8);
+            let fl_sent = (fl & U::<11>::from(0b00000111000u16)) | U::<11>::from(0b101u8);
             let w_dis = do_sc & sc_dis;
+            let w_arm = do_sc & sc_arm;
             let w_dl = do_sc & !sc_dis & sc_dl;
-            let w_fire = do_sc & !sc_dis & !sc_dl & sc_fire;
+            let w_fire = do_sc & !sc_dis & !sc_dl & !sc_arm & sc_fire;
             let w_auth = is_chk & auth;
             let w_sent = send_p & p_last;
-            let fl_we = w_dis | w_dl | w_fire | w_auth | fail | w_sent;
+            let fl_we = w_dis | w_dl | w_arm | w_fire | w_auth | fail | w_sent;
             let fl_wd = mux(
                 w_dis,
-                U::<10>::from(0u8),
+                U::<11>::from(0u8),
                 mux(
                     w_fire,
                     fl_fire,
-                    mux(fail, fl_fail, mux(w_sent, fl_sent, fl_noout)),
+                    mux(
+                        w_arm,
+                        fl | U::<11>::from(0b10000000000u16),
+                        mux(fail, fl_fail, mux(w_sent, fl_sent, fl_noout)),
+                    ),
                 ),
             );
             let w_t40 = send_p & at40;
-            let tm_we = w_fire | fail | w_t40;
-            let tm_fire = (now_s.zext::<96>() << 64u32) | tm.slice::<0, 64>().zext::<96>();
+            let tm_we = w_arm | w_fire | fail | w_t40;
+            let tm_fire = (now_t.zext::<96>() << 64u32) | tm.slice::<0, 64>().zext::<96>();
             let tm_fail = (tm.slice::<32, 64>().zext::<96>() << 32u32) | now_t.zext::<96>();
             let tm_t40 =
                 (m_last.zext::<96>() << 64u32) | (now_s.zext::<96>() << 32u32) | m_rt.zext::<96>();
-            let tm_wd = mux(w_fire, tm_fire, mux(fail, tm_fail, tm_t40));
+            let tm_wd = mux(w_arm | w_fire, tm_fire, mux(fail, tm_fail, tm_t40));
 
             // ------------------------------------------- next state
             let sc_next = mux(
