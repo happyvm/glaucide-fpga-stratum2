@@ -12,9 +12,10 @@ use ntp_fpga::ipv4_rx::IpMeta;
 use ntp_fpga::ipv4_tx::{IpTxReq, Ipv4Tx};
 use ntp_fpga::ipv6_tx::{Ip6TxReq, Ipv6Tx};
 use ntp_fpga::ntp_server::{
-    src_hash, NtpReplyMeta, NtpServer, DEFAULT_PRECISION, KOD_RATE, TX_CYCLES_V4, TX_CYCLES_V6,
-    TX_LATENCY_V4, TX_LATENCY_V6,
+    rl_index, src_port_denied, NtpReplyMeta, NtpServer, DEFAULT_PRECISION, KOD_RATE, RL_ENTRIES,
+    RL_LEAK_Q16, TX_CYCLES_V4, TX_CYCLES_V6, TX_LATENCY_V4, TX_LATENCY_V6,
 };
+use ntp_fpga::config::{ConfigSet, Test};
 use ntp_fpga::stream::{FrameByte, Meta};
 use ntp_fpga::tx_arb::TxArb;
 use ntp_fpga::udp4_rx::Udp4Rx;
@@ -115,6 +116,10 @@ struct Cfg {
     tx_latency: u64,
     rate_limit: u16,
     kod: bool,
+    /// `leak` wire, units of 2^-16 (0 = no leak, the deterministic tests).
+    leak: u16,
+    /// `hash_key` wire.
+    secret: u64,
 }
 
 fn vcfg() -> Cfg {
@@ -130,6 +135,8 @@ fn vcfg() -> Cfg {
         tx_latency: T_XMIT - T_RECV,
         rate_limit: 0,
         kod: false,
+        leak: 0,
+        secret: Test::RATE_SECRET,
     }
 }
 
@@ -171,6 +178,8 @@ type Wires = (
     In<U<64>>,
     In<U<16>>,
     In<Bit>,
+    In<U<64>>,
+    In<U<16>>,
 );
 
 /// The constant wire inputs of the unit, `synced` to `kod_enable`.
@@ -187,6 +196,8 @@ fn cfg_wires(c: &Cfg) -> Wires {
         tie(U::<64>::from(c.tx_latency)),
         tie(U::<16>::from(c.rate_limit)),
         tie(Bit::from_bool(c.kod)),
+        tie(U::<64>::from(c.secret)),
+        tie(U::<16>::from(c.leak)),
     )
 }
 
@@ -207,13 +218,13 @@ fn run(
     let (m6_t, m6) = chan::<Meta, DefaultClock>();
     let (r6_t, r6) = chan::<FrameByte, DefaultClock>();
     let (time_o, time_i) = signal::<U<96>, DefaultClock>();
-    let (sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd) = cfg_wires(cfg);
+    let (sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd, hk, lk) = cfg_wires(cfg);
     let (om_t, om) = chan::<NtpReplyMeta, DefaultClock>();
     let (ob_t, ob) = chan::<FrameByte, DefaultClock>();
     let mut d = NtpServer::default();
     let mut sim = Running::new(d.run(
         (
-            m4, r4, m6, r6, time_i, sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd,
+            m4, r4, m6, r6, time_i, sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd, hk, lk,
         ),
         (om_t, ob_t),
     ));
@@ -845,8 +856,12 @@ fn src_of(o: &Out) -> u128 {
     o.meta.dst_ip.raw()
 }
 
-fn hash4(a: u128) -> u32 {
-    src_hash(U::<64>::new(a & 0xFFFF_FFFF)).raw() as u32
+fn hash4(a: u128) -> usize {
+    rl_index(a as u64 & 0xFFFF_FFFF, Test::RATE_SECRET)
+}
+
+fn hash6(a: u128) -> usize {
+    rl_index((a >> 64) as u64, Test::RATE_SECRET)
 }
 
 #[test]
@@ -960,7 +975,7 @@ fn rate_limiter() {
     let p1 = 0x2001_0db8_0001_0000u128 << 64;
     let p2 = (1..1000u128)
         .map(|i| (0x2001_0db8_0002_0000u128 + i) << 64)
-        .find(|p| src_hash(U::<64>::new(p >> 64)).raw() != src_hash(U::<64>::new(p1 >> 64)).raw())
+        .find(|&p| hash6(p) != hash6(p1))
         .unwrap();
     let mut reqs = vec![];
     for i in 0..4u16 {
@@ -1154,7 +1169,7 @@ fn chain4(
     cycles: usize,
 ) -> Frames {
     let (time_o, time_i) = signal::<U<96>, DefaultClock>();
-    let (sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd) = cfg_wires(cfg);
+    let (sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd, hk, lk) = cfg_wires(cfg);
     let (um_t, um) = chan::<IpMeta, DefaultClock>();
     let (u_t, u) = chan::<FrameByte, DefaultClock>();
     let (nm_t, nm) = chan::<Meta, DefaultClock>();
@@ -1191,7 +1206,7 @@ fn chain4(
             d_urx.run((um, u), (nm_t, np_t)),
             d_ntp.run(
                 (
-                    m4, np, m6, r6, time_i, sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd,
+                    m4, np, m6, r6, time_i, sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd, hk, lk,
                 ),
                 (om_t, ob_t),
             ),
@@ -1360,7 +1375,7 @@ fn chain_latency_v6() {
         ..vcfg()
     };
     let (time_o, time_i) = signal::<U<96>, DefaultClock>();
-    let (sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd) = cfg_wires(&cfg);
+    let (sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd, hk, lk) = cfg_wires(&cfg);
     let (_m4_t, m4) = chan::<Meta, DefaultClock>();
     let (_r4_t, r4) = chan::<FrameByte, DefaultClock>();
     let (m6_t, m6) = chan::<Meta, DefaultClock>();
@@ -1393,7 +1408,7 @@ fn chain_latency_v6() {
         join2(
             d_ntp.run(
                 (
-                    m4, r4, m6, r6, time_i, sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd,
+                    m4, r4, m6, r6, time_i, sy, st, ri, ri6, rt, rd, rp, pr, tl, rl, kd, hk, lk,
                 ),
                 (om_t, ob_t),
             ),

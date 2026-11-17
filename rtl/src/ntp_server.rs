@@ -252,8 +252,16 @@ pub const NTP_LEN: u16 = 48;
 pub const DEFAULT_PRECISION: u8 = 0xE8;
 /// Reference ID of a Kiss-o'-Death `RATE` packet: ASCII "RATE".
 pub const KOD_RATE: u32 = 0x5241_5445;
+/// Address bits of the rate-limiter table.
+pub const RL_IDX_BITS: u32 = 12;
 /// Words of the rate-limiter table.
-pub const RL_ENTRIES: usize = 64;
+pub const RL_ENTRIES: usize = 1 << RL_IDX_BITS;
+/// Leak probability exponent: a request over its limit is still answered
+/// with probability 2^-`RL_LEAK_LOG2` (F2). The integration feeds the
+/// `leak` wire with [`RL_LEAK_Q16`].
+pub const RL_LEAK_LOG2: u32 = 4;
+/// The `leak` wire value for [`RL_LEAK_LOG2`]: probability in units of 2^-16.
+pub const RL_LEAK_Q16: u16 = 1 << (16 - RL_LEAK_LOG2);
 
 /// `clk_sys` cycles from the sampling of `time` (cycle S − 1) to the cycle
 /// `tx_path` accepts the last FCS byte, IPv4 reply on an idle path
@@ -296,13 +304,38 @@ pub struct NtpReplyMeta {
     pub len: U<16>,
 }
 
-/// Rate-limiter index of a 64-bit source key: XOR fold into 6 bits.
-#[lower]
-pub fn src_hash(k: U<64>) -> U<6> {
-    let a = k.slice::<0, 6>() ^ k.slice::<6, 6>() ^ k.slice::<12, 6>() ^ k.slice::<18, 6>();
-    let b = k.slice::<24, 6>() ^ k.slice::<30, 6>() ^ k.slice::<36, 6>() ^ k.slice::<42, 6>();
-    let c = k.slice::<48, 6>() ^ k.slice::<54, 6>() ^ k.slice::<60, 4>().zext::<6>();
-    a ^ b ^ c
+/// Multiplicative constant of the Weyl counter of the leak generator
+/// (2^64 / golden ratio, odd).
+pub const RNG_WEYL: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The multiplier of the rate-limiter hash for a secret: the secret made odd.
+pub const fn rl_mult(secret: u64) -> u64 {
+    secret | 1
+}
+
+/// The additive constant of the rate-limiter hash for a secret: the secret
+/// rotated by 32 bits, xor [`RNG_WEYL`] (so that it differs from the
+/// multiplier even for a symmetric secret).
+pub const fn rl_add(secret: u64) -> u64 {
+    secret.rotate_left(32) ^ RNG_WEYL
+}
+
+/// Rate-limiter bucket of a 64-bit source key under a 64-bit secret: the
+/// top [`RL_IDX_BITS`] bits of `(rl_mult(secret) * key + rl_add(secret))
+/// mod 2^64` (multiply-shift hashing, Dietzfelbinger et al.). This is the
+/// exact function the unit computes serially (see « Rate limiter »); the
+/// key is the IPv4 address zero extended, or the /64 prefix of an IPv6
+/// address.
+pub const fn rl_index(key: u64, secret: u64) -> usize {
+    (rl_mult(secret).wrapping_mul(key).wrapping_add(rl_add(secret)) >> (64 - RL_IDX_BITS)) as usize
+}
+
+/// UDP source ports a request is never answered from (rule N1 extended,
+/// F8): 0 (reserved, no valid sender) and the classic "small services"
+/// echo (7), daytime (13), qotd (17), chargen (19), time (37), the ones
+/// that answer or reflect text/binary back to the sender.
+pub const fn src_port_denied(p: u16) -> bool {
+    matches!(p, 0 | 7 | 13 | 17 | 19 | 37)
 }
 
 const IDLE: u8 = 0;
@@ -331,8 +364,19 @@ pub struct NtpServer {
     pub m_sport: Reg<U<16>>,
     pub m_esrc: Reg<U<48>>,
     pub m_rxts: Reg<U<64>>,
-    /// Rate-limiter index of the source.
-    pub hix: Reg<U<6>>,
+    /// Rate-limiter hash, serial multiplier: the source key, shifted right
+    /// 2 bits per step (its two low bits are the digit in use).
+    pub hx: Reg<U<64>>,
+    /// Multiplicand `rl_mult(secret)`, shifted left 2 bits per step.
+    pub hm: Reg<U<64>>,
+    /// Accumulator, starts at `rl_add(secret)`; its top 12 bits are the
+    /// bucket once `hs` reached 32.
+    pub hacc: Reg<U<64>>,
+    /// Hash steps done, saturates at 32.
+    pub hs: Reg<U<6>>,
+    /// Leak generator: xorshift state and Weyl counter.
+    pub rng_x: Reg<U<64>>,
+    pub rng_w: Reg<U<64>>,
     /// The reply in progress is a KoD.
     pub kod: Reg<Bit>,
     /// Reply image: `ra` bytes 0-15, `rb` 16-31, `rc` 32-39; byte k is the
@@ -344,9 +388,10 @@ pub struct NtpServer {
     pub k: Reg<U<6>>,
     /// `(time >> 32) + tx_latency` of the previous cycle.
     pub t3p: Reg<U<64>>,
-    /// Rate limiter: `{sec[31:16], cnt[15:0]}` per hash index.
-    #[distributed]
-    pub rl: Mem<U<32>, 64, DefaultClock>,
+    /// Rate limiter: `{sec[31:16], cnt[15:0]}` per bucket. The read address
+    /// is a register (`hacc`), so a synthesis tool may map it to block RAM.
+    #[ram_style("block")]
+    pub rl: Mem<U<32>, 4096, DefaultClock>,
 }
 
 #[lower]
@@ -369,6 +414,8 @@ impl
             In<U<64>>,
             In<U<16>>,
             In<Bit>,
+            In<U<64>>,
+            In<U<16>>,
         ),
         (Tx<NtpReplyMeta>, Tx<FrameByte>),
     > for NtpServer
@@ -392,6 +439,8 @@ impl
             tx_latency,
             rate_limit,
             kod_enable,
+            hash_key,
+            leak,
         ): (
             Rx<Meta>,
             Rx<FrameByte>,
@@ -409,6 +458,8 @@ impl
             In<U<64>>,
             In<U<16>>,
             In<Bit>,
+            In<U<64>>,
+            In<U<16>>,
         ),
         (reply_meta, reply): (Tx<NtpReplyMeta>, Tx<FrameByte>),
     ) {
@@ -448,7 +499,10 @@ impl
                 n_src.slice::<64, 64>(),
                 n_src.slice::<0, 32>().zext::<64>(),
             );
-            let n_hix = src_hash(key);
+            // Rate-limiter hash: loaded here, computed serially during RECV.
+            let sec_k = hash_key.get();
+            let h_a = sec_k | U::<64>::from(1u64);
+            let h_b = ((sec_k << 32u32) | (sec_k >> 32u32)) ^ U::<64>::from(RNG_WEYL);
 
             // ---------------------------------------------------- RECV
             let p4 = Bit::from(req4.peek().is_some());
@@ -471,11 +525,45 @@ impl
             // Origin complete in cycle L even when byte 47 is the last one.
             let org_now = mux(Bit::from(pos == 47), org_sh, org);
             let done = take & last;
-            let valid = self.ok0.get() & Bit::from(pos >= 47) & !err;
+            // N1 extended (F8): never answer from a UDP source port of 0 or
+            // of an echo-style service.
+            let sp = self.m_sport.get();
+            let sp_ok = !(Bit::from(sp == 0u16)
+                | Bit::from(sp == 7u16)
+                | Bit::from(sp == 13u16)
+                | Bit::from(sp == 17u16)
+                | Bit::from(sp == 19u16)
+                | Bit::from(sp == 37u16));
+            let valid = self.ok0.get() & Bit::from(pos >= 47) & !err & sp_ok;
+
+            // Serial multiply-add, two multiplier bits per step, 32 steps
+            // (`hs` = 0..31, the product is complete when `hs` = 32).
+            let hs = self.hs.get();
+            let hx = self.hx.get();
+            let hm = self.hm.get();
+            let hacc = self.hacc.get();
+            let h_run = Bit::from(hs < U::<6>::from(32u8)) & !take_m;
+            let zero64 = U::<64>::from(0u64);
+            let hp0 = mux(hx.bit(0), hm, zero64);
+            let hp1 = mux(hx.bit(1), hm << 1u32, zero64);
+            let hacc_n = hacc + hp0 + hp1;
+            let bucket = hacc.slice::<52, 12>();
+
+            // Leak generator: xorshift64 step xor a Weyl counter (so the
+            // state never sticks at 0), the receive timestamp of each
+            // request folded in when it is taken.
+            let rx_ = self.rng_x.get();
+            let rw_ = self.rng_w.get();
+            let xs1 = rx_ ^ (rx_ << 13u32);
+            let xs2 = xs1 ^ (xs1 >> 7u32);
+            let xs3 = xs2 ^ (xs2 << 17u32);
+            let rng_n = xs3 ^ rw_ ^ mux(take_m, n_rxts, zero64);
+            let leak_w = leak.get();
+            let leak_hit = Bit::from(rx_.slice::<24, 16>() < leak_w);
 
             // Rate limiter (cycle L).
             let sec = now.slice::<64, 16>();
-            let word = self.rl.read(self.hix.get());
+            let word = self.rl.read(bucket);
             let same = Bit::from(word.slice::<16, 16>() == sec);
             let cnt = mux(same, word.slice::<0, 16>(), U::<16>::from(0u16));
             let lim = rate_limit.get();
@@ -483,8 +571,11 @@ impl
             let allowed = unl | Bit::from(cnt < lim);
             let cnt_n = mux(allowed & !unl, cnt + U::<16>::from(1u16), cnt);
             let word_n = (sec.zext::<32>() << 16u32) | cnt_n.zext::<32>();
-            let go_n = valid & allowed;
-            let go_k = valid & !allowed & kod_enable.get();
+            // Over the limit: a leaked request is answered like an allowed
+            // one but not counted (F2).
+            let leaked = !allowed & leak_hit;
+            let go_n = valid & (allowed | leaked);
+            let go_k = valid & !allowed & !leaked & kod_enable.get();
             let go = go_n | go_k;
 
             // Reply image (cycle L).
@@ -559,7 +650,20 @@ impl
                     m_sport: n_sport,
                     m_esrc: n_esrc,
                     m_rxts: n_rxts,
-                    hix: n_hix,
+                    hx: key,
+                    hm: h_a,
+                    hacc: h_b,
+                    hs: U::<6>::from(0u8),
+                },
+                h_run ? {
+                    hx: hx >> 2u32,
+                    hm: hm << 2u32,
+                    hacc: hacc_n,
+                    hs: hs + U::<6>::from(1u8),
+                },
+                Bit::One ? {
+                    rng_x: rng_n,
+                    rng_w: rw_ + U::<64>::from(RNG_WEYL),
                 },
                 take & Bit::from(pos < 48) ? pos: pos + U::<6>::from(1u8),
                 take & Bit::from(pos == 0) ? {
@@ -568,7 +672,7 @@ impl
                 },
                 take & Bit::from(pos == 2) ? poll: data,
                 take & in_ts ? org: org_sh,
-                done & valid ? rl.at(self.hix.get()): word_n,
+                done & valid ? rl.at(bucket): word_n,
                 done ? {
                     st: mux(go, U::<2>::from(META), U::<2>::from(IDLE)),
                     kod: go_k,
