@@ -100,14 +100,6 @@ fn pay(n: usize, seed: usize) -> Vec<u8> {
         .collect()
 }
 
-fn fbs(b: &[u8], err: bool) -> Vec<FrameByte> {
-    let n = b.len();
-    b.iter()
-        .enumerate()
-        .map(|(i, &x)| FrameByte::new(x, i + 1 == n, err && i + 1 == n))
-        .collect()
-}
-
 fn split(bytes: &[FrameByte]) -> (Vec<u8>, bool) {
     (
         bytes.iter().map(|b| b.data.raw() as u8).collect(),
@@ -1230,7 +1222,12 @@ fn chain_negative_vectors() {
             assert_eq!(want.len(), 1);
             check_frame(&o.frames[0], want[0], name);
         }
-        assert_eq!(o.seen.len(), n_ans, "{name}: datagrams seen");
+        // A bad checksum is only known at the last byte: that datagram
+        // reaches the stand-in, ending with err.
+        let clean = o.seen.iter().filter(|s| !s.2).count();
+        assert_eq!(clean, n_ans, "{name}: clean datagrams seen");
+        let late = if name == "neg_udp6_checksum.hex" { 1 } else { 0 };
+        assert_eq!(o.seen.len() - clean, late, "{name}: late-err datagrams");
     }
 }
 
