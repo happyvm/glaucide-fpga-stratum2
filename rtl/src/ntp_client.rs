@@ -282,8 +282,10 @@ pub fn is_ll6(a: U<128>) -> Bit {
 #[derive(Trace, Default)]
 pub struct NtpClient {
     pub st: Reg<U<4>>,
-    /// Current slot.
+    /// Slot of the event in progress (reply or request path).
     pub cs: Reg<U<2>>,
+    /// Scheduler pointer: the slot `SCAN` examines.
+    pub sp: Reg<U<2>>,
     /// Alternates replies and scheduler actions in `SCAN`.
     pub pri: Reg<Bit>,
     // Reply.
@@ -480,15 +482,17 @@ impl
             let e1 = up1_en.get();
             let e2 = up2_en.get();
             let e3 = up3_en.get();
-            let c0 = cs.bit(0);
-            let c1 = cs.bit(1);
+            // Slot whose wires and state are read / written this cycle.
+            let ix = mux(is_scan, self.sp.get(), cs);
+            let c0 = ix.bit(0);
+            let c1 = ix.bit(1);
             let s_addr = mux(c1, mux(c0, a3, a2), mux(c0, a1, a0));
             let s_v6 = mux(c1, mux(c0, v3, v2), mux(c0, v1, v0));
             let s_en = mux(c1, mux(c0, e3, e2), mux(c0, e1, e0));
 
-            let fl = self.m_fl.read(cs);
-            let tm = self.m_tm.read(cs);
-            let t1s = self.m_t1.read(cs);
+            let fl = self.m_fl.read(ix);
+            let tm = self.m_tm.read(ix);
+            let t1s = self.m_t1.read(ix);
             let f_out = fl.bit(0);
             let f_pend = fl.bit(1);
             let f_sent = fl.bit(2);
@@ -779,8 +783,9 @@ impl
                 },
                 do_sc ? {
                     st: sc_next,
-                    cs: mux(sc_act, cs, cs + U::<2>::from(1u8)),
+                    cs: ix,
                 },
+                is_scan & !sc_act ? sp: ix + U::<2>::from(1u8),
                 take_b & Bit::from(pos < 48) ? pos: pos + U::<6>::from(1u8),
                 take_b & Bit::from(pos < 16) ? hdr: (hdr << 8u32) | data.zext::<128>(),
                 take_b & Bit::from(pos >= 24) & Bit::from(pos < 32) ? org: (self.org.get() << 8u32) | d64,
@@ -814,9 +819,9 @@ impl
                 w_t40 ? t1r: t1p << 8u32,
                 send_p & Bit::from(k > 40) ? t1r: t1r << 8u32,
                 w_sent ? st: U::<4>::from(S_SCAN),
-                fl_we ? m_fl.at(cs): fl_wd,
-                tm_we ? m_tm.at(cs): tm_wd,
-                w_t40 ? m_t1.at(cs): t1p,
+                fl_we ? m_fl.at(ix): fl_wd,
+                tm_we ? m_tm.at(ix): tm_wd,
+                w_t40 ? m_t1.at(ix): t1p,
             });
         }
     }

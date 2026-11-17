@@ -851,7 +851,7 @@ fn resolution_cap() {
     // the neighbor disappears: the next poll is abandoned and counted
     b.tab4.clear();
     let l0 = b.lookups.len();
-    b.advance(3 * SEC, 12, 100);
+    b.advance(3 * SEC, 192, 30);
     assert_eq!(b.lookups.len() - l0, RES_TRIES as usize);
     assert_eq!(b.misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![0]);
     assert_eq!(b.reqs.len(), 1);
@@ -865,8 +865,8 @@ fn deadline_miss_once() {
     b.set_ntp(T0 + SEC / 2);
     b.slot(2, PEER6, true, true);
     b.until_reqs(1, 300);
-    // 1.75 s later: still waiting
-    b.advance(SEC + 3 * SEC / 4, 7, 50);
+    // 1.25 s later (second s + 1.75): still waiting
+    b.advance(SEC + SEC / 4, 5, 50);
     assert!(b.misses.is_empty());
     assert_eq!(b.reqs.len(), 1);
     // DEADLINE_S whole seconds after T1's second: one miss, then the next
