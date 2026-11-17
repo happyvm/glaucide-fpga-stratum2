@@ -12,9 +12,17 @@ use txhdl_parts::cdc::ChanCdc;
 
 /// Stamps that can wait in `clk_sys` for their frame (credits).
 pub const STAMP_DEPTH: usize = 16;
-/// Nominal latency from the SFD on the MII to the capture of `time`, in
-/// units of 2^-32 s.
-pub const RX_STAMP_BIAS: u64 = 0;
+/// Nominal `clk_rx` period (100 Mb/s MII), picoseconds.
+pub const CLK_RX_PS: u64 = 40_000;
+/// `clk_sys` period, picoseconds.
+pub const CLK_SYS_PS: u64 = 10_000;
+/// Nominal latency from the edge of `clk_rx` that samples the SFD nibble
+/// to the edge of `clk_sys` that captures `time`: 2 `clk_rx` cycles, then
+/// 3.5 `clk_sys` cycles on average (see the module documentation).
+pub const RX_STAMP_LATENCY_PS: u64 = 2 * CLK_RX_PS + 7 * CLK_SYS_PS / 2;
+/// [`RX_STAMP_LATENCY_PS`] in units of 2^-32 s, rounded: 494 (115 ns).
+pub const RX_STAMP_BIAS: u64 =
+    ((RX_STAMP_LATENCY_PS as u128 * (1u128 << 32) + 500_000_000_000) / 1_000_000_000_000) as u64;
 
 /// Event on the `ClkRx` -> `clk_sys` event channel: an SFD was seen.
 pub const EV_SFD: u8 = 0;
@@ -110,6 +118,10 @@ impl<R: Clock>
                 !got | (m_in < 1517) | b.last,
                 "a frame has at most 1518 bytes (IEEE 802.3 4.4.2.3)"
             );
+            assume!(
+                !got | !b.err | b.last,
+                "err only together with last (stream contract 2)"
+            );
             let s = sfd.get();
             let (tok_b, _tok) = tokens.take();
             let tok = Bit::from(tok_b);
@@ -145,7 +157,7 @@ impl<R: Clock>
                     "an output frame starts only with a commit event"
                 );
                 words.send(FrameByte {
-                    data: b.data,
+                    data: mux(term, U::<8>::from(0u8), b.data),
                     last: wlast,
                     err: werr,
                 });
