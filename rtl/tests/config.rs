@@ -159,6 +159,9 @@ fn rate_secret_is_set_per_configuration() {
     assert_eq!(Test::RATE_SECRET, 0x1F2E_3D4C_5B6A_7988);
     assert_ne!(Board::RATE_SECRET, Test::RATE_SECRET);
     assert_ne!(Board::ENTROPY_SEED, Test::ENTROPY_SEED);
+    // KoD: on for the board (clients back off), off for the test set (silence, as the tests assume).
+    assert!(Board::KOD_ENABLE && !Test::KOD_ENABLE);
+    assert!(Board::RATE_LIMIT_PER_S == 0 || Board::RATE_LIMIT_PER_S >= 4);
     assert_ne!(Board::ENTROPY_SEED, 0);
     for s in [Board::RATE_SECRET, Test::RATE_SECRET] {
         assert_ne!(s, 0);

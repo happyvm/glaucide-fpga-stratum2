@@ -122,6 +122,11 @@ pub trait ConfigSet {
     const PRECISION_LOG2: i8;
     /// Responses allowed per second and per source before rate limiting.
     const RATE_LIMIT_PER_S: u16;
+    /// Send a Kiss-o'-Death `RATE` (48 bytes, never larger than the request) to a
+    /// rate-limited source instead of staying silent. With it chrony/ntpd back off
+    /// (RFC 8633); without it a client polling faster than the limit sees bursts of
+    /// replies then silence and keeps its poll interval (`docs/chrony-interop.md` C4).
+    const KOD_ENABLE: bool;
     /// Secret key of the rate limiter's hash (`ntp_server.rs`, « Rate
     /// limiter »): it decides which bucket each source falls in, so that an
     /// attacker cannot choose sources that collide with a victim's bucket
@@ -160,6 +165,7 @@ impl ConfigSet for Board {
     const POLL_LOG2: u8 = 6;
     const PRECISION_LOG2: i8 = -24;
     const RATE_LIMIT_PER_S: u16 = 8;
+    const KOD_ENABLE: bool = true;
     // Development value: replace it with a random one for each deployment.
     const RATE_SECRET: u64 = 0xA5C3_9E27_4B1D_6F83;
     // Public development value: set your own per deployment.
@@ -190,6 +196,7 @@ impl ConfigSet for Test {
     const POLL_LOG2: u8 = 6;
     const PRECISION_LOG2: i8 = -24;
     const RATE_LIMIT_PER_S: u16 = 8;
+    const KOD_ENABLE: bool = false;
     // Test value, different from [`Board`]'s.
     const RATE_SECRET: u64 = 0x1F2E_3D4C_5B6A_7988;
     const ENTROPY_SEED: u64 = 0x0123_4567_89AB_CDEF;
@@ -256,6 +263,12 @@ impl<C: ConfigSet> Checks<C> {
 
 // The same checks, on the two sets of this file, at compile time.
 const _: () = Checks::<Board>::OK;
+// The board set only (test sets may use low limits on purpose): chrony's `iburst` polls 4 times a
+// second, so a limit under 4 drops part of the initial burst (docs/chrony-interop.md, C3).
+const _: () = assert!(
+    Board::RATE_LIMIT_PER_S == 0 || Board::RATE_LIMIT_PER_S >= 4,
+    "Board::RATE_LIMIT_PER_S must be 0 (unlimited) or at least 4"
+);
 const _: () = Checks::<Test>::OK;
 
 /// The configuration unit. Drives the wires of the set `C`.

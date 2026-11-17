@@ -42,6 +42,9 @@ Serveur NTP **stratum 2, IPv4 + IPv6**, entièrement en logique, sur Arty A7-100
 - Avec la config `Board`, l'amont IPv6 passe par `fe80::1` : `2001:db8::1` n'est pas dans le /64 de la carte.
 - Le script `build.tcl` écrit le bitstream avant le verdict de timing : un échec laisse quand même un `arty_ntp.bit`.
 
+## Interopérabilité avec un vrai client (chrony 4.9)
+Voir `docs/chrony-interop.md` : le design simulé cycle par cycle, branché à un vrai `chronyd` (temps virtuel couplé à la simulation), est **sélectionné par chrony** en stratum 2 (reach 377, aucune ligne Invalid/Unacceptable), toutes les réponses sont exactes à l'octet, les champs vus par chrony (stratum, précision −24, dispersion racine, Reference ID) sont ceux attendus ; en stratum 16 chrony ne le sélectionne pas. L'offset résiduel mesuré par chrony (+4 ns, σ 0) correspond aux erreurs de timestamp de la simulation. **Limites : IPv4 seulement** (le conteneur n'a pas de sockets IPv6), une seule paire de phases MII, ni latence du PHY ni pile de l'hôte, la carte avec client non testée avec chrony. Reproduction : `tools/chrony/build.sh && tools/chrony/run.sh` (environ 5 minutes).
+
 ## Reste à faire
 1. **Sur machine avec Vivado** : `tools/vivado/README.md` ; revue de timing (T5.3). Points chauds : graine de checksum IPv6 (chaîne d'additions), multiplieurs de `ntp_server`/`selection`/`servo`.
 2. **Mise en service** (T5.4) : mesures contre chrony/ntpd, carte contre carte, latence PHY à ajouter aux biais.

@@ -128,6 +128,7 @@ impl<const RL: u16> ConfigSet for ChronyCfg<RL> {
     const POLL_LOG2: u8 = <ntp_fpga::config::Test as ConfigSet>::POLL_LOG2;
     const PRECISION_LOG2: i8 = <ntp_fpga::config::Test as ConfigSet>::PRECISION_LOG2;
     const RATE_LIMIT_PER_S: u16 = RL;
+    const KOD_ENABLE: bool = false;
     const RATE_SECRET: u64 = <ntp_fpga::config::Test as ConfigSet>::RATE_SECRET;
     const ENTROPY_SEED: u64 = 0x0123_4567_89AB_CDEF;
 }

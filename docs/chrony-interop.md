@@ -319,7 +319,8 @@ le registre d'accessibilité oscille et chrony alterne `Selected source` / `Can'
 (1 unreachable sources)` (13 fois en 30 s, reach final 300). Comme le design ne renvoie jamais de KoD
 (`kod_enable` = 0), chrony n'a aucun moyen d'apprendre qu'il doit ralentir : son poll reste à `minpoll`. Ce n'est
 pas un défaut (le silence est le comportement par défaut de ntpd et le choix documenté du projet), mais une
-conséquence à connaître. *Proposition* (non appliquée, hors périmètre) : faire de `kod_enable` une constante de
+conséquence à connaître. *Appliqué* : `kod_enable` est maintenant la constante `ConfigSet::KOD_ENABLE` (`Board` : vrai, `Test` : faux,
+comme le pont chrony) ; proposition d'origine : faire de `kod_enable` une constante de
 `ConfigSet` (au lieu du `tie(Bit::Zero)` de `ArtyCore`), pour pouvoir activer le KoD `RATE` (48 octets, jamais plus
 gros que la requête, donc sans amplification) : chrony recule alors de 4 × poll et arrête sa rafale
 (`ntp_core.c`). Un limiteur à fenêtre glissante ou à seau percé étalerait aussi les pertes.

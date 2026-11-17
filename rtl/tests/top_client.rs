@@ -76,6 +76,7 @@ impl ConfigSet for CliCfg {
     const POLL_LOG2: u8 = Test::POLL_LOG2;
     const PRECISION_LOG2: i8 = Test::PRECISION_LOG2;
     const RATE_LIMIT_PER_S: u16 = Test::RATE_LIMIT_PER_S;
+    const KOD_ENABLE: bool = false;
     const RATE_SECRET: u64 = Test::RATE_SECRET;
     const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 }
@@ -101,6 +102,7 @@ impl ConfigSet for CliCfg4 {
     const POLL_LOG2: u8 = CliCfg::POLL_LOG2;
     const PRECISION_LOG2: i8 = CliCfg::PRECISION_LOG2;
     const RATE_LIMIT_PER_S: u16 = CliCfg::RATE_LIMIT_PER_S;
+    const KOD_ENABLE: bool = false;
     const RATE_SECRET: u64 = CliCfg::RATE_SECRET;
     const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 }
@@ -125,6 +127,7 @@ impl ConfigSet for CliCfg6 {
     const POLL_LOG2: u8 = CliCfg::POLL_LOG2;
     const PRECISION_LOG2: i8 = CliCfg::PRECISION_LOG2;
     const RATE_LIMIT_PER_S: u16 = CliCfg::RATE_LIMIT_PER_S;
+    const KOD_ENABLE: bool = false;
     const RATE_SECRET: u64 = CliCfg::RATE_SECRET;
     const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 }

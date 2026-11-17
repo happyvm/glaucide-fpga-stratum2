@@ -288,8 +288,11 @@ hwtimestamp eth0
    (`minpoll 0` est une requête par seconde : sous le seuil de 8 par seconde de la carte. N'activez pas le mode
    entrelacé `xleave` : le serveur ne le gère pas.) Voir la documentation de chrony pour `rxfilter`.
    Suivez : `chronyc ntpdata 192.0.2.10`, `chronyc sources -v`, `chronyc sourcestats -v`. Avec `ArtyBoard`
-   (strate 16) chrony n'utilise pas le serveur : lisez le **délai** et sa gigue sur `ntpdata` ou sur une capture,
-   pas l'offset.
+   (strate 16) chrony ne calcule rien (`Peer delay` reste à 0, voir `docs/chrony-interop.md` C1) : mesurez le
+   délai avec `ntpdate -q` / `sntp`, ou sur une capture (point 3), ou utilisez une carte synchronisée
+   (`ArtyBoardWithClient`). **Un serveur non synchronisé apparaît « injoignable » dans chrony** (`^?`, reach 0)
+   alors que toutes les réponses arrivent (C2) : ne pas conclure à un problème réseau, lire `chronyc ntpdata`
+   (`Leap status : Not synchronised`, `Stratum : 16`, `Total RX`).
 3. **Capture** à horodatage d'interface : `sudo tcpdump -n -i eth0 --time-stamp-precision=nano -j adapter_unsynced -w mesure.pcap 'udp port 123'`
    (options à vérifier sur votre version de tcpdump et de libpcap). T1 et T4 viennent de la capture (côté hôte),
    T2 et T3 des champs *Receive* et *Transmit* de la réponse ; `offset = ((T2-T1)+(T3-T4))/2`, `delay = (T4-T1)-(T3-T2)`.

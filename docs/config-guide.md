@@ -25,6 +25,7 @@ contrôle des 24 bits (section 4) a produit l'erreur de compilation citée. Rien
 | `POLL_LOG2` | `u8` | intervalle d'interrogation en puissance de deux secondes (6 = 64 s) | 4 à 10 : vérifié à la compilation |
 | `PRECISION_LOG2` | `i8` | champ *precision* des réponses (-24 = environ 60 ns) | non vérifié |
 | `RATE_LIMIT_PER_S` | `u16` | réponses autorisées par seconde et par source | 0 = illimité |
+| `KOD_ENABLE` | `bool` | répondre par un Kiss-o'-Death `RATE` (48 octets) à une source limitée au lieu de se taire : chrony et ntpd ralentissent alors (RFC 8633) ; `Board` : `true`, `Test` : `false`. `Board::RATE_LIMIT_PER_S` doit valoir 0 ou au moins 4 (l'`iburst` de chrony interroge 4 fois par seconde : `docs/chrony-interop.md` C3) |
 | `RATE_SECRET` | `u64` | clé secrète du hachage du limiteur de débit (qui décide de la case de chaque source) | **choisir une valeur aléatoire par déploiement** (`python3 -c 'import secrets; print(hex(secrets.randbits(64)))'`), ne pas la publier ; 0 déconseillé ; les valeurs de `Board` et `Test` sont publiques |
 | `ENTROPY_SEED` | `u64` | graine par carte du générateur de nonce du client (`entropy.rs`) : à personnaliser à chaque déploiement ; pas de générateur matériel vrai, voir `docs/security.md` F3 |
 
@@ -74,6 +75,7 @@ Deux jeux existent dans `config.rs` :
 | `POLL_LOG2` | 6 | 6 |
 | `PRECISION_LOG2` | -24 | -24 |
 | `RATE_LIMIT_PER_S` | 8 | 8 |
+| `KOD_ENABLE` | `bool` | répondre par un Kiss-o'-Death `RATE` (48 octets) à une source limitée au lieu de se taire : chrony et ntpd ralentissent alors (RFC 8633) ; `Board` : `true`, `Test` : `false`. `Board::RATE_LIMIT_PER_S` doit valoir 0 ou au moins 4 (l'`iburst` de chrony interroge 4 fois par seconde : `docs/chrony-interop.md` C3) |
 
 Les amonts de `Board` sont des **adresses de documentation fictives** : ils doivent être remplacés avant tout
 usage réel. Ne modifiez pas `Test` : les tests et les vecteurs de référence en dépendent.

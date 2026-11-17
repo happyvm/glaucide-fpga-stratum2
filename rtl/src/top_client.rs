@@ -661,7 +661,7 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>
                                     precision_b,
                                     tx_latency,
                                     rate_limit,
-                                    tie(Bit::Zero),
+                                    tie(Bit::from_bool(C::KOD_ENABLE)),
                                     tie(U::<64>::new(rl_mult(C::RATE_SECRET) as u128)),
                                     tie(U::<16>::from(RL_LEAK_Q16)),
                                 ),
