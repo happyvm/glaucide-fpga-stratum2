@@ -70,7 +70,7 @@ Le modèle est une recommandation, pas une contrainte. Si un agent bloque, il le
 | T3.2 | Checksum pseudo-en-tête (IPv6 UDP/ICMPv6), commun | Haiku | T0.1 | `rtl/src/csum.rs` | Vecteurs RFC, utilisé par T3.3–T3.5 |
 | T3.3 | ICMPv6 : echo, NDP NS/NA (solicited-node), DAD minimal | Sonnet | T3.1, T3.2 | `rtl/src/icmpv6.rs` | `ping6` et NS de référence → NA identique |
 | T3.4 | UDP IPv6 : checksum obligatoire, port 123 | Sonnet | T3.1, T3.2 | `rtl/src/udp6.rs` | Datagramme v6 de référence → réponse valide |
-| T3.5 | Router Advertisement (SLAAC) en réception : préfixe /64, adresse dérivée | Sonnet | T3.3 | `rtl/src/slaac.rs` | RA de référence → adresse configurée |
+| T3.5 (optionnelle, hors v1) | Router Advertisement (SLAAC) en réception : préfixe /64, adresse dérivée | Sonnet | T3.3 | `rtl/src/slaac.rs` | RA de référence → adresse configurée |
 | T3.6 | Intégration NTP IPv6 : `ntp_server` partagé v4/v6, Reference ID selon la famille | Opus | T2.3, T3.4 | `rtl/src/ntp_server.rs` (extension) | Mêmes tests que T2.3 en v6 |
 
 ## Phase 4 — Client NTP et stratum 2
@@ -78,6 +78,7 @@ Le modèle est une recommandation, pas une contrainte. Si un agent bloque, il le
 | ID | Tâche | Modèle | Dépend de | Livrable | Critère d'acceptation |
 |---|---|---|---|---|---|
 | T4.1 | Registres de configuration : serveurs amont (v4/v6, statiques, pas de DNS en v1), MAC, adresses, poll ; **prouve** `local_mac` unicast (garant de l'hypothèse de T1.5, voir `docs/formal.md`) | Haiku | T0.1 | `rtl/src/config.rs` | Valeurs par défaut documentées, accès par un bus simple |
+| T4.1b | `config` : ajouter `GATEWAY_IP6` (passerelle IPv6 statique, link-local ou globale) et le fil `gateway6` ; test et vérification (pas de DHCP, voir `docs/architecture.md`) | Haiku | T4.1 | `rtl/src/config.rs` | Test du fil, adresse non multicast vérifiée à la compilation |
 | T4.2 | Client NTP : émission de requêtes mode 3 vers N amonts, collecte de T1..T4 (offset, delay) | Opus | T2.3, T3.4, T4.1 | `rtl/src/ntp_client.rs` | Échanges simulés avec un serveur modèle, offset/delay exacts à 1 LSB |
 | T4.3 | Filtre d'horloge RFC 5905 (8 échantillons, meilleur delay, dispersion, jitter) | Opus | T4.2 | `rtl/src/clock_filter.rs` | Comparaison au modèle Python sur 1000 échantillons aléatoires |
 | T4.4 | Sélection et regroupement (clustering) des amonts, rejet des *falsetickers* | Opus | T4.3 | `rtl/src/selection.rs` | Cas : 1 amont faux sur 3 écarté |

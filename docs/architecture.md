@@ -38,6 +38,17 @@ ntp_client (FSM) --> upstream stratum 1 (v4/v6) --> clock_servo (PI) --> discipl
 4. Client NTP + servo → stratum 2.
 5. Robustesse : rate limit, KoD, MMCM/CDC, mesures d'offset/jitter.
 
+## Configuration réseau : statique uniquement (décision du propriétaire)
+
+Le serveur **ne fonctionne pas en DHCP/BOOTP** : pas de client DHCPv4, BOOTP ou DHCPv6. Adresse MAC, adresse IPv4, masque, passerelle, adresse IPv6 globale statique, serveurs amont et paramètres NTP sont fixés à la synthèse (`rtl/src/config.rs`, `docs/roadmap.md` T4.1).
+
+Conséquences :
+- Les trames DHCP/BOOTP reçues (UDP 67/68, broadcast) sont déjà abandonnées par le filtre de ports ; rien à ajouter.
+- IPv4 : adresse, masque et passerelle statiques ; ARP sert à résoudre la passerelle et les amonts (`arp.rs`), pas à obtenir une adresse.
+- IPv6 : adresse link-local EUI-64 + adresse globale statique. Pas de DHCPv6. La configuration automatique SLAAC par Router Advertisement (T3.5) devient **optionnelle, hors périmètre v1** ; en revanche une **passerelle IPv6 statique** est nécessaire pour joindre des amonts IPv6 hors lien (T4.1b : ajouter `GATEWAY_IP6` à `config`).
+- Aucune détection d'adresse en double IPv4 (ARP probe) : l'adresse est choisie par l'administrateur.
+- Pour changer d'adresse il faut resynthétiser (ou, plus tard, ajouter un registre de configuration par UART).
+
 ## Outils
 - TxHDL (Rust → Verilog), simulation native en Rust (`Running::cycle`), traces FST/VCD. Épinglé via `tools/setup.sh`.
 - Synthèse/P&R : Vivado sur la machine de l'utilisateur, à partir de `out/*.v` et `constraints/arty_a7_100.xdc`.
