@@ -172,6 +172,7 @@ pub const CLIENT_TX_LATENCY_V6: u64 = TX_LATENCY_V6;
 /// the client's Origin nonces are only as unpredictable as the network
 /// jitter mixed in since reset (`entropy.rs`, « No true random number
 /// generator »).
+/// Kept for the tests of the standalone entropy bench; the board uses `ConfigSet::ENTROPY_SEED`.
 pub const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 
 // ---------------------------------------------------------------------
@@ -672,7 +673,7 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>
                                 join2(
                                     self.lat.run(route_lat, tx_latency_o),
                                     self.entropy.run(
-                                        (tie(U::<64>::new(ENTROPY_SEED as u128)), time_f, rx_stamp),
+                                        (tie(U::<64>::new(C::ENTROPY_SEED as u128)), time_f, rx_stamp),
                                         rnd_o,
                                     ),
                                 ),

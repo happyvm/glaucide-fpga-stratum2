@@ -26,6 +26,7 @@ contrôle des 24 bits (section 4) a produit l'erreur de compilation citée. Rien
 | `PRECISION_LOG2` | `i8` | champ *precision* des réponses (-24 = environ 60 ns) | non vérifié |
 | `RATE_LIMIT_PER_S` | `u16` | réponses autorisées par seconde et par source | 0 = illimité |
 | `RATE_SECRET` | `u64` | clé secrète du hachage du limiteur de débit (qui décide de la case de chaque source) | **choisir une valeur aléatoire par déploiement** (`python3 -c 'import secrets; print(hex(secrets.randbits(64)))'`), ne pas la publier ; 0 déconseillé ; les valeurs de `Board` et `Test` sont publiques |
+| `ENTROPY_SEED` | `u64` | graine par carte du générateur de nonce du client (`entropy.rs`) : à personnaliser à chaque déploiement ; pas de générateur matériel vrai, voir `docs/security.md` F3 |
 
 ### Ce que `config.rs` en déduit
 
@@ -162,6 +163,7 @@ impl ConfigSet for MonReseau {
     const PRECISION_LOG2: i8 = -24;
     const RATE_LIMIT_PER_S: u16 = 8;
     const RATE_SECRET: u64 = 0x0123_4567_89AB_CDEF; // à remplacer par une valeur aléatoire
+    const ENTROPY_SEED: u64 = 0x7C1A_92E4_5B0D_38F6; // per-device random value
 }
 const _: () = Checks::<MonReseau>::OK;
 ```

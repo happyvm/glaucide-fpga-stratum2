@@ -77,6 +77,7 @@ impl ConfigSet for CliCfg {
     const PRECISION_LOG2: i8 = Test::PRECISION_LOG2;
     const RATE_LIMIT_PER_S: u16 = Test::RATE_LIMIT_PER_S;
     const RATE_SECRET: u64 = Test::RATE_SECRET;
+    const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 }
 
 /// [`CliCfg`] with the IPv4 upstream only (the synchronisation test: one
@@ -101,6 +102,7 @@ impl ConfigSet for CliCfg4 {
     const PRECISION_LOG2: i8 = CliCfg::PRECISION_LOG2;
     const RATE_LIMIT_PER_S: u16 = CliCfg::RATE_LIMIT_PER_S;
     const RATE_SECRET: u64 = CliCfg::RATE_SECRET;
+    const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 }
 
 /// [`CliCfg`] with the IPv6 upstream only (slot 1).
@@ -124,6 +126,7 @@ impl ConfigSet for CliCfg6 {
     const PRECISION_LOG2: i8 = CliCfg::PRECISION_LOG2;
     const RATE_LIMIT_PER_S: u16 = CliCfg::RATE_LIMIT_PER_S;
     const RATE_SECRET: u64 = CliCfg::RATE_SECRET;
+    const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 }
 
 const MAC: u64 = Test::LOCAL_MAC;

@@ -158,6 +158,8 @@ fn rate_secret_is_set_per_configuration() {
     assert_eq!(Board::RATE_SECRET, 0xA5C3_9E27_4B1D_6F83);
     assert_eq!(Test::RATE_SECRET, 0x1F2E_3D4C_5B6A_7988);
     assert_ne!(Board::RATE_SECRET, Test::RATE_SECRET);
+    assert_ne!(Board::ENTROPY_SEED, Test::ENTROPY_SEED);
+    assert_ne!(Board::ENTROPY_SEED, 0);
     for s in [Board::RATE_SECRET, Test::RATE_SECRET] {
         assert_ne!(s, 0);
         assert_eq!(rl_mult(s) & 1, 1, "the multiplier is odd");

@@ -25,6 +25,7 @@
 //! | `PRECISION_LOG2` | -24 | -24 |
 //! | `RATE_LIMIT_PER_S` | 8 | 8 |
 //! | `RATE_SECRET` | `0xA5C3_9E27_4B1D_6F83` (public development value: set your own) | `0x1F2E_3D4C_5B6A_7988` |
+//! | `ENTROPY_SEED` | `0x6E74_705F_7365_6564` (public development value: set your own) | `0x0123_4567_89AB_CDEF` |
 //!
 //! The upstream servers of `Board` are the documentation addresses given
 //! in the roadmap; they are placeholders to replace before use on a
@@ -131,6 +132,11 @@ pub trait ConfigSet {
     /// and [`Test`] are public and for development only. Any value works
     /// (the unit makes the multiplier odd), but avoid 0.
     const RATE_SECRET: u64;
+    /// Per-device seed of the client's nonce generator (`entropy.rs`): a build-time
+    /// constant, NOT secret from the bitstream but unknown to network attackers.
+    /// Every deployment must set its own random value: with a shared public seed
+    /// the first requests after reset have only the arrival-timing entropy.
+    const ENTROPY_SEED: u64;
 }
 
 /// The real design (roadmap addresses, see the module header).
@@ -156,6 +162,8 @@ impl ConfigSet for Board {
     const RATE_LIMIT_PER_S: u16 = 8;
     // Development value: replace it with a random one for each deployment.
     const RATE_SECRET: u64 = 0xA5C3_9E27_4B1D_6F83;
+    // Public development value: set your own per deployment.
+    const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 }
 
 /// The Python model (`tools/golden/vectors.py`): the addresses of the
@@ -184,6 +192,7 @@ impl ConfigSet for Test {
     const RATE_LIMIT_PER_S: u16 = 8;
     // Test value, different from [`Board`]'s.
     const RATE_SECRET: u64 = 0x1F2E_3D4C_5B6A_7988;
+    const ENTROPY_SEED: u64 = 0x0123_4567_89AB_CDEF;
 }
 
 /// A MAC address (48 bits, byte 0 in the top byte) is unicast when the
