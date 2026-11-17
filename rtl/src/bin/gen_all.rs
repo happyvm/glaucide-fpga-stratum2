@@ -14,6 +14,7 @@ fn main() {
         Some("mii_tx") => print!("{}", MiiTx::verilog("mii_tx")),
         Some("eth_rx") => print!("{}", EthRx::verilog("eth_rx")),
         Some("eth_tx") => print!("{}", EthTx::verilog("eth_tx")),
+        Some("tx_arb") => print!("{}", ntp_fpga::tx_arb::TxArb::verilog("tx_arb")),
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
         other => {
             eprintln!("unknown module {other:?}");
