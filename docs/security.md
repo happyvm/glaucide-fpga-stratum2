@@ -220,3 +220,8 @@ Effet attendu : la capacité totale passe à 4 096 × 8 = 32 768 réponses/s (�
 ### F5/F6 — caches
 
 `arp.rs`, règle d'apprentissage (en-tête, « Cache ») : remplacer « op 1 *ou* op 2 avec tpa = `local_ip` » par « op 2, tpa = `local_ip`, et (`wait` et `spa == pending_ip`) ou (`spa` déjà en cache avec la même MAC) ». `icmpv6.rs` (N4) : n'émettre `learn` pour un NA que si `target == pend_t` (registre chargé à l'envoi d'un NS en RS1) et S = 1 ; supprimer l'apprentissage par NS (N5) ou le limiter au rafraîchissement d'une entrée existante. Résiduel : un attaquant du lien qui répond plus vite que la passerelle à notre propre requête gagne encore (limite d'ARP/NDP sans SEND).
+
+
+## N1 — répartition du hash du limiteur (trouvé par ntpperf)
+
+Le hash multiply-shift répartit mal les adresses consécutives pour certains secrets (jeu Test : 1 498 buckets pour 3 000 sources). Correctif : `ntp_server::rl_secret_ok` (const fn) rejette à la compilation, via `config::Checks`, tout `RATE_SECRET` qui n'utilise pas ≥ ~90 % des buckets attendus pour des progressions d'adresses (pas 1, 2, 256, 65536). `tools/gen_rate_secret.py` choisit/vérifie un secret (≈ 4 sur 10 passent). Secrets Board et Test remplacés.

@@ -430,6 +430,40 @@ pub const fn rl_index(key: u64, secret: u64) -> usize {
     (m.wrapping_mul(key).wrapping_add(rl_add(m)) >> (64 - RL_IDX_BITS)) as usize
 }
 
+/// Quality test of a rate-limiter secret (ntpperf finding N1, `docs/security.md`): a
+/// multiply-shift hash is universal only on average over its multiplier, and for some
+/// secrets CONSECUTIVE client addresses fall into very few buckets and share limits.
+/// This counts the distinct buckets used by arithmetic progressions of addresses (a /24
+/// of hosts: stride 1 and 2; consecutive /24 and /16 networks: strides 256 and 65536,
+/// starting at 192.0.2.0) and requires at least ~90 % of what a random function would
+/// use (random expectation: 2589 of 4096 for 4096 keys, 1612 for 2048). It is a const
+/// fn: `config::Checks` runs it at compile time, `tools/gen_rate_secret.py` is the same
+/// test in Python to pick a value. About 4 secrets in 10 pass.
+pub const fn rl_secret_ok(secret: u64) -> bool {
+    const CASES: [(u64, usize, usize); 4] =
+        [(1, 4096, 2330), (2, 4096, 2330), (256, 2048, 1450), (65536, 2048, 1450)];
+    let mut c = 0;
+    while c < CASES.len() {
+        let (stride, n, min) = CASES[c];
+        let mut seen = [false; 4096];
+        let mut distinct = 0usize;
+        let mut i = 0u64;
+        while i < n as u64 {
+            let b = rl_index(0xC000_0200u64 + i * stride, secret);
+            if !seen[b] {
+                seen[b] = true;
+                distinct += 1;
+            }
+            i += 1;
+        }
+        if distinct < min {
+            return false;
+        }
+        c += 1;
+    }
+    true
+}
+
 /// UDP source ports a request is never answered from (rule N1 extended,
 /// F8): 0 (reserved, no valid sender) and the classic "small services"
 /// echo (7), daytime (13), qotd (17), chargen (19), time (37), the ones

@@ -24,7 +24,7 @@
 //! | `POLL_LOG2` | 6 (64 s) | 6 |
 //! | `PRECISION_LOG2` | -24 | -24 |
 //! | `RATE_LIMIT_PER_S` | 8 | 8 |
-//! | `RATE_SECRET` | `0xA5C3_9E27_4B1D_6F83` (public development value: set your own) | `0x1F2E_3D4C_5B6A_7988` |
+//! | `RATE_SECRET` | `0x376C_73AA_4CFD_2DDD` (public development value: set your own) | `0x770C_9A0D_583E_3A62` |
 //! | `ENTROPY_SEED` | `0x6E74_705F_7365_6564` (public development value: set your own) | `0x0123_4567_89AB_CDEF` |
 //!
 //! The upstream servers of `Board` are the documentation addresses given
@@ -167,7 +167,7 @@ impl ConfigSet for Board {
     const RATE_LIMIT_PER_S: u16 = 8;
     const KOD_ENABLE: bool = true;
     // Development value: replace it with a random one for each deployment.
-    const RATE_SECRET: u64 = 0xA5C3_9E27_4B1D_6F83;
+    const RATE_SECRET: u64 = 0x376C_73AA_4CFD_2DDD;
     // Public development value: set your own per deployment.
     const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 }
@@ -198,7 +198,7 @@ impl ConfigSet for Test {
     const RATE_LIMIT_PER_S: u16 = 8;
     const KOD_ENABLE: bool = false;
     // Test value, different from [`Board`]'s.
-    const RATE_SECRET: u64 = 0x1F2E_3D4C_5B6A_7988;
+    const RATE_SECRET: u64 = 0x770C_9A0D_583E_3A62;
     const ENTROPY_SEED: u64 = 0x0123_4567_89AB_CDEF;
 }
 
@@ -253,6 +253,10 @@ impl<C: ConfigSet> Checks<C> {
         assert!(
             solicited_node_low24(C::LOCAL_GUA) == solicited_node_low24(eui64_link_local(C::LOCAL_MAC)),
             "LOCAL_GUA and the link-local address must share their low 24 bits (one sn_low)"
+        );
+        assert!(
+            crate::ntp_server::rl_secret_ok(C::RATE_SECRET),
+            "RATE_SECRET spreads consecutive addresses badly (rate-limiter hash): pick another value with tools/gen_rate_secret.py"
         );
         assert!(
             C::POLL_LOG2 >= 4 && C::POLL_LOG2 <= 10,

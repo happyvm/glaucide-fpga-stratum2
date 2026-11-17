@@ -155,10 +155,17 @@ fn every_set_has_a_unicast_mac_and_a_valid_poll() {
 #[test]
 fn rate_secret_is_set_per_configuration() {
     use ntp_fpga::ntp_server::{rl_index, rl_mult};
-    assert_eq!(Board::RATE_SECRET, 0xA5C3_9E27_4B1D_6F83);
-    assert_eq!(Test::RATE_SECRET, 0x1F2E_3D4C_5B6A_7988);
+    assert_eq!(Board::RATE_SECRET, 0x376C_73AA_4CFD_2DDD);
+    assert_eq!(Test::RATE_SECRET, 0x770C_9A0D_583E_3A62);
     assert_ne!(Board::RATE_SECRET, Test::RATE_SECRET);
     assert_ne!(Board::ENTROPY_SEED, Test::ENTROPY_SEED);
+    // Rate-limiter secrets must spread consecutive addresses (ntpperf N1): the two sets pass,
+    // the previous development values and a degenerate one are rejected.
+    assert!(ntp_fpga::ntp_server::rl_secret_ok(Board::RATE_SECRET));
+    assert!(ntp_fpga::ntp_server::rl_secret_ok(Test::RATE_SECRET));
+    assert!(!ntp_fpga::ntp_server::rl_secret_ok(0xA5C3_9E27_4B1D_6F83));
+    assert!(!ntp_fpga::ntp_server::rl_secret_ok(0x1F2E_3D4C_5B6A_7988));
+    assert!(!ntp_fpga::ntp_server::rl_secret_ok(0));
     // KoD: on for the board (clients back off), off for the test set (silence, as the tests assume).
     assert!(Board::KOD_ENABLE && !Test::KOD_ENABLE);
     assert!(Board::RATE_LIMIT_PER_S == 0 || Board::RATE_LIMIT_PER_S >= 4);
