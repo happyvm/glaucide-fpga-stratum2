@@ -469,3 +469,42 @@ fn martian_sources_today() {
     want.sort();
     assert_eq!(answered, want);
 }
+
+/// Reflection towards UDP services (finding F8): a request forged with the
+/// source port of an echo (7), daytime (13), quote (17), chargen (19) or
+/// time (37) service, or port 0, is answered. Echo sends our 48-byte mode-4
+/// reply back: dropped (no loop, see `only_client_mode_is_answered`). But
+/// a text service answers with ASCII lines, and a line starting with `c`
+/// (0x63: LI 1, VN 4, mode 3) or `[` (0x5b: VN 3, mode 3) of 48 bytes or
+/// more is a valid request: the server answers it, to the service again,
+/// which answers again: a loop between us and the service, slowed only by
+/// the rate limiter (8 per second). The test shows both halves.
+#[test]
+fn service_ports_and_text_loops_today() {
+    let mut b = PinBench::new();
+    let mut k = 0;
+    for port in [0u16, 7, 13, 17, 19, 37] {
+        b.frame(&ntp4_frame(PEER_MAC, src_k(20 + k), port, &ntp_payload(0x23, 48, xmit(k as u64))), 300, false);
+        k += 1;
+    }
+    // A chargen line (RFC 864: 72 printable characters and CR LF) starting
+    // with 'c', arriving from port 19.
+    let line: Vec<u8> = (0..72u8).map(|i| b'c' + (i % 30)).chain([b'\r', b'\n']).collect();
+    b.frame(&ntp4_frame(PEER_MAC, src_k(40), 19, &line), 300, false);
+    let sent = b.run::<FixedSync>(1500);
+    let ports: Vec<u16> = ntp_replies(&sent).iter().map(|s| s.udp.as_ref().unwrap().4).collect();
+    assert_eq!(ports, vec![0, 7, 13, 17, 19, 37, 19], "every one answered, the chargen line too");
+}
+
+/// Desired behaviour behind F8: no reply to source port 0 or to the ports
+/// of the small UDP services (7, 13, 17, 19, 37), as for martian addresses.
+#[test]
+#[ignore = "FINDING F8: requests from UDP service ports are answered (docs/security.md)"]
+fn no_reply_to_service_ports() {
+    let mut b = PinBench::new();
+    for (k, port) in [0u16, 7, 13, 17, 19, 37].into_iter().enumerate() {
+        b.frame(&ntp4_frame(PEER_MAC, src_k(20 + k as u32), port, &ntp_payload(0x23, 48, xmit(k as u64))), 300, false);
+    }
+    let sent = b.run::<FixedSync>(1500);
+    assert!(ntp_replies(&sent).is_empty());
+}
