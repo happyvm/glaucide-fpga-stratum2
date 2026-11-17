@@ -339,7 +339,7 @@ impl<T: ArpTiming>
             // ---------------------------------------------------- cache
             // F5: only the reply (op 2, addressed to our MAC and IP) that answers
             // the outstanding resolution is learned.
-            let learn = dec & Bit::from(op == 2) & self.tha_ok.get() & wait & Bit::from(spa == req_ip) & !Bit::from(spa == 0u32);
+            let learn = dec & Bit::from(op == 2) & self.tha_ok.get() & wait & Bit::from(spa == req_ip) & !Bit::from(spa == 0u32) & !Bit::from(sha == 0u8);
             let lh0 = v0 & Bit::from(ip0 == spa);
             let lh1 = v1 & Bit::from(ip1 == spa);
             let lh2 = v2 & Bit::from(ip2 == spa);
@@ -436,6 +436,9 @@ impl<T: ArpTiming>
             // Reply: only for a well-formed request for local_ip, no err frame.
             check!(!dec_rep | (Bit::from(op == 1) & Bit::from(tpa_eff == ip) & good & !b.err & last), "a reply is queued only for a well-formed, error-free request targeting local_ip");
             check!(!dec_rep | !sha.bit(40), "no reply to a group sender address (A4)");
+            check!(!learn | (wait & Bit::from(op == 2) & Bit::from(spa == req_ip) & !Bit::from(spa == 0u32) & good & !b.err & last), "F5: an entry is learned only from a well-formed reply, addressed to us, whose sender is the address being resolved");
+            check!(!learn | !sha.bit(40), "F5: a group (multicast/broadcast) MAC is never learned");
+            check!(!learn | !Bit::from(sha == 0u8), "F5: the null MAC is never learned");
             check!(!(take_p & last & b.err) | !(dec | learn), "an err frame teaches nothing and gets no reply");
             check!(!(take_p & last) | !(dec & !full), "a short payload is not a packet");
             // Fields: every byte equals the snapshot field at its index.

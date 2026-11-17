@@ -522,6 +522,22 @@ fn rsp(o: &Out) -> Vec<(bool, u64)> {
 }
 
 #[test]
+fn solicited_reply_with_null_or_group_mac_is_not_learned() {
+    // Found by the formal proof (check "the null MAC is never learned"): an on-path sender
+    // answering our request with sha = 0 used to be learned. Now the resolution stays open
+    // and the real reply that follows is the one learned.
+    let mut s = Script::default();
+    s.resolves.push((10, GW));
+    s.frames.push(rxf(300, gw_reply(0, GW, MAC, IP)));
+    s.frames.push(rxf(500, gw_reply(0x0100_5E00_0001, GW, MAC, IP)));
+    s.lookups.push((800, GW));
+    s.frames.push(rxf(1000, gw_reply(GW_MAC, GW, MAC, IP)));
+    s.lookups.push((1300, GW));
+    let o = run(&s, 1400, always);
+    assert_eq!(rsp(&o), vec![(false, 0), (true, GW_MAC)]);
+}
+
+#[test]
 fn arp_poisoning_attempts_never_change_the_cache() {
     // Phase 1 (no resolution outstanding): every attack is ignored.
     // Phase 2: the gateway is resolved and a valid reply is learned.
