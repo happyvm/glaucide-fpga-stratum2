@@ -334,6 +334,7 @@ fn run_rx(frames: &[RxFr], gap: usize, take: impl Fn(usize, usize) -> bool) -> R
                         src: U::<48>::from(f.src_mac),
                         ethertype: U::<16>::from(0x0800u16),
                         multicast: Bit::from_bool(f.dst_mc),
+                        ts: U::<64>::from(0u64),
                     });
                     meta_sent = true;
                 }

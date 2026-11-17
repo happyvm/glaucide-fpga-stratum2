@@ -6,7 +6,7 @@ use ntp_fpga::eth_rx::{EthMeta, EthRx};
 use ntp_fpga::eth_tx::EthHdr;
 use ntp_fpga::ipv6_rx::{Ip6Meta, Ipv6Rx};
 use ntp_fpga::ipv6_tx::{Ip6TxReq, Ipv6Tx};
-use ntp_fpga::stream::FrameByte;
+use ntp_fpga::stream::{FrameByte, Ts};
 use ntp_fpga::tx_arb::TxArb;
 use txhdl::comp::{chan, join2, signal, DefaultClock, Running, Unit};
 use txhdl::types::{Bit, U};
@@ -395,6 +395,7 @@ struct M {
     hop: u8,
     eth_src: u64,
     multicast: bool,
+    rx_ts: u64,
 }
 
 #[derive(Default, Debug)]
@@ -413,6 +414,7 @@ fn grab(m: Ip6Meta) -> M {
         hop: m.hop.raw() as u8,
         eth_src: m.eth_src.raw() as u64,
         multicast: m.multicast.to_bool(),
+        rx_ts: m.rx_ts.raw() as u64,
     }
 }
 
@@ -453,6 +455,7 @@ fn run_rx(
                         src: U::<48>::from(f.src_mac),
                         ethertype: U::<16>::from(0x86DDu16),
                         multicast: Bit::from_bool(f.dst_mac & 0x0100_0000_0000 != 0),
+                        ts: U::<64>::from(0u64),
                     });
                     meta_sent = true;
                 }
@@ -1056,6 +1059,11 @@ struct RxChain {
     udp_metas: Vec<M>,
 }
 
+/// Stamp of the `k`-th frame fed to [`rx_chain`].
+fn chain_stamp(k: usize) -> u64 {
+    0x6000_0000_0000_0000 | ((k as u64) << 12) | 0x9a7
+}
+
 fn rx_chain(frames: &[Vec<u8>], gap: usize, take: impl Fn(usize) -> bool) -> RxChain {
     let (mac_o, mac) = signal::<U<48>, DefaultClock>();
     let (sn_o, sn1) = signal::<U<24>, DefaultClock>();
@@ -1079,9 +1087,10 @@ fn rx_chain(frames: &[Vec<u8>], gap: usize, take: impl Fn(usize) -> bool) -> RxC
     let (i_t, i) = chan::<FrameByte, DefaultClock>();
     let (um_t, um) = chan::<Ip6Meta, DefaultClock>();
     let (u_t, u) = chan::<FrameByte, DefaultClock>();
+    let (st_t, st_r) = chan::<Ts, DefaultClock>();
     let (mut d_eth, mut d_rx) = (EthRx::default(), Ipv6Rx::default());
     let mut sim = Running::new(join2(
-        d_eth.run((in_r, mac, sn1), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)),
+        d_eth.run((in_r, mac, sn1, st_r), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)),
         d_rx.run((v6m, v6p, ll, gua, gv, sn2), (im_t, i_t, um_t, u_t)),
     ));
     let mut q: Vec<Option<FrameByte>> = vec![];
@@ -1101,7 +1110,13 @@ fn rx_chain(frames: &[Vec<u8>], gap: usize, take: impl Fn(usize) -> bool) -> RxC
     };
     let (mut io, mut uo) = (vec![], vec![]);
     let mut next = 0;
+    let mut next_st = 0;
     for t in 0..(q.len() * 6 + 2000) {
+        // One receive stamp per frame, in order (T1.13).
+        if next_st < frames.len() && st_t.ready().to_bool() {
+            st_t.send(Ts::from(chain_stamp(next_st)));
+            next_st += 1;
+        }
         if next < q.len() {
             match q[next] {
                 None => next += 1,
@@ -1366,4 +1381,46 @@ fn lowers_to_verilog() {
     assert!(v.contains("module ipv6_rx"), "ipv6_rx");
     let v = Ipv6Tx::verilog("ipv6_tx");
     assert!(v.contains("module ipv6_tx"), "ipv6_tx");
+}
+
+/// Interleaved frames of all kinds (IPv6 ICMP/NDP/NTP/other, IPv4, ARP,
+/// foreign MAC, runts): the `rx_ts` of each forwarded packet is the stamp of
+/// ITS frame, whatever was dropped before it.
+#[test]
+fn chain_rx_stamp_follows_its_frame() {
+    let mut rx: Vec<Vec<u8>> = vec![];
+    for name in [
+        "ping6.hex",
+        "neg_foreign_mac.hex",
+        "ntp4_basic.hex",
+        "ndp_ns_na.hex",
+        "neg_runt.hex",
+        "arp_request_reply.hex",
+        "ntp6_basic.hex",
+        "neg_udp6_checksum.hex",
+        "neg_ndp_hoplimit.hex",
+        "ping4.hex",
+    ] {
+        rx.extend(vector(name).into_iter().filter(|(r, _)| *r).map(|(_, f)| f));
+    }
+    // Rotate so classes interleave rather than come in file order.
+    let n = rx.len();
+    let order: Vec<usize> = (0..n).map(|i| (i * 7) % n).collect();
+    let mut seen = vec![false; n];
+    assert!(order.iter().all(|&i| !std::mem::replace(&mut seen[i], true)));
+    let rx: Vec<Vec<u8>> = order.iter().map(|&i| rx[i].clone()).collect();
+    let mut want = [vec![], vec![]];
+    for (k, f) in rx.iter().enumerate() {
+        if let Some((c, _)) = ref_chain(f) {
+            want[c].push(chain_stamp(k));
+        }
+    }
+    assert!(want[0].len() >= 4 && want[1].len() >= 3, "weak sample");
+    for (gap, tk) in [(0usize, false), (1, true)] {
+        let o = rx_chain(&rx, gap, |t| !tk || t % 4 != 0);
+        let gi: Vec<u64> = o.icmp_metas.iter().map(|m| m.rx_ts).collect();
+        let gu: Vec<u64> = o.udp_metas.iter().map(|m| m.rx_ts).collect();
+        assert_eq!(gi, want[0], "icmp stamps, gap {gap}");
+        assert_eq!(gu, want[1], "udp stamps, gap {gap}");
+    }
 }
