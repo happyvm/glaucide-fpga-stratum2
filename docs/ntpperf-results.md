@@ -135,11 +135,203 @@ réelles chacun, négligeable devant la simulation (≈ 7 µs réelles par cycle
 
 ### 2.5 Vitesse de simulation et coût d'un point de mesure
 
-VITESSE
+Mesuré (release, 3 à 4 ponts en parallèle sur 4 cœurs) : **121 000 à 140 000 cycles `clk_sys` par seconde réelle**
+par pont (≈ 7,5 µs réelles par cycle de 10 ns : ≈ 750 fois plus lent que le matériel), la coordination avec
+ntpperf coûtant moins de 1 % (a-105k : 40,0 M cycles simulés en 316 s de simulation pour 317 s au total ; 42 118
+avances du temps pour 40 001 requêtes). Une requête isolée coûte ≈ 2 225 cycles simulés (préambule et requête :
+816 cycles sur `rxd`, 253 cycles jusqu'au SFD de la réponse, 760 de réponse, 400 de seuil d'inactivité), le reste
+est sauté. Au-delà de ≈ 45 000 req/s le fil n'est jamais au repos : un point de ntpperf (0,5 s virtuelle avec son
+échauffement, dont les 0,1 s finales d'attente sont sautées) coûte alors **4·10⁷ cycles ≈ 5 à 5,5 min**, quel
+que soit le débit. D'où le choix de l'intervalle d'échantillonnage minimal de ntpperf (`-t 0.2`), d'un point par
+processus pour les débits élevés (exécutés en parallèle) et d'un balayage de ntpperf lui-même (`-r 1000-11390 -x
+1.5`, 7 points en une exécution) pour les faibles débits. Le balayage complet par défaut de ntpperf (`-r
+1000-200000 -x 1.5`, 15 points) prend ≈ LAWALL en un seul processus : il est dans `--long`.
 
 ## 3. Résultats
 
-RESULTATS
+Chiffres de l'exécution de référence (`tools/ntpperf/build.sh && tools/ntpperf/run.sh`, puis `run.sh --long`),
+« all checks passed ». Les exécutions sont déterministes (T0 fixe, graine de ntpperf tirée de l'heure virtuelle) :
+a-105k et b-105k simulent exactement le même nombre de cycles (40 000 175). Résumé complet produit par
+`analyse.py` : `out/ntpperf/results/summary.md`.
+
+### 3.1 a. Débit brut sans limiteur (`--rate-limit 0`, `FixedSync` strate 2)
+
+Commandes (`-t 0.2` : 0,2 s virtuelle de mesure par débit ; réseau `NET` = `-i sim0 -m 02:00:00:00:00:01 -d
+192.168.123.1 -s 172.18.0.0/16`) :
+
+```
+ntpperf_bridge --shim out/ntpperf/ntpperf_vtime.so --shm F --rate-limit 0 --log requests.csv -- out/ntpperf/src/ntpperf NET -B -t 0.2 -r 1000-11390 -x 1.5
+ntpperf_bridge ... --rate-limit 0 ... -- ntpperf NET -B -t 0.2 -r 25000      (puis 60000, 105000, 125000)
+```
+
+Tables brutes de ntpperf (cinq exécutions mises bout à bout) :
+
+```
+               |          responses            |        response time (ns)
+rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
+1000       100   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+1500       150   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+2250       225   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+3375       337   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+5062       506   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+7593       759   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+11389     1138   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+25000     2500   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+60000     6000   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+105000   10500   0.00%   0.00% 100.00%   0.00%   +10020  +10020  +10020      0
+125000   12500  12.28%   0.00%  87.72%   0.00%   +10020  +10020  +10020      0
+```
+
+Balayage complet de ntpperf (`--long`, tâche `la-full`, un seul processus, `-B -t 0.2 -r 1000-200000 -x 1.5`) :
+
+```
+LA_TABLE
+```
+
+Interprétation :
+
+- **Aucune perte jusqu'au débit de ligne** : 0,00 % perdu, 0,00 % invalide jusqu'à 105 000 req/s (96 % de L) ;
+  au-delà, la perte est **exactement celle de la file d'émission** : 1 − L/R = 12,28 % à 125 000 req/s (3 070
+  requêtes mesurées rejetées par la file, aucune requête parvenue au design sans réponse), 15,66 % mesuré à
+  130 000 req/s pour 15,65 % attendus (essai préliminaire). Le design répond à **toutes** les requêtes qui
+  arrivent sur `rxd`, trames dos à dos avec l'écart minimal de 12 octets compris : **c'est le lien à 100 Mb/s qui
+  limite, pas le design**. Plus haut débit sans perte : le débit de ligne, 109 649 req/s (le point de ntpperf
+  immédiatement inférieur, 86 497 ou 105 000, est sans perte ; le suivant, 125 000 ou 129 746, perd 1 − L/R).
+- **Marge du design** : le serveur consomme n + 50 = 98 cycles par requête de 48 octets (`ntp_server.rs`,
+  « Throughput », test `throughput_back_to_back`) pour 912 cycles disponibles entre deux requêtes au débit de ligne
+  (9,12 µs) : ≈ 11 % d'occupation, marge ≈ 9,3. Côté émission la réponse a exactement la taille de la requête
+  (90 octets) : le lien TX est saturé exactement quand le lien RX l'est, et `mii_tx` tient le débit de ligne
+  (sinon le temps de réponse croîtrait et la FIFO de 2 048 octets de `rx_path` finirait par déborder : rien de tel).
+- **Temps de réponse** (T3 − T2 calculé par ntpperf) : **+10 020 ns, σ 0, à tous les débits**, surcharge comprise ;
+  la vérité du banc donne 10 019,9 à 10 020,1 ns (σ 0,11 ns, 40 001 réponses à 105 000 req/s). T3 − T2 = SFD à SFD :
+  7,52 µs de réception de la fin de la requête (94 octets), puis traitement et K = 1,885 µs de latence d'émission
+  prédite (même valeur que chronyd, constat C10 de `docs/chrony-interop.md`). **Pas de file d'attente dans le
+  serveur** : avec des requêtes sérialisées par le fil (au moins 9,12 µs d'écart) et des réponses de même taille,
+  chaque réponse trouve `udp4_tx` et `tx_path` vides ; le temps de réponse ne dépend pas de la charge.
+
+### 3.2 b. Exactitude de l'horodatage d'émission sous charge (`-o 1e-12 -H`)
+
+`-o` n'active l'affichage de l'écart que pour une correction non nulle : 10⁻¹² s ne change aucun chiffre. `-H` :
+l'horodatage de réception local d'une réponse est l'instant virtuel de son SFD sur les broches TX (pas de PHY ni de
+câble). ntpperf affiche donc **SFD émis − T3**, soit l'opposé de l'erreur de T3.
+
+```
+               |          responses            |     TX timestamp offset (ns)
+rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
+1000       100   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+1500       150   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+2250       225   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+3375       337   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+105000   10500   0.00%   0.00% 100.00%   0.00%       -9      -9      -9      0
+125000   12500  12.28%   0.00%  87.72%   0.00%       -9      -9      -9      0
+```
+
+Balayage complet (`--long`, `lb-full`, `-B -t 0.2 -o 1e-12 -H -r 1000-200000 -x 1.5`) :
+
+```
+LB_TABLE
+```
+
+| Débit (req/s) | ntpperf min / moyenne / max / σ (ns) | vérité du banc SFD − T3 : min / moyenne / max / σ (ns) |
+|---|---|---|
+| 1 000 à 3 375 | −9 / −9 / −9 / 0 | −10,0 / −9,9 / −9,8 / 0,1 |
+| 105 000 | −9 / −9 / −9 / 0 | −10,0 / −9,9 / −9,8 / 0,1 |
+| 125 000 (surcharge) | −9 / −9 / −9 / 0 | −10,0 / −9,9 / −9,8 / 0,1 |
+
+- **L'erreur de T3 est de +9,88 ns (σ 0,12 ns, min +9,8, max +10,0) contre le SFD émis, indépendante de la
+  charge**, de 1 000 req/s à la saturation du lien : aucune attente dans `tx_path` ni dans l'arbitre (voir 3.1).
+  C'est exactement la valeur des tests de `rtl/tests/top.rs` (T3 +5 à +10 ns selon la phase MII) et de
+  `chrony_bridge` (e3 = +9,88 ns), avec la latence d'émission calibrée K de `ntp_reply_route.rs`
+  (TX_CYCLES_V4 = 108 cycles + 790 ns de `tx_path`). Une seule paire de phases MII est simulée (`ClkRx25`/`ClkTx25`
+  synchrones de `clk_sys`), d'où σ ≈ 0.
+- ntpperf affiche −9 et non −9,88 : il convertit T3 en ns en **tronquant** (`convert_ntp_ts`), ce qui ajoute
+  jusqu'à 1 ns à l'écart ; l'écart entre horloge du design et temps vrai (−10,1 ns, un cycle) est déjà inclus dans
+  la vérité du banc (`clk_err`, stable de −10,2 à −10,0 ns).
+- Sur une vraie carte s'ajoutent les latences TX du PHY et la résolution de l'horodatage de la carte réseau de
+  l'hôte ntpperf ; cette co-simulation mesure l'erreur propre du design, à 0,1 ns près.
+
+### 3.3 c. Limiteur par défaut (`RATE_LIMIT_PER_S` = 8, fuite 1/16, silence)
+
+```
+ntpperf_bridge ... --rate-limit 8 ... -- ntpperf NET -B -t 1.0 -r 1000     (puis 10000 ; --long : 30000, 80000)
+```
+
+`-t 1.0` : chaque client émet 12 requêtes en 1,2 s (une toutes les 0,1 s), les 2 premières d'échauffement ; T0 est
+une seconde entière, les fenêtres d'une seconde du limiteur commencent donc avec la mesure. **Formule** pour une
+source seule dans sa case qui envoie n requêtes dans une fenêtre : réponses = min(n, 8) + (n − 8)⁺/16 ; avec
+ntpperf n = 10 par seconde (`rate / 10` clients à 10 req/s chacun), d'où **perte = (10 − 8)/10 × (1 − 1/16) =
+18,75 %** (dans la fenêtre 1 : requêtes 1 à 10, dont 2 d'échauffement ; fenêtre 2 : requêtes 11-12 toutes
+servies ; sur les 10 requêtes comptées, 2 sont au-delà de la limite, servies avec probabilité 1/16). `analyse.py`
+recalcule l'espérance exacte à partir des instants, des fenêtres et des **cases réelles du design** (`rl_index`
+de `ntp_server.rs`, journalisée par le pont et recalculée en Python : identiques).
+
+```
+               |          responses            |        response time (ns)
+rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
+1000       100  18.58%   0.00%  81.42%   0.00%   +10020  +10020  +10020      0
+10000     1000  18.95%   0.00%  81.05%   0.00%   +10020  +10020  +10020      0
+LC_ROWS
+```
+
+| Débit | Sources | Cases occupées | Sources partageant une case | Perte ntpperf | Espérance exacte (hachage du design) | Une case par source | Hachage aléatoire uniforme |
+|---|---|---|---|---|---|---|---|
+| 1 000 | 100 | 100 | 0 | 18,58 % | 18,73 % ± 0,34 | 18,73 % | — |
+| 10 000 | 1 000 | 1 000 | 0 | 18,95 % | 18,75 % ± 0,11 | 18,75 % | 27,3 % |
+LC_TABLE
+
+- Jusqu'à 1 000 sources, la perte mesurée par ntpperf est celle de la formule, à l'écart statistique de la fuite
+  près (1,8 σ à 10 000 req/s : 8 106 réponses pour 8 126 ± 11 attendues).
+- **Les sources consécutives de ntpperf ne se répartissent pas comme des clés aléatoires** : le hachage
+  multiplicatif `(m·k + b) >> 52` sur des clés consécutives est une suite de Weyl (k·m/2⁶⁴ mod 1) dont la
+  répartition dépend du développement en fraction continue de m/2⁶⁴ (`RATE_SECRET`). Jusqu'à 1 000 sources : aucune
+  collision (mieux que le hasard, qui en aurait 23 %) ; au-delà, avec le secret de `Test`, les sources s'entassent
+  dans peu de cases (tableau ci-dessous) : voir le constat **N1**.
+
+| N sources consécutives (172.18.0.0 + i) | cases distinctes, secret `Test` | secret `Board` | fonction aléatoire (espérance) |
+|---|---|---|---|
+| 100 | 100 | 100 | 99 |
+| 1 000 | 1 000 | 929 | 887 |
+| 2 500 | 1 461 | 2 103 | 1 871 |
+| 3 000 | 1 498 | 2 495 | 2 127 |
+| 4 096 | 1 566 | 3 351 | 2 589 |
+| 8 000 | 1 826 | 4 096 | 3 515 |
+| 16 384 | 2 374 | 4 096 | 4 021 |
+
+(ntpperf plafonne à 16 384 clients, `MAX_CLIENTS` : la taille du réseau `-s` au-delà ne change rien ; un /16 en
+donne 65 536 adresses mais ntpperf n'en utilise que `min(rate/10, 16 384)`.)
+
+### 3.4 d. KoD activé (`--rate-limit 8 --kod`)
+
+```
+ntpperf_bridge ... --rate-limit 8 --kod ... -- ntpperf NET -B -t 1.0 -r 1000
+               |          responses            |        response time (ns)
+rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
+1000       100   0.00%   0.00% 100.00%   0.00%       +0   +8178  +10020   3884
+ntpperf_bridge ... --rate-limit 8 --kod ... -- ntpperf NET -B -t 1.0 -o 1e-12 -H -r 1000
+               |          responses            |     TX timestamp offset (ns)
+rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
+1000       100   0.00%   0.00% 100.00%   0.00%  -237268110785876256 +339910485709810496 +3955530061237428224 887712134519796864
+LD_ROWS
+```
+
+- **ntpperf compte un KoD comme une réponse valide en mode de base**, ni perdue ni « invalid » : sa validation
+  (`process_response`) ne regarde que le mode (4), le port source (123) et l'Origin (= Transmit de la requête),
+  jamais la strate ni le Reference ID. 184 des 1 201 réponses sont des KoD `RATE` (strate 0) ; parmi les réponses
+  comptées, 18,38 % de KoD pour 18,73 % attendus (requêtes au-delà de la limite moins les fuites, qui reçoivent une
+  réponse normale).
+- Le KoD du design porte Receive = Transmit = Transmit de la requête (comme ntpd) : ntpperf calcule pour lui
+  T3 − T2 = 0, d'où le minimum +0 et la moyenne abaissée à 8 178 ns = 10 020 × (1 − 0,1838) ; avec `-o`, il
+  soustrait de son horodatage local un « T3 » qui est son propre Transmit aléatoire : écarts de l'ordre de 10¹⁷ ns,
+  dénués de sens. Le design se comporte comme spécifié (`ntp_server.rs`, « KoD ») ; c'est ntpperf qui ne filtre
+  pas les KoD (constat N3).
+- Avec le KoD, **chaque requête valide reçoit une réponse** de même taille : le limiteur ne réduit plus le volume
+  réfléchi (déjà noté par `docs/security.md`, recommandation R4).
+
+### 3.5 e. IPv6
+
+**Non couvert par ntpperf** : il ne fabrique que des requêtes IPv4 (`sender.c` : en-tête IPv4 codé en dur, option
+`-s` IPv4 seulement) ; le chemin IPv6 du design (`udp6_rx`, `udp6_tx`, limiteur indexé par /64) n'est pas exercé
+par ce test.
 
 ## 4. Constats
 
