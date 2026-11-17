@@ -305,4 +305,43 @@ lien entre `rb` et `rg2`).
 
 ## 7. Ce qui reste
 
-RESTE
+Par ordre d'importance :
+
+1. **Chemins entre unités dans le top** (12 à 14 niveaux de LUT estimés, 8 à 10 ns) : canal
+   registré → décision de l'unité → canal suivant, surtout `ipv4_rx` (octet 19 : vérification de
+   l'en-tête, somme, adresse, puis émission de la méta et poussée dans les canaux ICMP/UDP),
+   `ipv6_rx`, le verdict du dernier octet de `udp4_rx` / `udp6_rx` (bit `err` du `last`, qui passe
+   par la somme de l'octet courant), `icmp_echo`, `eth_tx` (`cnt → crc`). **Les mêmes unités
+   seules restent sous 6,5 ns (8 à 9 LUT)** ; l'écart vient pour partie des canaux (2 à 3 niveaux
+   de plus) et pour partie de la cartographie d'ABC dans le top aplati (§ 1). À confirmer dans
+   Vivado. Si Vivado les confirme : (a) `ipv4_rx` : registrer la décision de l'octet 19 et émettre
+   la méta un cycle plus tard (sans effet sur les horodatages, portés par la méta) ; (b) verdict
+   UDP : tenir un accumulateur déjà replié (17 bits) à côté de `acc`, ou retarder la sortie d'un
+   octet ; (c) solution générale : canaux TxHDL avec `ready` registré (tampon « skid ») sur les
+   liaisons longues.
+2. **Client, état SCAN** (top client) : lecture des LUT-RAM `m_fl` / `m_tm` du créneau → soustraction
+   de 32 bits → comparaisons (échéances, intervalle de poll) → décision → écritures. 7,2 ns dans le
+   module seul, 10,5 à 11,7 ns dans le top (les entrées de configuration s'y ajoutent). Découpage
+   possible en deux cycles par créneau (lecture registrée, puis décision) sans effet sur T1 (pris
+   à la construction de l'octet 40). Non fait ici : unité de 900 lignes, risque de régression
+   pour un gain à confirmer.
+3. **`clock_filter` dans le top client** (13,8 ns, 21 LUT, `cp → it`, état FIN : `t40 − tlast`
+   lu en LUT-RAM puis test « plus récent ») : **artefact de l'outil**. Le chemin (`--path`) montre
+   la soustraction de 64 bits cartographiée par ABC en une chaîne de 16 LUT5 au lieu de la chaîne
+   de retenue (16 CARRY4) qu'il a dans le module seul (7,4 ns, 8 LUT + 16 CARRY4) ; Vivado utilise
+   la chaîne de retenue. Attendu : environ 7 ns.
+4. **À surveiller** (7 à 8,5 ns par module) : `servo` (`tl → sx`, comparaison de `el` = `now − tl`
+   avec le seuil du poll, 7,9 ns), `sync_state` (étage 3, `p2_plo → o_rds`, 7,6 ns),
+   `selection` (multiplieur 34 × 34 en DSP cascadés, 7,5 ns ; chemin du diviseur `st → dx`,
+   7,3 ns), `clock_filter` (`cp → sres`, 7,4 ns), `ntp_client` (7,2 ns), `icmpv6` (verdict du
+   dernier octet vers `gd`, 7,1 ns), `ipv4_tx` (`n → st`, 7,1 ns, non modifié).
+5. **Croisements** : les points ouverts du § 5 (bornes de skew des bus Gray et de `cx → cpt`,
+   lectures de LUT-RAM entre domaines, front de capture TX du PHY).
+6. **Vivado** : lancer `tools/vivado/build.tcl`, puis comparer `report_timing_summary`
+   (WNS / TNS, 10 pires chemins de `clk_sys`) à ce document ; `report_cdc` et
+   `report_methodology` pour les croisements.
+
+Ressources : les changements de T5.3 ne modifient pas la consommation de façon notable
+(`tools/estimate_resources.py` sur les modules modifiés : `selection` −52 LUT / +219 bascules
+pour le pipeline du comparateur et `rdx`, les autres à ±70 LUT et ±20 bascules) ;
+`docs/resources.md` n'est pas mis à jour.

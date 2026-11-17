@@ -26,8 +26,8 @@
 //! * The unit then computes for a fixed number of cycles that depends only on
 //!   the number of survivors `n` (below), with no other input:
 //!   [`event_cycles`] gives the cycle (counted from T = 0) in which
-//!   `selected` is offered, at most [`MAX_EVENT_CYCLES`] = 541 cycles
-//!   (5.41 µs at 100 MHz).
+//!   `selected` is offered, at most [`MAX_EVENT_CYCLES`] = 545 cycles
+//!   (5.45 µs at 100 MHz).
 //! * `selected` is offered from that cycle until taken (the channel's
 //!   `ready`); exactly one `Selected` per `PeerStat` taken, in order. The
 //!   next `PeerStat` is taken at the earliest in the cycle after the
