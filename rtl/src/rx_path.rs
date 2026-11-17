@@ -76,9 +76,9 @@
 //!   one `clk_sys` cycle late only when the pointer changes inside its
 //!   aperture, which keeps the error within **±1 `clk_sys` cycle = ±10
 //!   ns**. Measured in simulation (`rtl/tests/rx_path.rs`): -4.66 to +5.12
-//!   ns over six phases at a 40/10 ns ratio, -3.49 to +6.05 ns over all
-//!   phases with a 40.5 ns `clk_rx` (the extra ns is 2 x 0.5 ns of
-//!   off-nominal `clk_rx`, see below);
+//!   ns over six phases at a 40/10 ns ratio; over all phases, -3.49 to
+//!   +6.05 ns with a 40.5 ns `clk_rx` and -5.59 to +3.96 ns with 39.5 ns
+//!   (the extra ns is 2 x 0.5 ns of off-nominal test clock, see below);
 //! * MII granularity: the SFD is located to one `clk_rx` cycle, **40 ns**;
 //! * `clk_rx` frequency: the 2 `clk_rx` cycles of the latency are 80 ns at
 //!   the nominal 25 MHz; the PHY's clock is within ±100 ppm: ±8 ps;
