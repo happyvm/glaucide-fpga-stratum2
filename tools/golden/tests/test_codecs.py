@@ -81,7 +81,11 @@ class CodecTest(unittest.TestCase):
     def test_udp(self):
         for s, d in ((A4, B4), (A6, B6)):
             u = udp.UdpDatagram(1, 123, b"abc")
-            self.assertEqual(udp.UdpDatagram.parse(s, d, u.build(s, d) + b"pad"), u)
+            self.assertEqual(udp.UdpDatagram.parse(s, d, u.build(s, d)), u)
+            # Stricter than RFC 1122 (decision T2.2): trailing bytes after the
+            # UDP length are rejected, the length must match exactly.
+            with self.assertRaises(ParseError):
+                udp.UdpDatagram.parse(s, d, u.build(s, d) + b"pad")
             b = bytearray(u.build(s, d))
             b[8] ^= 1
             with self.assertRaises(ParseError):

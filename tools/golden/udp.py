@@ -34,11 +34,16 @@ class UdpDatagram:
 
     @staticmethod
     def parse(src: bytes, dst: bytes, data: bytes) -> "UdpDatagram":
-        """Bytes after the UDP length field are dropped."""
+        """The UDP length field must equal the IP payload length exactly.
+
+        Stricter than RFC 1122 (which lets a receiver ignore trailing bytes):
+        the hardware drops any mismatch at byte 5 of the datagram, before
+        forwarding anything (decision T2.2, smaller attack surface).
+        """
         if len(data) < 8:
             raise ParseError("UDP header truncated")
         sport, dport, length, c = struct.unpack(">HHHH", data[:8])
-        if length < 8 or length > len(data):
+        if length < 8 or length != len(data):
             raise ParseError("UDP length inconsistent")
         seg = data[:length]
         if c == 0:
