@@ -327,7 +327,7 @@ use crate::udp4_tx::UdpTxReq;
 use crate::udp6_tx::Udp6TxReq;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Mem, Out, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{assume, check, cover, lower, with, Trace};
 
 /// UDP port of NTP (our source port and the server's).
 pub const NTP_PORT: u16 = 123;
@@ -441,6 +441,8 @@ pub struct NtpClient {
     /// the 64-bit compare ends at a register; in `CHK` it holds the
     /// comparison of the last `RX` cycle, whose operands are final).
     pub oke: Reg<Bit>,
+    /// Monitor (check!/cover! only): an authentic, usable reply is being turned into a Sample.
+    pub m_path: Reg<Bit>,
     pub t2: Reg<U<64>>,
     pub t3: Reg<U<64>>,
     // Arithmetic.
@@ -1071,8 +1073,37 @@ impl
                 mux(give_up & f_sent, U::<4>::from(S_MISS), U::<4>::from(S_SCAN)),
             );
 
+            // ---- formal properties (orchestrator; docs/formal.md, row "Client NTP") ----
+            let to_c2 = is_chk & auth & !unusable;
+            let is_lkp_c = Bit::from(st == S_LKP);
+            let is_lwt_c = Bit::from(st == S_LWT);
+            let is_req_c = Bit::from(st == S_REQ);
+            let is_pay_c = Bit::from(st == S_PAY);
+            let m_path = self.m_path.get();
+            // Anti-spoofing (F3): a reply is used only if it is mode 4, version 3 or 4, answers the
+            // outstanding request (Origin = the nonce sent, recomputed in CHK: the registered
+            // comparison `oke` is still valid) and is not a KoD, an alarm or stratum 16+.
+            check!(!to_c2 | (f_out & Bit::from(r_mode == 4u8) & (Bit::from(r_vn == 3u8) | Bit::from(r_vn == 4u8)) & org_eq), "a reply is used only if it is mode 4, version 3 or 4, and its Origin is the nonce sent for the outstanding request (F3)");
+            check!(!to_c2 | (Bit::from(r_st >= 1u8) & Bit::from(r_st <= 15u8) & !Bit::from(r_li == 3u8)), "a reply is used only with stratum 1..15 and no alarm");
+            check!(!(is_chk & !f_out & auth), "no reply is authentic without an outstanding request (a second reply is dropped)");
+            check!(!(is_c2 | is_smp) | m_path, "a Sample is only built from an authentic reply");
+            check!(!send_s | (is_smp & m_path), "a Sample is sent only in SMP, for an authentic reply");
+            check!(!(send_s & send_x), "a Sample and a miss never share a cycle");
+            // Kiss-o'-Death (F9): applied only for an authentic KoD with the matching code.
+            check!(!(is_miss & self.kr.get()) | (Bit::from(r_st == 0u8) & Bit::from(r_rid == KOD_RATE)), "RATE back-off only for a stratum 0 reply carrying RATE");
+            check!(!(is_miss & self.kd.get()) | (Bit::from(r_st == 0u8) & (Bit::from(r_rid == KOD_DENY) | Bit::from(r_rid == KOD_RSTR))), "a slot dies only for a stratum 0 reply carrying DENY or RSTR");
+            check!(!(is_lkp_c | is_lwt_c | is_req_c | is_pay_c | is_c2 | is_smp) | (!self.kr.get() & !self.kd.get()), "no KoD pending outside the reply and MISS states");
+            check!(!(self.kr.get() & self.kd.get()), "a reply is at most one kind of KoD");
+            cover!(to_c2, "a reply is accepted");
+            cover!(is_chk & !auth, "a reply is dropped as not authentic");
+            cover!(send_s, "a Sample is sent");
+            cover!(is_chk & auth & unusable, "an authentic but unusable reply is counted as a miss");
+            cover!(is_miss & self.kr.get(), "a RATE KoD is applied");
+
             with!(self <= {
                 oke: org_eq,
+                to_c2 ? m_path: Bit::One,
+                send_s | send_x | take_m ? m_path: Bit::Zero,
                 pt0: (U::<32>::from(0u8) - (poll_secs(pe0) << 6u32)).slice::<7, 17>(),
                 pt1: (U::<32>::from(0u8) - (poll_secs(pe1) << 6u32)).slice::<7, 17>(),
                 pt2: (U::<32>::from(0u8) - (poll_secs(pe2) << 6u32)).slice::<7, 17>(),
