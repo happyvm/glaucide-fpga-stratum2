@@ -384,13 +384,26 @@ fn echo_reply_packet() -> Vec<u8> {
 
 #[test]
 fn resolve_waits_while_busy() {
-    // The resolve arrives while the echo is being read: the reply goes first.
-    let o = run(&bench(vec![(0, echo_req_frame())], vec![(40, PEER_LL)], 600));
-    check_frames("busy", &o.sent, &[(PEER_MAC, echo_reply_packet()), exp_ns(PEER_LL, LL)]);
     // A resolve already waiting when the frame reaches the unit goes first and
     // the frame (held in the channels) is answered afterwards.
     let o = run(&bench(vec![(0, echo_req_frame())], vec![(0, PEER_LL)], 600));
     check_frames("idle", &o.sent, &[exp_ns(PEER_LL, LL), (PEER_MAC, echo_reply_packet())]);
+    // Sweep the resolve over the whole reception and reply: frames are always
+    // whole and complete; once the unit has started the message the echo reply
+    // comes first (the resolve waits), both orders occur.
+    let (mut echo_first, mut ns_first) = (0, 0);
+    for at in (0..160).step_by(4) {
+        let o = run(&bench(vec![(0, echo_req_frame())], vec![(at, PEER_LL)], 600));
+        let (a, b) = (exp_ns(PEER_LL, LL), (PEER_MAC, echo_reply_packet()));
+        if o.sent.first().map(|s| s.data == b.1) == Some(true) {
+            echo_first += 1;
+            check_frames("echo first", &o.sent, &[b, a]);
+        } else {
+            ns_first += 1;
+            check_frames("ns first", &o.sent, &[a, b]);
+        }
+    }
+    assert!(echo_first > 0 && ns_first > 0, "{echo_first} {ns_first}");
 }
 
 #[test]
@@ -429,7 +442,7 @@ fn learns(frames: Vec<Vec<u8>>) -> Out {
 #[test]
 fn na_learning_table() {
     let tlla = opt(2, AA_MAC);
-    let ok_msg = |t: u128, o: &[u8], d: u128| na_msg(t, 0x60, o, t, d);
+    let ok_msg = |t: u128, o: &[u8], d: u128| na_msg(t, 0x60, o, if d == LL { PEER_LL } else { PEER }, d);
     // (what, frame, expected learn)
     let mut bad_ck = eth6(MAC, PEER, GUA, 255, &ok_msg(PEER, &tlla, GUA));
     bad_ck[14 + 40 + 2] ^= 0x10;

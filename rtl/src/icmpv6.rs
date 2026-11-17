@@ -505,7 +505,7 @@ impl
                     orem: orem - U::<12>::from(1u16),
                     ost: mux(Bit::from(orem == 1), U::<2>::from(0u8), U::<2>::from(2u8)),
                 },
-                take & o_b & Bit::from(ot == U::<8>::from(1u8)) ? smac: (smac << 8u32) | b.data.zext::<48>(),
+                take & o_b & Bit::from(ot == want_t) ? smac: (smac << 8u32) | b.data.zext::<48>(),
                 take & is_nsi ? bad: bad_n,
                 ns_end ? {
                     st: mux(good, U::<4>::from(CK1), U::<4>::from(GATHER)),
