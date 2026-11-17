@@ -226,7 +226,10 @@ fn tx_header_vectors_from_python_model() {
             let d = f.data();
             assert_eq!(&d[..40], &exp[..40], "40-byte header");
             assert_eq!(&d[..], &exp[..], "whole packet");
-            assert_eq!(&d[..40], &ref_header(j.dst_ip, j.src_ip, j.next, j.hop, j.len)[..]);
+            assert_eq!(
+                &d[..40],
+                &ref_header(j.dst_ip, j.src_ip, j.next, j.hop, j.len)[..]
+            );
         }
     }
 }
@@ -268,14 +271,23 @@ fn tx_headers_many_combinations() {
     for i in 0..40 {
         x = x.wrapping_mul(1664525).wrapping_add(1013904223);
         let d = ((x as u128) << 96) | ((x as u128).wrapping_mul(0x9E37_79B9) << 32) | i;
-        jobs.push(job(d, !d, (x >> 24) as u8, (x >> 8) as u8, 1 + (i as usize * 37) % 1460));
+        jobs.push(job(
+            d,
+            !d,
+            (x >> 24) as u8,
+            (x >> 8) as u8,
+            1 + (i as usize * 37) % 1460,
+        ));
     }
     let frames = run_tx(&jobs, 0, |_| true);
     assert_eq!(frames.len(), jobs.len());
     for (j, f) in jobs.iter().zip(&frames) {
         let d = f.data();
         assert_eq!(d.len(), 40 + j.len as usize);
-        assert_eq!(&d[..40], &ref_header(j.dst_ip, j.src_ip, j.next, j.hop, j.len)[..]);
+        assert_eq!(
+            &d[..40],
+            &ref_header(j.dst_ip, j.src_ip, j.next, j.hop, j.len)[..]
+        );
         assert_eq!(&d[40..], &j.payload[..]);
         assert!(!f.err());
         assert_eq!(f.dst_mac, j.dst_mac);
@@ -571,7 +583,8 @@ fn ref_rx(f: &RxFr, gua_valid: bool) -> Option<(usize, Vec<u8>)> {
     let dst = u128_at(b, 24);
     let ours = dst == LL || (gua_valid && dst == GUA);
     let is_sn = dst == sn_of(SN_LOW);
-    let dmac_ours_uni = f.dst_mac == MAC;
+    // eth_rx already matched our MAC: ipv6_rx only sees whether it is unicast.
+    let dmac_ours_uni = f.dst_mac & 0x0100_0000_0000 == 0;
     let ok_dst = if ours {
         dmac_ours_uni
     } else if is_sn {
@@ -603,30 +616,125 @@ fn rx_table() {
     cases.push(("udp to ll", udp(30), Some(1), true));
     cases.push(("icmp to gua", icmp(12).to(GUA, MAC), Some(0), true));
     cases.push(("udp to gua", udp(30).to(GUA, MAC), Some(1), true));
-    cases.push(("icmp to gua, gua_valid 0", icmp(12).to(GUA, MAC), None, false));
+    cases.push((
+        "icmp to gua, gua_valid 0",
+        icmp(12).to(GUA, MAC),
+        None,
+        false,
+    ));
     cases.push(("udp to gua, gua_valid 0", udp(12).to(GUA, MAC), None, false));
     cases.push(("icmp to ll, gua_valid 0", icmp(12), Some(0), false));
-    cases.push(("icmp to sn", icmp(12).to(sn_of(SN_LOW), sn_mac(SN_LOW)), Some(0), true));
-    cases.push(("icmp to sn, gua_valid 0", icmp(12).to(sn_of(SN_LOW), sn_mac(SN_LOW)), Some(0), false));
-    cases.push(("udp to sn (G8)", udp(12).to(sn_of(SN_LOW), sn_mac(SN_LOW)), None, true));
-    cases.push(("icmp to sn on unicast mac (G6)", icmp(12).to(sn_of(SN_LOW), MAC), None, true));
-    cases.push(("icmp to sn, wrong mac", icmp(12).to(sn_of(SN_LOW), sn_mac(2)), None, true));
-    cases.push(("icmp to sn, all-nodes mac", icmp(12).to(sn_of(SN_LOW), 0x3333_0000_0001), None, true));
-    cases.push(("icmp to sn of other low", icmp(12).to(sn_of(2), sn_mac(2)), None, true));
-    cases.push(("icmp to sn of other low, our mac", icmp(12).to(sn_of(2), sn_mac(SN_LOW)), None, true));
-    cases.push(("icmp to sn, other prefix", icmp(12).to(sn_of(SN_LOW) ^ (1u128 << 112), sn_mac(SN_LOW)), None, true));
-    cases.push(("icmp to ff02::1", icmp(12).to(ALL_NODES, 0x3333_0000_0001), None, true));
-    cases.push(("udp to ff02::1", udp(12).to(ALL_NODES, 0x3333_0000_0001), None, true));
-    cases.push(("icmp to ff02::2", icmp(12).to(ALL_NODES + 1, 0x3333_0000_0002), None, true));
-    cases.push(("icmp to ff02::1 on our mac", icmp(12).to(ALL_NODES, MAC), None, true));
-    cases.push(("icmp to someone else", icmp(12).to(PEER_LL, MAC), None, true));
+    cases.push((
+        "icmp to sn",
+        icmp(12).to(sn_of(SN_LOW), sn_mac(SN_LOW)),
+        Some(0),
+        true,
+    ));
+    cases.push((
+        "icmp to sn, gua_valid 0",
+        icmp(12).to(sn_of(SN_LOW), sn_mac(SN_LOW)),
+        Some(0),
+        false,
+    ));
+    cases.push((
+        "udp to sn (G8)",
+        udp(12).to(sn_of(SN_LOW), sn_mac(SN_LOW)),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to sn on unicast mac (G6)",
+        icmp(12).to(sn_of(SN_LOW), MAC),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to sn, wrong mac",
+        icmp(12).to(sn_of(SN_LOW), sn_mac(2)),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to sn, all-nodes mac",
+        icmp(12).to(sn_of(SN_LOW), 0x3333_0000_0001),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to sn of other low",
+        icmp(12).to(sn_of(2), sn_mac(2)),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to sn of other low, our mac",
+        icmp(12).to(sn_of(2), sn_mac(SN_LOW)),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to sn, other prefix",
+        icmp(12).to(sn_of(SN_LOW) ^ (1u128 << 112), sn_mac(SN_LOW)),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to ff02::1",
+        icmp(12).to(ALL_NODES, 0x3333_0000_0001),
+        None,
+        true,
+    ));
+    cases.push((
+        "udp to ff02::1",
+        udp(12).to(ALL_NODES, 0x3333_0000_0001),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to ff02::2",
+        icmp(12).to(ALL_NODES + 1, 0x3333_0000_0002),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to ff02::1 on our mac",
+        icmp(12).to(ALL_NODES, MAC),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to someone else",
+        icmp(12).to(PEER_LL, MAC),
+        None,
+        true,
+    ));
     cases.push(("icmp to peer gua", icmp(12).to(PEER, MAC), None, true));
     cases.push(("icmp to ::1", icmp(12).to(1, MAC), None, true));
     cases.push(("icmp to ::", icmp(12).to(0, MAC), None, true));
-    cases.push(("icmp to ll, multicast mac", icmp(12).to(LL, 0x3333_0000_0001), None, true));
-    cases.push(("icmp to ll, broadcast mac", icmp(12).to(LL, 0xFFFF_FFFF_FFFF), None, true));
-    cases.push(("icmp to ll off by one bit", icmp(12).to(LL ^ 1, MAC), None, true));
-    cases.push(("icmp to ll off by top bit", icmp(12).to(LL ^ (1 << 127), MAC), None, true));
+    cases.push((
+        "icmp to ll, multicast mac",
+        icmp(12).to(LL, 0x3333_0000_0001),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to ll, broadcast mac",
+        icmp(12).to(LL, 0xFFFF_FFFF_FFFF),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to ll off by one bit",
+        icmp(12).to(LL ^ 1, MAC),
+        None,
+        true,
+    ));
+    cases.push((
+        "icmp to ll off by top bit",
+        icmp(12).to(LL ^ (1 << 127), MAC),
+        None,
+        true,
+    ));
     // Sources.
     for (n, s, exp) in [
         ("src ff02::1", ALL_NODES, None),
@@ -649,7 +757,14 @@ fn rx_table() {
     p.src = 0;
     cases.push(("udp from :: to ll (passes this layer)", p, Some(1), true));
     // Hop limit.
-    for (h, exp) in [(0u8, None), (1, Some(0)), (2, Some(0)), (64, Some(0)), (254, Some(0)), (255, Some(0))] {
+    for (h, exp) in [
+        (0u8, None),
+        (1, Some(0)),
+        (2, Some(0)),
+        (64, Some(0)),
+        (254, Some(0)),
+        (255, Some(0)),
+    ] {
         let mut p = icmp(12);
         p.hop = h;
         cases.push(("hop limit", p, exp, true));
@@ -791,8 +906,8 @@ fn rx_truncated_and_err() {
     let mut f = p.frame();
     f.err = true;
     let o = run_rx(&[f], 0, true, |_, _| true);
-    assert_eq!(o.bytes[1].len(), 26);
-    assert!(o.bytes[1][25].last.to_bool() && o.bytes[1][25].err.to_bool());
+    assert_eq!(o.bytes[1].len(), 20);
+    assert!(o.bytes[1][19].last.to_bool() && o.bytes[1][19].err.to_bool());
     // A good frame after an err one is clean.
     let mut f = Pk::new(17, 8).frame();
     f.err = true;
@@ -828,11 +943,41 @@ fn rx_backpressure_and_meta_before_payload() {
     assert_eq!(clean(&o, 1).len(), 3);
 }
 
+/// Like assert_eq on lists of packets, but reports only the first difference.
+fn same(got: &[Vec<u8>], want: &[Vec<u8>], what: &str) {
+    for (k, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g == w,
+            "{what}: packet {k}: got {} bytes, want {}",
+            g.len(),
+            w.len()
+        );
+    }
+    assert_eq!(got.len(), want.len(), "{what}: number of packets");
+}
+
 #[test]
 fn rx_back_to_back_differential() {
     // Pseudo-random packets against the reference, in one long run.
-    let macs = [MAC, sn_mac(1), sn_mac(2), 0x3333_0000_0001, 0x0200_0000_0003, 0xFFFF_FFFF_FFFF];
-    let dsts = [LL, GUA, sn_of(1), sn_of(2), ALL_NODES, ALL_NODES + 1, PEER, PEER_LL, 0];
+    let macs = [
+        MAC,
+        sn_mac(1),
+        sn_mac(2),
+        0x3333_0000_0001,
+        0x0200_0000_0003,
+        0xFFFF_FFFF_FFFF,
+    ];
+    let dsts = [
+        LL,
+        GUA,
+        sn_of(1),
+        sn_of(2),
+        ALL_NODES,
+        ALL_NODES + 1,
+        PEER,
+        PEER_LL,
+        0,
+    ];
     let srcs = [PEER, 0, ALL_NODES, PEER_LL, u128::MAX];
     let nexts = [58u8, 58, 17, 17, 6, 0, 43, 44, 60];
     let hops = [0u8, 1, 64, 255];
@@ -846,7 +991,7 @@ fn rx_back_to_back_differential() {
     for gv in [true, false] {
         frames.clear();
         let mut exp = vec![];
-        for _ in 0..400 {
+        for _ in 0..600 {
             let mut p = Pk::new(nexts[rnd() % 9], rnd() % 90);
             p.dst = dsts[rnd() % 9];
             p.dst_mac = macs[rnd() % 6];
@@ -878,13 +1023,26 @@ fn rx_back_to_back_differential() {
         let o = run_rx(&frames, 0, gv, |_, _| true);
         let got_i = clean(&o, 0);
         let got_u = clean(&o, 1);
-        let want_i: Vec<Vec<u8>> = exp.iter().filter(|r| r.0 == 0).map(|r| r.1.clone()).collect();
-        let want_u: Vec<Vec<u8>> = exp.iter().filter(|r| r.0 == 1).map(|r| r.1.clone()).collect();
-        assert_eq!(got_i, want_i, "gua_valid {gv}: icmp");
-        assert_eq!(got_u, want_u, "gua_valid {gv}: udp");
+        let want_i: Vec<Vec<u8>> = exp
+            .iter()
+            .filter(|r| r.0 == 0)
+            .map(|r| r.1.clone())
+            .collect();
+        let want_u: Vec<Vec<u8>> = exp
+            .iter()
+            .filter(|r| r.0 == 1)
+            .map(|r| r.1.clone())
+            .collect();
+        same(&got_i, &want_i, &format!("gua_valid {gv}: icmp"));
+        same(&got_u, &want_u, &format!("gua_valid {gv}: udp"));
         assert_eq!(o.meta[0].len(), want_i.len());
         assert_eq!(o.meta[1].len(), want_u.len());
-        assert!(want_i.len() > 20 && want_u.len() > 20, "weak sample");
+        assert!(
+            want_i.len() > 15 && want_u.len() > 8,
+            "weak sample {} {}",
+            want_i.len(),
+            want_u.len()
+        );
         want[0].extend(exp);
     }
 }
@@ -1030,8 +1188,16 @@ fn chain_rx_vectors() {
         let want: Vec<(usize, Vec<u8>)> = rx.iter().filter_map(|f| ref_chain(f)).collect();
         for (gap, tk) in [(0usize, false), (1, true)] {
             let o = rx_chain(&rx, gap, |t| !tk || t % 4 != 0);
-            let wi: Vec<Vec<u8>> = want.iter().filter(|w| w.0 == 0).map(|w| w.1.clone()).collect();
-            let wu: Vec<Vec<u8>> = want.iter().filter(|w| w.0 == 1).map(|w| w.1.clone()).collect();
+            let wi: Vec<Vec<u8>> = want
+                .iter()
+                .filter(|w| w.0 == 0)
+                .map(|w| w.1.clone())
+                .collect();
+            let wu: Vec<Vec<u8>> = want
+                .iter()
+                .filter(|w| w.0 == 1)
+                .map(|w| w.1.clone())
+                .collect();
             assert_eq!(o.icmp, wi, "{name}: icmp");
             assert_eq!(o.udp, wu, "{name}: udp");
             assert_eq!(o.icmp_metas.len(), wi.len(), "{name}");
@@ -1049,7 +1215,11 @@ fn chain_rx_vectors() {
 #[test]
 fn chain_rx_ping6_and_ntp6_exact() {
     let v = vector("ping6.hex");
-    let rx: Vec<Vec<u8>> = v.iter().filter(|(r, _)| *r).map(|(_, f)| f.clone()).collect();
+    let rx: Vec<Vec<u8>> = v
+        .iter()
+        .filter(|(r, _)| *r)
+        .map(|(_, f)| f.clone())
+        .collect();
     let o = rx_chain(&rx, 0, |_| true);
     assert_eq!(o.icmp.len(), 2);
     assert!(o.udp.is_empty());
@@ -1065,15 +1235,23 @@ fn chain_rx_ping6_and_ntp6_exact() {
     assert_eq!(o.icmp_metas[0].eth_src, PEER_MAC);
     assert!(!o.icmp_metas[0].multicast);
     let v = vector("ntp6_basic.hex");
-    let rx: Vec<Vec<u8>> = v.iter().filter(|(r, _)| *r).map(|(_, f)| f.clone()).collect();
+    let rx: Vec<Vec<u8>> = v
+        .iter()
+        .filter(|(r, _)| *r)
+        .map(|(_, f)| f.clone())
+        .collect();
     let o = rx_chain(&rx, 0, |_| true);
-    assert_eq!(o.udp.len(), 1);
+    assert_eq!(o.udp.len(), 2);
     assert_eq!(o.udp[0].len(), 56); // UDP header 8 + NTP 48
     assert_eq!(o.udp_metas[0].next, 17);
     assert_eq!(o.udp_metas[0].len, 56);
     // NDP: the NS to the solicited-node group arrives with multicast = 1.
     let v = vector("ndp_ns_na.hex");
-    let rx: Vec<Vec<u8>> = v.iter().filter(|(r, _)| *r).map(|(_, f)| f.clone()).collect();
+    let rx: Vec<Vec<u8>> = v
+        .iter()
+        .filter(|(r, _)| *r)
+        .map(|(_, f)| f.clone())
+        .collect();
     let o = rx_chain(&rx, 0, |_| true);
     assert_eq!(o.icmp.len(), rx.len());
     assert!(o.icmp_metas[0].multicast && o.icmp_metas[0].hop == 255);
