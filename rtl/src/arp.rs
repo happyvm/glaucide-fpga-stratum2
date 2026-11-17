@@ -125,10 +125,6 @@ pub struct Arp {
     pub tx_cnt: Reg<U<5>>,
     /// The frame in progress is a request (else a reply).
     pub tx_req: Reg<Bit>,
-    /// Packet shifted out, first byte in the top byte of `txp_hi`; bytes 0..14
-    /// are in `txp_hi`, bytes 14..28 in `txp_lo` (a U<N> has at most 128 bits).
-    pub txp_hi: Reg<U<112>>,
-    pub txp_lo: Reg<U<112>>,
     // Cache.
     pub v0: Reg<Bit>,
     pub v1: Reg<Bit>,
@@ -143,8 +139,9 @@ pub struct Arp {
     pub mac2: Reg<U<48>>,
     pub mac3: Reg<U<48>>,
     pub rr: Reg<U<2>>,
+    /// Variable fields of the frame being sent (the packet storage): loaded
+    /// at its `hdr`, the byte at index `tx_cnt` is selected from them.
     // Monitors (only read by check!/cover!; pruned in synthesis).
-    /// Fields of the frame being sent, snapshot at its `hdr`.
     pub m_op: Reg<U<8>>,
     pub m_mac: Reg<U<48>>,
     pub m_ip: Reg<U<32>>,
@@ -206,8 +203,6 @@ impl
             let tx_st = self.tx_st.get();
             let tc = self.tx_cnt.get();
             let tx_req = self.tx_req.get();
-            let txp_hi = self.txp_hi.get();
-            let txp_lo = self.txp_lo.get();
             let v0 = self.v0.get();
             let v1 = self.v1.get();
             let v2 = self.v2.get();
@@ -314,32 +309,25 @@ impl
             let l_op = mux(send_rep, U::<8>::from(2u8), U::<8>::from(1u8));
             let l_tha = mux(send_rep, self.rep_dst.get(), U::<48>::from(0u8));
             let l_tpa = mux(send_rep, self.rep_ip.get(), req_ip);
-            let load_hi = (U::<112>::from(0x0001_0800_0604_0000u64) << 48u32)
-                | (l_op.zext::<112>() << 48u32)
-                | mac.zext::<112>();
-            let load_lo = (ip.zext::<112>() << 80u32)
-                | (l_tha.zext::<112>() << 32u32)
-                | l_tpa.zext::<112>();
+            let m_op = self.m_op.get();
+            let m_mac = self.m_mac.get();
+            let m_ip = self.m_ip.get();
+            let m_tha = self.m_tha.get();
+            let m_tpa = self.m_tpa.get();
             let room = out_payload.ready();
             let pay_go = t_pay & room;
             let t_last = Bit::from(tc == 27);
             let t_end = pay_go & t_last;
-            let o_data = txp_hi.slice::<104, 8>();
+            let o_data = mux(tc == 0, U::<8>::from(0u8), mux(tc == 1, U::<8>::from(1u8), mux(tc == 2, U::<8>::from(8u8), mux(tc == 3, U::<8>::from(0u8), mux(tc == 4, U::<8>::from(6u8), mux(tc == 5, U::<8>::from(4u8), mux(tc == 6, U::<8>::from(0u8), mux(tc == 7, m_op, mux(tc == 8, m_mac.slice::<40,8>(), mux(tc == 9, m_mac.slice::<32,8>(), mux(tc == 10, m_mac.slice::<24,8>(), mux(tc == 11, m_mac.slice::<16,8>(), mux(tc == 12, m_mac.slice::<8,8>(), mux(tc == 13, m_mac.slice::<0,8>(), mux(tc == 14, m_ip.slice::<24,8>(), mux(tc == 15, m_ip.slice::<16,8>(), mux(tc == 16, m_ip.slice::<8,8>(), mux(tc == 17, m_ip.slice::<0,8>(), mux(tc == 18, m_tha.slice::<40,8>(), mux(tc == 19, m_tha.slice::<32,8>(), mux(tc == 20, m_tha.slice::<24,8>(), mux(tc == 21, m_tha.slice::<16,8>(), mux(tc == 22, m_tha.slice::<8,8>(), mux(tc == 23, m_tha.slice::<0,8>(), mux(tc == 24, m_tpa.slice::<24,8>(), mux(tc == 25, m_tpa.slice::<16,8>(), mux(tc == 26, m_tpa.slice::<8,8>(), mux(tc == 27, m_tpa.slice::<0,8>(), U::<8>::from(0u8)))))))))))))))))))))))))))));
             let ob = FrameByte { data: o_data, last: t_last, err: Bit::Zero };
             if pay_go.to_bool() {
                 out_payload.send(ob);
             }
 
             // ---------------------------------------------------- properties
-            let m_op = self.m_op.get();
-            let m_mac = self.m_mac.get();
-            let m_ip = self.m_ip.get();
-            let m_tha = self.m_tha.get();
-            let m_tpa = self.m_tpa.get();
-            let m_have = self.m_have.get();
+                        let m_have = self.m_have.get();
             let m_lip = self.m_lip.get();
             let m_lmac = self.m_lmac.get();
-            let exp = mux(tc == 0, U::<8>::from(0u8), mux(tc == 1, U::<8>::from(1u8), mux(tc == 2, U::<8>::from(8u8), mux(tc == 3, U::<8>::from(0u8), mux(tc == 4, U::<8>::from(6u8), mux(tc == 5, U::<8>::from(4u8), mux(tc == 6, U::<8>::from(0u8), mux(tc == 7, m_op, mux(tc == 8, m_mac.slice::<40,8>(), mux(tc == 9, m_mac.slice::<32,8>(), mux(tc == 10, m_mac.slice::<24,8>(), mux(tc == 11, m_mac.slice::<16,8>(), mux(tc == 12, m_mac.slice::<8,8>(), mux(tc == 13, m_mac.slice::<0,8>(), mux(tc == 14, m_ip.slice::<24,8>(), mux(tc == 15, m_ip.slice::<16,8>(), mux(tc == 16, m_ip.slice::<8,8>(), mux(tc == 17, m_ip.slice::<0,8>(), mux(tc == 18, m_tha.slice::<40,8>(), mux(tc == 19, m_tha.slice::<32,8>(), mux(tc == 20, m_tha.slice::<24,8>(), mux(tc == 21, m_tha.slice::<16,8>(), mux(tc == 22, m_tha.slice::<8,8>(), mux(tc == 23, m_tha.slice::<0,8>(), mux(tc == 24, m_tpa.slice::<24,8>(), mux(tc == 25, m_tpa.slice::<16,8>(), mux(tc == 26, m_tpa.slice::<8,8>(), mux(tc == 27, m_tpa.slice::<0,8>(), U::<8>::from(0u8)))))))))))))))))))))))))))));
             // Internal invariants.
             check!(ci <= 28, "the payload counter stays within 0..=28");
             check!(tc <= 27, "the transmit counter stays within 0..=27");
@@ -360,12 +348,12 @@ impl
             check!(!(take_p & last & b.err) | !(dec | learn), "an err frame teaches nothing and gets no reply");
             check!(!(take_p & last) | !(dec & !full), "a short payload is not a packet");
             // Fields: every byte equals the snapshot field at its index.
-            check!(!pay_go | Bit::from(o_data == exp), "payload byte is the field of the ARP packet at its index");
-            check!(!(pay_go & tx_req) | Bit::from(m_op == 1), "request: op is 1");
-            check!(!(pay_go & !tx_req) | Bit::from(m_op == 2), "reply: op is 2");
-            check!(!(pay_go & tx_req) | (Bit::from(m_tha == 0u8) & Bit::from(m_tpa == req_ip)), "request: tha is 0, tpa is the resolved address");
-            check!(!(pay_go & !tx_req) | (Bit::from(m_tha == self.m_rs.get()) & Bit::from(m_tpa == self.m_rp.get())), "reply: tha and tpa are the requester's sha and spa (swap)");
-            check!(!pay_go | (Bit::from(m_op == 1) | Bit::from(m_op == 2)), "op is 1 or 2");
+            check!(!t_pay | (Bit::from(tx_req) & Bit::from(m_op == 1) | !tx_req & Bit::from(m_op == 2)), "op is 1 in a request, 2 in a reply");
+            check!(!(t_pay & !tx_req) | (Bit::from(m_tha == self.m_rs.get()) & Bit::from(m_tpa == self.m_rp.get())), "reply in progress: tha and tpa are the requester's sha and spa (swap)");
+            check!(!(t_pay & tx_req) | (Bit::from(m_tha == 0u8) & Bit::from(m_tpa == req_ip)), "request in progress: tha is 0, tpa is the resolved address");
+            check!(!take_h | Bit::from(l_op == mux(send_rep, U::<8>::from(2u8), U::<8>::from(1u8))), "hdr loads op 2 for a reply, 1 for a request");
+            check!(!(send_rep) | (Bit::from(self.rep_dst.get() == self.m_rs.get()) & Bit::from(self.rep_ip.get() == self.m_rp.get())), "the queued reply is addressed to the requester");
+            check!(!rep_pend | (Bit::from(self.rep_dst.get() == self.m_rs.get()) & Bit::from(self.rep_ip.get() == self.m_rp.get())), "the queued reply keeps the requester addresses");
             check!(!take_h | Bit::from(h_dst == mux(send_rep, self.rep_dst.get(), U::<48>::from(0xffff_ffff_ffffu64))), "hdr destination: requester for a reply, broadcast for a request");
             // The hdr is always completed: the byte with last ends the frame at count 27.
             check!(!(pay_go & t_last) | Bit::from(tc == 27), "last is the 28th byte");
@@ -412,8 +400,6 @@ impl
                     tx_st: U::<1>::from(1u8),
                     tx_cnt: U::<5>::from(0u8),
                     tx_req: send_rq,
-                    txp_hi: load_hi,
-                    txp_lo: load_lo,
                     m_op: l_op,
                     m_mac: mac,
                     m_ip: ip,
@@ -422,11 +408,7 @@ impl
                 },
                 send_rep ? rep_pend: Bit::Zero,
                 send_rq ? req_pend: Bit::Zero,
-                pay_go ? {
-                    txp_hi: (txp_hi << 8u32) | txp_lo.slice::<104, 8>().zext::<112>(),
-                    txp_lo: txp_lo << 8u32,
-                    tx_cnt: tc + 1,
-                },
+                pay_go ? tx_cnt: tc + 1,
                 t_end ? { tx_st: U::<1>::from(0u8), tx_cnt: U::<5>::from(0u8) },
                 // Resolution.
                 set_new ? { wait: Bit::One, req_pend: Bit::One, req_ip: rip },
