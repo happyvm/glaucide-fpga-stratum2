@@ -1,13 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `gen_all <module>`: print the Verilog of a design module.
 use ntp_fpga::{
-    clock::NtpClock, crc32::FrameCrc, eth_rx::EthRx, eth_tx::EthTx, fcs_check::FcsCheck,
-    mii_rx::MiiRx, mii_tx::MiiTx, stream::FrameCounter, tx_arb::TxArb, tx_path::TxPath,
+    clock::{DisciplinedClock, NtpClock},
+    crc32::FrameCrc,
+    eth_rx::EthRx,
+    eth_tx::EthTx,
+    fcs_check::FcsCheck,
+    mii_rx::MiiRx,
+    mii_tx::MiiTx,
+    stream::FrameCounter,
+    tx_arb::TxArb,
+    tx_path::TxPath,
 };
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("ntp_clock") => print!("{}", NtpClock::verilog("ntp_clock")),
+        Some("disciplined_clock") => print!("{}", DisciplinedClock::verilog("disciplined_clock")),
         Some("frame_counter") => print!("{}", FrameCounter::verilog("frame_counter")),
         Some("frame_crc") => print!("{}", FrameCrc::verilog("frame_crc")),
         Some("mii_rx") => print!("{}", MiiRx::verilog("mii_rx")),
