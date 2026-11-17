@@ -2,7 +2,146 @@
 //! Receive path crossing (task T1.4a): `mii_rx` frames from `ClkRx` to
 //! `clk_sys`, and one receive timestamp per frame, taken at the SFD.
 //!
-//! PLACEHOLDER HEADER, rewritten below once the design is final.
+//! Ports of [`RxPath`] ([`RxPathMii`] in the design):
+//! * `ClkRx` side: `raw` (`Rx<FrameByte>`, the raw frames of `mii_rx`, FCS
+//!   included; always taken, `ready` is never low while `valid` is high)
+//!   and `sfd` (`In<Bit>`, `mii_rx`'s one-cycle SFD pulse).
+//! * `clk_sys` side: `time` (`In<U<96>>`, the `NtpClock` accumulator; the
+//!   stamp uses `time >> 32`), `frames` (`Tx<FrameByte>`, the same raw
+//!   frames, FCS included) and `stamps` (`Tx<Ts>`, one per frame).
+//!
+//! # Structure
+//!
+//! Five parts, every crossing a `ChanCdc` (Gray pointers, two flops):
+//!
+//! ```text
+//!  ClkRx                                     |  clk_sys
+//!  raw, sfd -> RxIngress -- words ---> DataCdc (2048) --> RxEgress -> frames
+//!                        -- events --> EventCdc (4) ----> (stamp,   -> stamps
+//!                        <- credits -- CreditCdc (4) <---  pairing)  <- time
+//! ```
+//!
+//! [`RxIngress`] and [`RxEgress`] are single-clock units; they carry the
+//! formal properties (below).
+//!
+//! # Frames, overflow
+//!
+//! Every input byte is taken in the cycle it is offered (the wire cannot
+//! wait). The data FIFO holds 2048 words, more than a whole 1518-byte
+//! frame. A frame goes into it only if its first byte finds room in the
+//! FIFO, a slot in the event channel and a stamp credit (below); otherwise
+//! the whole frame is dropped, nothing of it is written. If the FIFO is
+//! full in the middle of a frame (the `clk_sys` consumer has stalled for
+//! about 2048 bytes), the frame is cut: the bytes already written stay,
+//! the rest of the input frame is dropped, and a terminator word
+//! `{data: 0, last: 1, err: 1}` is written as soon as there is room, so
+//! the frame ends with `err` (stream contract 2: the consumer discards
+//! it). A new frame whose SFD comes while the terminator is still owed is
+//! dropped whole. Data is never altered without `err` on the frame's last
+//! byte. An SFD while an output frame is still open (which `mii_rx` never
+//! does) closes it the same way.
+//!
+//! Output, stream contract of `stream.rs`: a frame is at least one byte,
+//! at most 1518 (the input's limit, the terminator replacing a dropped
+//! byte), `err` only with `last`.
+//!
+//! # Timestamp
+//!
+//! The SFD pulse crosses as an event on its own small `ChanCdc` (its Gray
+//! write pointer is the toggle synchroniser of the event; four slots, so
+//! events closer than the synchroniser latency are not merged, and its
+//! read side is always ready, so an event never waits). [`RxEgress`] reads
+//! `time` in the cycle the event comes out and keeps
+//! `(time >> 32) - RX_STAMP_BIAS`.
+//!
+//! Latency, edge by edge (netlist; the Rust simulation is the same):
+//! * `clk_rx` edge `k`: `mii_rx` samples the SFD nibble (the reference
+//!   instant of the stamp) and raises its `sfd` register;
+//! * `k + 1`: [`RxIngress`] sees `sfd`, offers the SFD event;
+//! * `k + 2`: the event `ChanCdc` writes it and moves its Gray pointer;
+//! * first `clk_sys` edge strictly after that, `e1` (`phi` in (0, 1]
+//!   `clk_sys` cycle later): first synchroniser flop; `e1 + 1`: second;
+//!   `e1 + 2`: popped into the channel to [`RxEgress`]; `e1 + 3`: `time`
+//!   captured.
+//!
+//! Total `2 T_rx + (2 + phi + 1) T_sys` = 80 ns + 30 ns + `phi` x 10 ns,
+//! from 110 to 120 ns. [`RX_STAMP_BIAS`] removes the mean, 115 ns
+//! ([`RX_STAMP_LATENCY_PS`], 494 units of 2^-32 s), so that the stamp
+//! estimates the time at which the SFD nibble was sampled on the MII.
+//!
+//! Uncertainty budget (fixed, documented; the NTP precision field relies
+//! on it):
+//! * asynchronous crossing: the phase `phi` of the two clocks gives an
+//!   error in (-5, +5] ns, uniform; a metastable first flop can resolve
+//!   one `clk_sys` cycle late only when the pointer changes inside its
+//!   aperture, which keeps the error within **±1 `clk_sys` cycle = ±10
+//!   ns**. Measured in simulation (`rtl/tests/rx_path.rs`): -4.66 to +5.12
+//!   ns over six phases at a 40/10 ns ratio, -3.49 to +6.05 ns over all
+//!   phases with a 40.5 ns `clk_rx` (the extra ns is 2 x 0.5 ns of
+//!   off-nominal `clk_rx`, see below);
+//! * MII granularity: the SFD is located to one `clk_rx` cycle, **40 ns**;
+//! * `clk_rx` frequency: the 2 `clk_rx` cycles of the latency are 80 ns at
+//!   the nominal 25 MHz; the PHY's clock is within ±100 ppm: ±8 ps;
+//! * `time` resolution: 10 ns steps of `NtpClock`, inside the ±10 ns above;
+//!   2^-32 s rounding of the bias: 0.02 ns.
+//!
+//! Total: |error| <= 10 + 40 = 50 ns < 2^-24 s (59.6 ns), hence precision
+//! -24. Not included: the PHY's own receive latency (DP83848J, constant,
+//! to be measured on the board and added to the bias later).
+//!
+//! # Pairing
+//!
+//! Invariant: the n-th stamp delivered on `stamps` belongs to the n-th
+//! frame delivered on `frames`, and is offered no later than its first
+//! byte. Mechanism:
+//! * two kinds of events go through the event channel, in order: `SFD`
+//!   when the SFD is seen, `COMMIT` when the frame's first byte is written
+//!   into the data FIFO. A `COMMIT` is sent only for the frame of the last
+//!   `SFD` event (no other `SFD` event in between) and in the same cycle
+//!   as the frame's first word;
+//! * [`RxEgress`] stamps every `SFD` event into `latest`, and pushes
+//!   `latest` into its stamp queue on `COMMIT`. An SFD whose frame never
+//!   writes a byte (0 complete bytes in `mii_rx`, or dropped here) has no
+//!   `COMMIT`: its stamp is overwritten by the next SFD (orphan
+//!   discarded). The stamp queue therefore holds exactly the stamps of the
+//!   frames in the data FIFO, in their order;
+//! * a frame at the head of the FIFO first takes the oldest stamp (it
+//!   waits if the `COMMIT` has not arrived yet), sends it on `stamps`, then
+//!   its bytes on `frames`;
+//! * credits: the stamp queue has [`STAMP_DEPTH`] slots. [`RxIngress`]
+//!   holds a credit per free slot, spends one per `COMMIT` and gets one
+//!   back through the credit channel each time a stamp leaves the queue.
+//!   A frame with no credit is dropped whole, so the queue never
+//!   overflows: at most 16 frames wait for a stalled consumer, the next
+//!   ones are dropped until it resumes.
+//!
+//! Throughput: one byte per 2 `clk_rx` cycles in, up to one per `clk_sys`
+//! cycle out plus one cycle per frame for its stamp; frames back to back
+//! at the minimum gap (96 bit times + preamble) pass without loss when the
+//! consumer is ready.
+//!
+//! # Netlist
+//!
+//! Join `raw`, `frames` and `stamps` to their neighbours through
+//! registered channels (note in `stream.rs`). One `rst` serves both
+//! domains: it must be released synchronously to each clock (the top's
+//! reset synchronisers, T1.11). The data FIFO is read asynchronously by
+//! `ChanCdc` (distributed RAM, 2048 x 10 bits, not block RAM).
+//!
+//! # Formal
+//!
+//! `check!`/`assume!`/`cover!` in [`RxIngress`] and [`RxEgress`] are
+//! proved per unit (`tools/formal/prove.sh rx_ingress prove`, `rx_egress`):
+//! state invariants, overflow and terminator, `err` only with `last`,
+//! frame length, commit only after its own SFD event, credits within the
+//! depth, pairing counters (stamps sent = frames started + the one waiting
+//! for its first byte), stamp queue pointers, stamp = `time >> 32` minus
+//! the bias. The two-clock whole is not proved: the `ChanCdc`s (in-order,
+//! lossless transfer) and the link between the two units' properties
+//! (each `assume!` of [`RxEgress`] about events is a `check!` of the same
+//! text in [`RxIngress`], carried by the event channel) are covered by the
+//! simulation tests, where every `check!`/`assume!` is also evaluated each
+//! cycle, as is the timestamp latency.
 use crate::clocks::ClkRx;
 use crate::stream::{FrameByte, Ts};
 use txhdl::comp::{chan, join2, mux, Clock, DefaultClock, In, Mem, Reg, Rx, Tx, Unit};
@@ -51,7 +190,8 @@ pub struct RxIngress<R: Clock> {
     pub m_in: Reg<U<11>, R>,
     /// Words written to the data FIFO for the open output frame.
     pub m_n: Reg<U<11>, R>,
-    /// The last event sent is an SFD (not yet followed by a commit).
+    /// The current frame (that of the last `sfd` pulse) has had its SFD
+    /// event sent and not yet its commit.
     pub m_sfd: Reg<Bit, R>,
 }
 
@@ -71,8 +211,7 @@ impl<R: Clock> Default for RxIngress<R> {
 }
 
 #[lower]
-impl<R: Clock>
-    Unit<(Rx<FrameByte, R>, In<Bit, R>, Rx<U<1>, R>), (Tx<FrameByte, R>, Tx<U<1>, R>)>
+impl<R: Clock> Unit<(Rx<FrameByte, R>, In<Bit, R>, Rx<U<1>, R>), (Tx<FrameByte, R>, Tx<U<1>, R>)>
     for RxIngress<R>
 {
     async fn run(
@@ -96,15 +235,21 @@ impl<R: Clock>
             check!(!(armed & run), "armed and run are exclusive");
             check!(!(armed & skip), "armed and skip are exclusive");
             check!(!(run & skip), "run and skip are exclusive");
-            check!(!pend | !(run | armed), "a pending terminator blocks the next frame");
+            check!(
+                !pend | !(run | armed),
+                "a pending terminator blocks the next frame"
+            );
             check!(
                 (run | pend) == Bit::from(m_n != 0),
                 "an output frame is open exactly while running or owing its terminator"
             );
-            check!(!run | (m_n == m_in), "a running frame forwards every input byte");
+            check!(
+                !run | (m_n == m_in),
+                "a running frame forwards every input byte"
+            );
             check!(m_n <= 1517, "an open output frame has at most 1517 words");
             check!(!armed | (m_in == 0), "an armed frame has no byte yet");
-            check!(!armed | m_sfd, "an armed frame's SFD is the last event sent");
+            check!(!armed | m_sfd, "an armed frame has its own SFD event sent");
             check!(
                 cred <= STAMP_DEPTH as u8,
                 "credits never exceed the stamp queue depth"
@@ -150,8 +295,14 @@ impl<R: Clock>
             let sfd_ev = s & eroom & !commit & !pend_n;
 
             if write.to_bool() {
-                check!(!werr | wlast, "err only together with last (stream contract 2)");
-                check!(m_n + 1 <= 1518, "a frame has at most 1518 bytes (IEEE 802.3 4.4.2.3)");
+                check!(
+                    !werr | wlast,
+                    "err only together with last (stream contract 2)"
+                );
+                check!(
+                    m_n + 1 <= 1518,
+                    "a frame has at most 1518 bytes (IEEE 802.3 4.4.2.3)"
+                );
                 check!(
                     (m_n != 0) | commit,
                     "an output frame starts only with a commit event"
@@ -165,7 +316,10 @@ impl<R: Clock>
             if commit.to_bool() {
                 check!(m_n == 0, "a commit starts a new output frame");
                 check!(m_sfd, "a commit follows its own SFD event");
-                check!(cred != 0, "credit flow: a commit always has a free stamp slot");
+                check!(
+                    cred != 0,
+                    "credit flow: a commit always has a free stamp slot"
+                );
             }
             if (commit | sfd_ev).to_bool() {
                 events.send(mux(commit, U::<1>::from(EV_COMMIT), U::<1>::from(EV_SFD)));
@@ -196,7 +350,7 @@ impl<R: Clock>
                 mux(got, m_in + 1, m_in),
             );
             let m_n_n = mux(write & wlast, U::<11>::from(0u8), mux(write, m_n + 1, m_n));
-            let m_sfd_n = mux(sfd_ev, Bit::One, mux(commit, Bit::Zero, m_sfd));
+            let m_sfd_n = mux(sfd_ev, Bit::One, mux(s | commit, Bit::Zero, m_sfd));
             with!(self <= {
                 armed: armed_n,
                 run: run_n,
@@ -259,10 +413,8 @@ impl<S: Clock> Default for RxEgress<S> {
 
 #[lower]
 impl<S: Clock>
-    Unit<
-        (Rx<FrameByte, S>, Rx<U<1>, S>, In<U<96>, S>),
-        (Tx<FrameByte, S>, Tx<Ts, S>, Tx<U<1>, S>),
-    > for RxEgress<S>
+    Unit<(Rx<FrameByte, S>, Rx<U<1>, S>, In<U<96>, S>), (Tx<FrameByte, S>, Tx<Ts, S>, Tx<U<1>, S>)>
+    for RxEgress<S>
 {
     async fn run(
         &mut self,
@@ -284,7 +436,10 @@ impl<S: Clock>
             let held = count.zext::<6>() + owed.zext::<6>();
             let fresh = infr & Bit::from(m_n == 0);
 
-            check!(count <= STAMP_DEPTH as u8, "the stamp queue holds at most its depth");
+            check!(
+                count <= STAMP_DEPTH as u8,
+                "the stamp queue holds at most its depth"
+            );
             check!(
                 held <= STAMP_DEPTH as u8,
                 "queued stamps plus owed credits never exceed the depth"
@@ -331,8 +486,14 @@ impl<S: Clock>
                 stamps.send(self.q.read(qh.slice::<0, 4>()));
             }
             if got.to_bool() {
-                check!(!b.err | b.last, "err only together with last (stream contract 2)");
-                check!(m_n + 1 <= 1518, "a frame has at most 1518 bytes (IEEE 802.3 4.4.2.3)");
+                check!(
+                    !b.err | b.last,
+                    "err only together with last (stream contract 2)"
+                );
+                check!(
+                    m_n + 1 <= 1518,
+                    "a frame has at most 1518 bytes (IEEE 802.3 4.4.2.3)"
+                );
                 frames.send(b);
             }
             let tsend = Bit::from(owed != 0) & tokens.ready();
@@ -457,6 +618,6 @@ pub fn formal_verilog(unit: &str) -> String {
     match unit {
         "rx_ingress" => RxIngress::<DefaultClock>::verilog("rx_ingress"),
         "rx_egress" => RxEgress::<DefaultClock>::verilog("rx_egress"),
-        _ => RxPath::<DefaultClock, DefaultClock>::verilog("rx_path"),
+        other => panic!("no formal unit {other:?} in rx_path"),
     }
 }

@@ -288,7 +288,10 @@ fn check_frames(
     let mut errs = vec![];
     let mut prev_id: Option<usize> = None;
     for (f, &(st_tick, stamp)) in out.iter().zip(stamps) {
-        assert!(st_tick <= f.first_tick, "stamp after the frame's first byte");
+        assert!(
+            st_tick <= f.first_tick,
+            "stamp after the frame's first byte"
+        );
         // Every test has fewer than 256 frames: the first byte is the id.
         let id = f.data[0] as usize;
         assert!(id < frames.len(), "unknown frame id {id}");
@@ -302,7 +305,11 @@ fn check_frames(
         } else {
             assert!(f.err, "frame {id} altered without err");
             assert!(f.data.len() <= sent.len(), "frame {id} too long");
-            assert_eq!(f.data[..f.data.len() - 1], sent[..f.data.len() - 1], "frame {id}: prefix");
+            assert_eq!(
+                f.data[..f.data.len() - 1],
+                sent[..f.data.len() - 1],
+                "frame {id}: prefix"
+            );
         }
         // The stamp estimates the time of the SFD edge.
         let e = diff_ns(stamp, ntp_at(sfd_ticks[id], tick_ps));
@@ -340,8 +347,14 @@ fn stamp_case<R: Clock>(n: usize, gap: u64) -> (f64, f64) {
     assert_eq!(out.len(), n, "every frame delivered");
     let errs = check_frames(&frames, &out, &st, &sf, TICK_PS);
     let b = bound_ns(R::PERIOD);
-    let (lo, hi) = errs.iter().fold((f64::MAX, f64::MIN), |(l, h), &e| (l.min(e), h.max(e)));
-    assert!(lo >= -b && hi <= b, "{}: stamp error {lo:.2}..{hi:.2} ns beyond ±{b} ns", R::NAME);
+    let (lo, hi) = errs
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(l, h), &e| (l.min(e), h.max(e)));
+    assert!(
+        lo >= -b && hi <= b,
+        "{}: stamp error {lo:.2}..{hi:.2} ns beyond ±{b} ns",
+        R::NAME
+    );
     println!("{}: {n} frames, stamp error {lo:.2} .. {hi:.2} ns", R::NAME);
     (lo, hi)
 }
@@ -361,7 +374,10 @@ fn stamps_sweep_every_phase_at_ratio_4_05() {
     // 40.5 ns against 10 ns: the phase moves by a tick per clk_rx cycle,
     // so 60 frames visit every relative phase many times.
     let (lo, hi) = stamp_case::<Rx81>(60, 37);
-    assert!(hi - lo > 8.0, "the sweep should show the full ±1/2 cycle spread");
+    assert!(
+        hi - lo > 8.0,
+        "the sweep should show the full ±1/2 cycle spread"
+    );
 }
 
 #[test]
@@ -383,7 +399,13 @@ fn back_to_back_at_minimum_gap() {
     assert_eq!(out.len(), frames.len(), "no frame lost at minimum gap");
     let errs = check_frames(&frames, &out, &st, &sf, TICK_PS);
     assert!(errs.iter().all(|e| e.abs() <= bound_ns(81)));
-    let mins: Vec<TFrame> = (0..60).map(|_| TFrame { len: 60, err: false, gap: 24 }).collect();
+    let mins: Vec<TFrame> = (0..60)
+        .map(|_| TFrame {
+            len: 60,
+            err: false,
+            gap: 24,
+        })
+        .collect();
     let (out, st, sf) = run_path::<Rx80p5, Sys>(&mins, always, TICK_PS);
     assert_eq!(out.len(), 60);
     check_frames(&mins, &out, &st, &sf, TICK_PS);
@@ -400,7 +422,11 @@ fn orphan_sfds_do_not_misalign_stamps() {
             2 => 1,
             _ => 64,
         };
-        frames.push(TFrame { len, err: false, gap: if len == 0 { 2 } else { 30 } });
+        frames.push(TFrame {
+            len,
+            err: false,
+            gap: if len == 0 { 2 } else { 30 },
+        });
     }
     let (out, st, sf) = run_path::<Rx81, Sys>(&frames, always, TICK_PS);
     let expect = frames.iter().filter(|f| f.len > 0).count();
@@ -427,23 +453,49 @@ fn overflow_cuts_with_err_and_keeps_pairing() {
     // FIFO full at its first byte and is dropped whole. After the stall
     // everything flows again.
     let ready = |c: u64| c > 40_000;
-    let mut frames: Vec<TFrame> = (0..3).map(|_| TFrame { len: 1518, err: false, gap: 24 }).collect();
+    let mut frames: Vec<TFrame> = (0..3)
+        .map(|_| TFrame {
+            len: 1518,
+            err: false,
+            gap: 24,
+        })
+        .collect();
     // The stall (400 us) ends during this idle time (120 us from 370 us).
     frames[2].gap = 3000;
-    frames.extend((0..4).map(|_| TFrame { len: 64, err: false, gap: 3000 }));
+    frames.extend((0..4).map(|_| TFrame {
+        len: 64,
+        err: false,
+        gap: 3000,
+    }));
     let (out, st, sf) = run_path::<Rx81, Sys>(&frames, ready, TICK_PS);
     let errs = check_frames(&frames, &out, &st, &sf, TICK_PS);
     let ids: Vec<usize> = out.iter().map(|f| f.data[0] as usize).collect();
     assert_eq!(ids[0], 0);
-    assert!(!out[0].err && out[0].data.len() == 1518, "the first frame fits whole");
+    assert!(
+        !out[0].err && out[0].data.len() == 1518,
+        "the first frame fits whole"
+    );
     assert_eq!(ids[1], 1);
-    assert!(out[1].err && out[1].data.len() < 1518, "the second is cut with err");
-    assert_eq!(*out[1].data.last().unwrap(), 0, "the terminator byte carries 0");
+    assert!(
+        out[1].err && out[1].data.len() < 1518,
+        "the second is cut with err"
+    );
+    assert_eq!(
+        *out[1].data.last().unwrap(),
+        0,
+        "the terminator byte carries 0"
+    );
     // 2048 words in the FIFO plus the few slots of the channels around it.
     let held = out[0].data.len() + out[1].data.len() - 1;
-    assert!((2048..2048 + 8).contains(&held), "the FIFO was full: {held}");
+    assert!(
+        (2048..2048 + 8).contains(&held),
+        "the FIFO was full: {held}"
+    );
     assert!(!ids.contains(&2), "the third is dropped whole");
-    assert!(ids.ends_with(&[3, 4, 5, 6]), "frames after the stall flow: {ids:?}");
+    assert!(
+        ids.ends_with(&[3, 4, 5, 6]),
+        "frames after the stall flow: {ids:?}"
+    );
     assert!(errs.iter().all(|e| e.abs() <= bound_ns(81)), "{errs:?}");
 }
 
@@ -453,11 +505,21 @@ fn stamp_credits_limit_queued_frames() {
     // with their stamps, the next ones are dropped whole (no credit), and
     // the pairing holds once the consumer resumes.
     let ready = |c: u64| c > 30_000;
-    let mut frames: Vec<TFrame> = (0..STAMP_DEPTH + 6).map(|_| TFrame { len: 64, err: false, gap: 24 }).collect();
+    let mut frames: Vec<TFrame> = (0..STAMP_DEPTH + 6)
+        .map(|_| TFrame {
+            len: 64,
+            err: false,
+            gap: 24,
+        })
+        .collect();
     // A long idle time (400 us) before the last three, which arrive after
     // the stall (300 us).
     frames.last_mut().unwrap().gap = 10_000;
-    frames.extend((0..3).map(|_| TFrame { len: 64, err: false, gap: 100 }));
+    frames.extend((0..3).map(|_| TFrame {
+        len: 64,
+        err: false,
+        gap: 100,
+    }));
     let (out, st, sf) = run_path::<Rx81, Sys>(&frames, ready, TICK_PS);
     let errs = check_frames(&frames, &out, &st, &sf, TICK_PS);
     let ids: Vec<usize> = out.iter().map(|f| f.data[0] as usize).collect();
@@ -467,7 +529,10 @@ fn stamp_credits_limit_queued_frames() {
     // channel (a slot freed); the rest of the burst is dropped whole.
     assert_eq!(ids[..STAMP_DEPTH], (0..STAMP_DEPTH).collect::<Vec<_>>()[..]);
     assert!(ids.ends_with(&[n - 3, n - 2, n - 1]), "{ids:?}");
-    assert!(ids.len() <= STAMP_DEPTH + 1 + 3, "frames beyond the credits were kept: {ids:?}");
+    assert!(
+        ids.len() <= STAMP_DEPTH + 1 + 3,
+        "frames beyond the credits were kept: {ids:?}"
+    );
     assert!(errs.iter().all(|e| e.abs() <= bound_ns(81)), "{errs:?}");
 }
 
@@ -484,15 +549,38 @@ struct Cy {
 }
 
 fn nibbles(pre: usize, payload: &[u8], extra_nib: bool, er: bool) -> Vec<Cy> {
-    let mut v = vec![Cy { d: 5, dv: true, er: false }; pre];
-    v.push(Cy { d: 0xd, dv: true, er: false });
+    let mut v = vec![
+        Cy {
+            d: 5,
+            dv: true,
+            er: false
+        };
+        pre
+    ];
+    v.push(Cy {
+        d: 0xd,
+        dv: true,
+        er: false,
+    });
     for (i, b) in payload.iter().enumerate() {
         let e = er && i == 3;
-        v.push(Cy { d: b & 15, dv: true, er: e });
-        v.push(Cy { d: b >> 4, dv: true, er: false });
+        v.push(Cy {
+            d: b & 15,
+            dv: true,
+            er: e,
+        });
+        v.push(Cy {
+            d: b >> 4,
+            dv: true,
+            er: false,
+        });
     }
     if extra_nib {
-        v.push(Cy { d: 7, dv: true, er: false });
+        v.push(Cy {
+            d: 7,
+            dv: true,
+            er: false,
+        });
     }
     v
 }
@@ -586,4 +674,3 @@ fn with_mii_rx_at_ratio_1() {
         );
     }
 }
-
