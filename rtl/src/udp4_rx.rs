@@ -153,12 +153,7 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp4Rx {
             let endb = last | (is_f & end_len);
 
             // Running sum: seed (pseudo-header) at byte 0, then words.
-            let seed = csum_fold(pseudo_v4(
-                m.src,
-                m.dst,
-                U::<8>::from(PROTO_UDP),
-                m.len,
-            ));
+            let seed = csum_fold(pseudo_v4(m.src, m.dst, U::<8>::from(PROTO_UDP), m.len));
             let base = mux(p0, seed.zext::<32>(), acc);
             let odd = pos.bit(0);
             let lo = b.data.zext::<16>();
