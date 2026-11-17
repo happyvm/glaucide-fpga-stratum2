@@ -47,6 +47,7 @@ Pour qu'une unité soit prouvable, il faut la déclarer dans `rtl/src/bin/formal
 - Toute unité a un test de mutation : un fichier de mutations connues (par exemple inverser un bit de champ) doit faire **échouer** au moins une propriété. Procédure type : `bad.v` dans la validation de `formal_smoke`.
 - **Registre des hypothèses de configuration** (garant = module de configuration T4.1, qui doit les prouver par `check!` de même texte, vérifié par F0.3) :
   - `local_mac` est une adresse unicast (bit de groupe à 0) — utilisé par `eth_rx` (T1.5).
+  - Vérification automatique des correspondances garantie/hypothèse : `tools/formal/contracts.py` (voir `tools/formal/README.md`).
 - Les `assume!` sont limités à : (a) la forme des flux d'entrée définis dans `stream.rs`, (b) les garanties d'un module amont prouvées, (c) l'environnement physique documenté. Tout autre `assume!` est refusé en revue.
 
 ## Catalogue des propriétés par couche

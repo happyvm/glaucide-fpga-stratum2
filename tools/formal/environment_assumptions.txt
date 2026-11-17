@@ -1,0 +1,15 @@
+# Environment assumptions accepted by tools/formal/contracts.py (rule a(ii)).
+#
+# Format: one entry per line, the message exactly as written in the assume!
+# statement, then " # " and the reason / guarantor. An assume! whose message is
+# checked by a check! in another unit does not need an entry here.
+#
+# Stream-contract assumptions (rtl/src/stream.rs) are monitored by task F0.5.
+# The configuration assumption is guaranteed by the configuration module T4.1
+# (docs/formal.md, "Registre des hypothèses de configuration").
+# Entries marked UNREVIEWED must be reviewed by a human.
+
+payload: err only together with last (stream contract 2) # stream contract, F0.5 (rtl/src/eth_tx.rs, rtl/src/tx_arb.rs)
+a frame has at most 1518 bytes (stream contract 3) # stream contract, F0.5 (rtl/src/fcs_check.rs)
+local_mac is a unicast address (group bit clear) # config assumption, guarantor T4.1, see docs/formal.md
+the step is nought, one or two # UNREVIEWED (rtl/src/formal_smoke.rs, toy unit of the smoke test, not classified)
