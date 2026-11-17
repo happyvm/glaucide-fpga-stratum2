@@ -23,7 +23,6 @@
 //! | `UPSTREAM` | `192.0.2.1`, `2001:db8::1`, on; two slots off | `192.0.2.99`, `2001:db8::99`, on; two slots off |
 //! | `POLL_LOG2` | 6 (64 s) | 6 |
 //! | `PRECISION_LOG2` | -24 | -24 |
-//! | `STRATUM_OFFSET` | 1 | 1 |
 //! | `RATE_LIMIT_PER_S` | 8 | 8 |
 //!
 //! The upstream servers of `Board` are the documentation addresses given
@@ -70,7 +69,6 @@
 //! | `up<i>_en` | `Bit` | `UPSTREAM[i].2` (high: slot in use) |
 //! | `poll_log2` | `U<8>` | `POLL_LOG2` |
 //! | `precision` | `U<8>` | `PRECISION_LOG2`, two's complement |
-//! | `stratum_offset` | `U<8>` | `STRATUM_OFFSET` |
 //! | `rate_limit` | `U<16>` | `RATE_LIMIT_PER_S` |
 //!
 //! Timing: each wire is driven at every rising edge of `clk_sys` with a
@@ -120,8 +118,6 @@ pub trait ConfigSet {
     const POLL_LOG2: u8;
     /// Precision of the server, as a power of two of seconds (-24: 40 ns).
     const PRECISION_LOG2: i8;
-    /// Our stratum is the selected source's stratum plus this offset.
-    const STRATUM_OFFSET: u8;
     /// Responses allowed per second and per source before rate limiting.
     const RATE_LIMIT_PER_S: u16;
 }
@@ -146,7 +142,6 @@ impl ConfigSet for Board {
     ];
     const POLL_LOG2: u8 = 6;
     const PRECISION_LOG2: i8 = -24;
-    const STRATUM_OFFSET: u8 = 1;
     const RATE_LIMIT_PER_S: u16 = 8;
 }
 
@@ -173,7 +168,6 @@ impl ConfigSet for Test {
     ];
     const POLL_LOG2: u8 = 6;
     const PRECISION_LOG2: i8 = -24;
-    const STRATUM_OFFSET: u8 = 1;
     const RATE_LIMIT_PER_S: u16 = 8;
 }
 
@@ -290,7 +284,6 @@ impl<C: ConfigSet>
             Out<Bit>,
             Out<U<8>>,
             Out<U<8>>,
-            Out<U<8>>,
             Out<U<16>>,
         ),
     > for Config<C>
@@ -322,7 +315,6 @@ impl<C: ConfigSet>
             up3_en,
             poll_log2,
             precision,
-            stratum_offset,
             rate_limit,
         ): (
             Out<U<48>>,
@@ -346,7 +338,6 @@ impl<C: ConfigSet>
             Out<U<128>>,
             Out<Bit>,
             Out<Bit>,
-            Out<U<8>>,
             Out<U<8>>,
             Out<U<8>>,
             Out<U<16>>,
@@ -396,7 +387,6 @@ impl<C: ConfigSet>
             up3_en.set(Bit::from_bool(C::UPSTREAM[3].2));
             poll_log2.set(U::<8>::new(C::POLL_LOG2 as u128));
             precision.set(U::<8>::new(C::PRECISION_LOG2 as u8 as u128));
-            stratum_offset.set(U::<8>::new(C::STRATUM_OFFSET as u128));
             rate_limit.set(U::<16>::new(C::RATE_LIMIT_PER_S as u128));
         }
     }

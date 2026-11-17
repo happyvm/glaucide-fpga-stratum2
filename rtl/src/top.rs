@@ -771,7 +771,6 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
         let (up3_en_o, _up3_en) = signal::<Bit, DefaultClock>();
         let (poll_log2_o, poll_log2) = signal::<U<8>, DefaultClock>();
         let (precision_o, precision) = signal::<U<8>, DefaultClock>();
-        let (stratum_offset_o, _stratum_offset) = signal::<U<8>, DefaultClock>();
         let (rate_limit_o, rate_limit) = signal::<U<16>, DefaultClock>();
         let local_mac_b = local_mac.clone();
         let local_mac_c = local_mac.clone();
@@ -900,7 +899,6 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
                                 up3_en_o,
                                 poll_log2_o,
                                 precision_o,
-                                stratum_offset_o,
                                 rate_limit_o,
                             ),
                         ),

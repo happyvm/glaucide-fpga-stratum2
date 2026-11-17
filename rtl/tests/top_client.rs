@@ -75,7 +75,6 @@ impl ConfigSet for CliCfg {
     ];
     const POLL_LOG2: u8 = Test::POLL_LOG2;
     const PRECISION_LOG2: i8 = Test::PRECISION_LOG2;
-    const STRATUM_OFFSET: u8 = Test::STRATUM_OFFSET;
     const RATE_LIMIT_PER_S: u16 = Test::RATE_LIMIT_PER_S;
 }
 
@@ -99,7 +98,6 @@ impl ConfigSet for CliCfg4 {
     ];
     const POLL_LOG2: u8 = CliCfg::POLL_LOG2;
     const PRECISION_LOG2: i8 = CliCfg::PRECISION_LOG2;
-    const STRATUM_OFFSET: u8 = CliCfg::STRATUM_OFFSET;
     const RATE_LIMIT_PER_S: u16 = CliCfg::RATE_LIMIT_PER_S;
 }
 
@@ -122,7 +120,6 @@ impl ConfigSet for CliCfg6 {
     ];
     const POLL_LOG2: u8 = CliCfg::POLL_LOG2;
     const PRECISION_LOG2: i8 = CliCfg::PRECISION_LOG2;
-    const STRATUM_OFFSET: u8 = CliCfg::STRATUM_OFFSET;
     const RATE_LIMIT_PER_S: u16 = CliCfg::RATE_LIMIT_PER_S;
 }
 

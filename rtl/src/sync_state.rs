@@ -53,7 +53,10 @@
 //! * `synced = ok`; `leap = 0` if `ok` else 3. v1 does not propagate leap
 //!   seconds (`Selected.leap` is not used: a usable peer has LI < 3 by the
 //!   clock filter and we announce no pending leap second).
-//! * `stratum = S.stratum + 1` (2..=15 by `usable`) if `ok`, else 16.
+//! * `stratum = S.stratum + 1` (2..=15 by `usable`) if `ok`, else 16. The
+//!   `+ 1` is fixed by the protocol (RFC 5905 §7.3: a server is one stratum
+//!   above its source), not a setting: there is no `STRATUM_OFFSET` in
+//!   `config.rs`.
 //! * `ref_id = peer_ref[S.peer]` if `ok`, else the last value (see below).
 //! * `ref_ts = S.upd` if `ok`, else the last value.
 //! * `root_delay = sat32(S.root_delay + sat32(ceil16(S.delay)))`.

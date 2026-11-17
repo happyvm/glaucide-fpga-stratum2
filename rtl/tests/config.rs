@@ -167,7 +167,6 @@ fn test_set_is_the_golden_model() {
     );
     assert_eq!(Test::POLL_LOG2, 6);
     assert_eq!(Test::PRECISION_LOG2, -24);
-    assert_eq!(Test::STRATUM_OFFSET, 1);
 }
 
 /// Decision (orchestrator): the global address is a static constant, not
@@ -201,7 +200,6 @@ struct Wires {
     up: [(In<U<128>>, In<Bit>, In<Bit>); 4],
     poll_log2: In<U<8>>,
     precision: In<U<8>>,
-    stratum_offset: In<U<8>>,
     rate_limit: In<U<16>>,
 }
 
@@ -229,7 +227,6 @@ fn bench<C: ConfigSet + 'static>() -> (Wires, Running<impl std::future::Future<O
     let (u3e_d, u3e) = signal::<Bit, DefaultClock>();
     let (poll_d, poll_log2) = signal::<U<8>, DefaultClock>();
     let (prec_d, precision) = signal::<U<8>, DefaultClock>();
-    let (strat_d, stratum_offset) = signal::<U<8>, DefaultClock>();
     let (rate_d, rate_limit) = signal::<U<16>, DefaultClock>();
 
     let c: &'static mut Config<C> = Box::leak(Box::default());
@@ -259,7 +256,6 @@ fn bench<C: ConfigSet + 'static>() -> (Wires, Running<impl std::future::Future<O
             u3e_d,
             poll_d,
             prec_d,
-            strat_d,
             rate_d,
         ),
     ));
@@ -281,7 +277,6 @@ fn bench<C: ConfigSet + 'static>() -> (Wires, Running<impl std::future::Future<O
         ],
         poll_log2,
         precision,
-        stratum_offset,
         rate_limit,
     };
     (wires, sim)
@@ -312,7 +307,6 @@ fn sample(w: &Wires) -> Vec<u128> {
     v.extend([
         w.poll_log2.get().raw(),
         w.precision.get().raw(),
-        w.stratum_offset.get().raw(),
         w.rate_limit.get().raw(),
     ]);
     v
@@ -350,7 +344,6 @@ fn board_wires_carry_the_board_constants() {
                 0,
                 6,
                 0xE8, // -24 in two's complement
-                1,
                 8,
             ]
         );
@@ -388,7 +381,6 @@ fn test_wires_carry_the_golden_constants() {
                 0,
                 6,
                 0xE8,
-                1,
                 8,
             ]
         );
