@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Table-driven tests of the Ethernet filter and classifier (T1.5).
 use ntp_fpga::eth_rx::{EthMeta, EthRx};
-use ntp_fpga::stream::FrameByte;
+use ntp_fpga::stream::{FrameByte, Ts};
 use txhdl::comp::{chan, signal, DefaultClock, Running, Unit};
 use txhdl::types::U;
 
@@ -14,6 +14,11 @@ const SRC: u64 = 0x0200_0000_0042;
 const ARP: u16 = 0x0806;
 const V4: u16 = 0x0800;
 const V6: u16 = 0x86dd;
+
+/// Stamp of the `k`-th input frame (distinct per frame).
+fn stamp(k: usize) -> u64 {
+    0x5EED_0000_0000_0000 | ((k as u64) << 16) | 0xbeef
+}
 
 /// One input frame (no FCS) and the err flag of its `last`.
 #[derive(Clone)]
@@ -46,6 +51,7 @@ struct Meta {
     src: u64,
     et: u16,
     mc: bool,
+    ts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,10 +86,11 @@ fn run(
     let (v4p_t, v4p) = chan::<FrameByte, DefaultClock>();
     let (v6m_t, v6m) = chan::<EthMeta, DefaultClock>();
     let (v6p_t, v6p) = chan::<FrameByte, DefaultClock>();
+    let (st_tx, st_rx) = chan::<Ts, DefaultClock>();
     mac_o.set(U::<48>::from(MAC));
     sn_o.set(U::<24>::from(SN));
     let mut dut = EthRx::default();
-    let mut sim = Running::new(dut.run((in_rx, mac, sn), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)));
+    let mut sim = Running::new(dut.run((in_rx, mac, sn, st_rx), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)));
     // The input as a stream of (byte, idle-before) items.
     let mut q: Vec<Option<FrameByte>> = vec![];
     for f in frames {
@@ -97,8 +104,14 @@ fn run(
     }
     let mut out = Out::default();
     let mut next = 0;
+    let mut next_st = 0;
     let total = q.len() * 40 + 400;
     for t in 0..total {
+        // One stamp per input frame, in order, delivered ahead of its frame.
+        if next_st < frames.len() && st_tx.ready().to_bool() {
+            st_tx.send(Ts::from(stamp(next_st)));
+            next_st += 1;
+        }
         if next < q.len() {
             match q[next] {
                 None => next += 1,
@@ -121,6 +134,7 @@ fn run(
                         src: m.src.raw() as u64,
                         et: m.ethertype.raw() as u16,
                         mc: m.multicast.to_bool(),
+                        ts: m.ts.raw() as u64,
                     });
                 }
             }
@@ -420,4 +434,37 @@ fn other_solicited_node_group_is_dropped() {
         all,
         all,
     );
+}
+
+/// Each forwarded frame carries the stamp of its own frame, whatever was
+/// dropped before it (wrong MAC, unknown EtherType, runts, empty payload).
+#[test]
+fn stamp_follows_its_frame_across_drops() {
+    let frames = vec![
+        ok(frame(0x0223_0000_0001, V4, &pl(20, 1))), // 0: wrong MAC, dropped
+        ok(frame(MAC, V4, &pl(20, 2))),              // 1: IPv4
+        ok(frame(MAC, 0x1234, &pl(20, 3))),          // 2: unknown EtherType
+        ok(pl(5, 4)),                                // 3: runt (ends before byte 14)
+        ok(frame(BCAST, ARP, &pl(28, 5))),           // 4: ARP
+        ok(frame(MAC, V6, &[])),                     // 5: empty payload
+        ok(pl(1, 6)),                                // 6: one byte
+        ok(frame(SOLNODE, V6, &pl(40, 7))),          // 7: IPv6
+        ok(frame(BCAST, V6, &pl(40, 8))),            // 8: IPv6 to broadcast, dropped
+        ok(frame(MAC, V4, &pl(30, 9))),              // 9: IPv4
+        ok(pl(14, 10)),                              // 10: header only
+        ok(frame(ALLNODES, V6, &pl(41, 11))),        // 11: IPv6
+    ];
+    let want: [(usize, usize); 5] = [(1, 1), (0, 4), (2, 7), (1, 9), (2, 11)];
+    let pats: [&dyn Fn(usize, usize) -> bool; 2] = [&all, &|t, c| (t + c) % 3 != 0];
+    for gap in [0, 3] {
+        for p in pats {
+            let o = run(&frames, gap, p, p);
+            for c in 0..3 {
+                let w: Vec<usize> = want.iter().filter(|e| e.0 == c).map(|e| e.1).collect();
+                let got: Vec<u64> = o.meta[c].iter().map(|m| m.ts).collect();
+                let exp: Vec<u64> = w.iter().map(|&k| stamp(k)).collect();
+                assert_eq!(got, exp, "stamps on channel {c}, gap {gap}");
+            }
+        }
+    }
 }

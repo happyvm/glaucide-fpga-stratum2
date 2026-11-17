@@ -3,8 +3,22 @@
 //! from `ClkRx` is T1.4's job).
 //!
 //! Ports: `raw` (`Rx<FrameByte>`, raw frame, FCS included, as `mii_rx`
-//! emits it) in; `frames` (`Tx<FrameByte>`, same frame without its 4 FCS
-//! bytes) out.
+//! emits it), `pick` (formal witness wire) and `stamps_in` (`Rx<Ts>`, the
+//! `stamps` of `rx_path`) in; `frames` (`Tx<FrameByte>`, same frame without
+//! its 4 FCS bytes) and `stamps_out` (`Tx<Ts>`) out.
+//!
+//! # Receive timestamp (T1.13)
+//!
+//! One stamp is popped from `stamps_in` per raw frame, when its first byte
+//! is taken, and held in `ts`. `rx_path` delivers a frame's stamp no later
+//! than its first byte, so in the normal case this never stalls; if the
+//! stamp is late the first byte simply waits (input stalls) until it
+//! arrives, and if it never comes the unit waits forever. The stamp is
+//! forwarded on `stamps_out` in the cycle the first byte of the output
+//! frame is emitted, if and only if the frame emits anything (raw length
+//! >= 5); a runt frame drops its stamp with it. That cycle also needs
+//! `stamps_out.ready()`: otherwise the input stalls. Order is preserved:
+//! one stamp out per output frame, in frame order.
 //!
 //! # Behaviour
 //!
@@ -42,7 +56,7 @@
 //! `assume!` is the frame length limit of the stream contract. Monitors
 //! (`m_*`) only feed `check!`/`cover!` and are pruned in synthesis.
 use crate::crc32::{crc32_step, INIT, RESIDUE};
-use crate::stream::FrameByte;
+use crate::stream::{FrameByte, Ts};
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{assume, check, cover, lower, with, Trace};
@@ -58,6 +72,8 @@ pub struct FcsCheck {
     pub fill: Reg<U<3>>,
     /// CRC register over the bytes of the frame so far (pre-complement).
     pub crc: Reg<U<32>>,
+    /// Stamp of the frame in progress (popped with its first byte).
+    pub ts: Reg<Ts>,
     // Monitors.
     /// Raw bytes taken in the current frame.
     pub m_in: Reg<U<11>>,
@@ -83,6 +99,7 @@ impl Default for FcsCheck {
             d3: Reg::default(),
             fill: Reg::default(),
             crc: Reg::new(INIT),
+            ts: Reg::default(),
             m_in: Reg::default(),
             m_out: Reg::default(),
             m_first: Reg::default(),
@@ -94,8 +111,12 @@ impl Default for FcsCheck {
 }
 
 #[lower]
-impl Unit<(Rx<FrameByte>, In<U<11>>), Tx<FrameByte>> for FcsCheck {
-    async fn run(&mut self, (raw, pick): (Rx<FrameByte>, In<U<11>>), frames: Tx<FrameByte>) {
+impl Unit<(Rx<FrameByte>, In<U<11>>, Rx<Ts>), (Tx<FrameByte>, Tx<Ts>)> for FcsCheck {
+    async fn run(
+        &mut self,
+        (raw, pick, stamps_in): (Rx<FrameByte>, In<U<11>>, Rx<Ts>),
+        (frames, stamps_out): (Tx<FrameByte>, Tx<Ts>),
+    ) {
         loop {
             DefaultClock::rising().await;
             // Invariants, emitted in every cycle (the k-induction needs
@@ -174,9 +195,15 @@ impl Unit<(Rx<FrameByte>, In<U<11>>), Tx<FrameByte>> for FcsCheck {
 
             // A byte is taken when it can go on: always while the delay
             // line fills (nothing is emitted), else when `frames` has room.
-            let take = !full | frames.ready();
+            // The first byte of a frame also needs its stamp; the first
+            // output byte also needs room on `stamps_out`.
+            let first = Bit::from(m_in == 0);
+            let st_ok = !first | Bit::from(stamps_in.peek().is_some());
+            let first_out = full & Bit::from(m_out == 0);
+            let take = (!full | frames.ready()) & st_ok & (!first_out | stamps_out.ready());
             let r = raw.recv_if(take);
             let got = Bit::from(r.is_some());
+            let new_ts = stamps_in.recv_if(got & first).unwrap_or_default();
             let b = r.unwrap_or_default();
             assume!(
                 !got | (m_in < 1518) | b.last,
@@ -209,6 +236,9 @@ impl Unit<(Rx<FrameByte>, In<U<11>>), Tx<FrameByte>> for FcsCheck {
                 "the byte emitted at output position p is the byte taken at input position p"
             );
             cover!(emit & (m_out.zext::<12>() == p12) & (p != 0), "position p is emitted (p not 0)");
+            if (emit & first_out).to_bool() {
+                stamps_out.send(self.ts.get());
+            }
             if emit.to_bool() {
                 frames.send(FrameByte {
                     data: self.d3.get(),
@@ -226,7 +256,10 @@ impl Unit<(Rx<FrameByte>, In<U<11>>), Tx<FrameByte>> for FcsCheck {
                     m_in: m_in + 1,
                 },
                 got & !full ? fill: fill + 1,
-                got & (m_in == 0) ? m_first: b.data,
+                got & (m_in == 0) ? {
+                    m_first: b.data,
+                    ts: new_ts,
+                },
                 emit ? m_out: m_out + 1,
                 !gset ? g_p: pick.get(),
                 !gset ? g_set: Bit::One,

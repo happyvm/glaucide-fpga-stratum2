@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Tests of the FCS checker (T1.12).
 use ntp_fpga::fcs_check::FcsCheck;
-use ntp_fpga::stream::FrameByte;
+use ntp_fpga::stream::{FrameByte, Ts};
 use txhdl::comp::{chan, signal, DefaultClock, Running, Unit};
 use txhdl::types::U;
 
@@ -58,15 +58,42 @@ fn run(input: &[FrameByte], take: impl Fn(usize) -> bool) -> Vec<Got> {
 /// the proof quantifies over) held at `pick`: the in-simulation `check!`s of
 /// the delay line run for that position too.
 fn run_pick(input: &[FrameByte], take: impl Fn(usize) -> bool, pick: u16) -> Vec<Got> {
+    run_full(input, take, pick).0
+}
+
+/// Stamp of the `k`-th raw frame of a test stream.
+fn stamp(k: usize) -> u64 {
+    0xA5A5_0000_0000_0000 | ((k as u64) << 8) | 0x5c
+}
+
+/// Same, one stamp per raw frame fed on `stamps_in` (one per cycle, ahead of
+/// the bytes of its frame); returns the output bytes and `stamps_out`.
+fn run_full(
+    input: &[FrameByte],
+    take: impl Fn(usize) -> bool,
+    pick: u16,
+) -> (Vec<Got>, Vec<u64>) {
+    let n_frames = input.iter().filter(|b| b.last.to_bool()).count();
+    let (stx, srx) = chan::<Ts, DefaultClock>();
+    let (sotx, sorx) = chan::<Ts, DefaultClock>();
+    let mut stamps_out = Vec::new();
+    let mut next_stamp = 0;
     let (tx, rx) = chan::<FrameByte, DefaultClock>();
     let (otx, orx) = chan::<FrameByte, DefaultClock>();
     let (pick_out, pick_in) = signal::<U<11>, DefaultClock>();
     pick_out.set(U::<11>::from(pick));
     let mut m = FcsCheck::default();
-    let mut sim = Running::new(m.run((rx, pick_in), otx));
+    let mut sim = Running::new(m.run((rx, pick_in, srx), (otx, sotx)));
     let mut next = 0;
     let mut out = Vec::new();
     for t in 0..input.len() * 4 + 30 {
+        if next_stamp < n_frames && stx.ready().to_bool() {
+            stx.send(Ts::from(stamp(next_stamp)));
+            next_stamp += 1;
+        }
+        if let Some(s) = sorx.recv() {
+            stamps_out.push(s.raw() as u64);
+        }
         if next < input.len() && tx.ready().to_bool() {
             tx.send(input[next]);
             next += 1;
@@ -83,7 +110,7 @@ fn run_pick(input: &[FrameByte], take: impl Fn(usize) -> bool, pick: u16) -> Vec
         sim.cycle();
     }
     assert_eq!(next, input.len(), "all input bytes were accepted");
-    out
+    (out, stamps_out)
 }
 
 /// Stream contract on the output: err only with last, one last per frame
@@ -285,5 +312,44 @@ fn delay_line_checks_hold_for_every_position() {
     for pick in 0..80u16 {
         let out = run_pick(&bytes(&raw, false), |_| true, pick);
         assert_eq!(data(&out), raw[..raw.len() - 4].to_vec(), "pick {pick}");
+    }
+}
+
+/// One stamp out per emitted frame, in order, each the stamp of ITS frame:
+/// runts (raw length < 5) drop their stamp with them.
+#[test]
+fn stamps_follow_emitted_frames_only() {
+    // (payload length without FCS, or raw length of a runt), kind.
+    // Frame k of the stream gets `stamp(k)`.
+    let kinds: [(usize, bool); 9] = [
+        (60, false),
+        (3, true),
+        (30, false),
+        (1, true),
+        (0, true), // raw frame of 4 bytes is built below as a runt of 4
+        (46, false),
+        (2, true),
+        (20, false),
+        (4, true),
+    ];
+    let mut input = Vec::new();
+    let mut expect = Vec::new();
+    for (k, &(n, runt)) in kinds.iter().enumerate() {
+        let raw = if runt {
+            // Runts: 1..=4 raw bytes (n = 0 stands for 4 bytes).
+            body(if n == 0 { 4 } else { n.min(4) })
+        } else {
+            with_fcs(&body(n))
+        };
+        input.extend(bytes(&raw, false));
+        if !runt {
+            expect.push(stamp(k));
+        }
+    }
+    let patterns: [&dyn Fn(usize) -> bool; 3] = [&|_| true, &|t| t % 3 == 0, &|t| t % 7 < 2];
+    for p in patterns {
+        let (o, st) = run_full(&input, p, 0);
+        assert_eq!(frames(&o).len(), expect.len(), "one frame per non-runt");
+        assert_eq!(st, expect, "one stamp per emitted frame, in order");
     }
 }

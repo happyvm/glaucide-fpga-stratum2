@@ -122,6 +122,8 @@ pub struct Ip6Meta {
     pub eth_src: U<48>,
     /// The destination is a multicast address (solicited-node group).
     pub multicast: Bit,
+    /// Receive timestamp of the frame (copied from `EthMeta.ts`).
+    pub rx_ts: U<64>,
 }
 
 #[derive(Trace, Default)]
@@ -136,6 +138,8 @@ pub struct Ipv6Rx {
     pub src: Reg<U<128>>,
     pub dst: Reg<U<128>>,
     pub esrc: Reg<U<48>>,
+    /// Receive timestamp of the frame in progress (from `EthMeta.ts`).
+    pub ets: Reg<U<64>>,
     pub edst: Reg<U<48>>,
     /// Payload bytes left, the current one included (while forwarding).
     pub rem: Reg<U<16>>,
@@ -253,6 +257,7 @@ impl
                 hop: self.hop.get(),
                 eth_src: self.esrc.get(),
                 multicast: sn,
+                rx_ts: self.ets.get(),
             };
             let m_icmp = take & dec_icmp;
             let m_udp = take & dec_udp;
@@ -285,6 +290,7 @@ impl
                 take ? ok: ok_n,
                 take & p0 ? {
                     esrc: m.src,
+                    ets: m.ts,
                     edst: m.dst,
                 },
                 take & p4 ? plen: b.data.zext::<16>() << 8u32,

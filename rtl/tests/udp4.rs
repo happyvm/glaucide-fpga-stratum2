@@ -8,7 +8,7 @@ use ntp_fpga::eth_rx::{EthMeta, EthRx};
 use ntp_fpga::eth_tx::{EthHdr, EthTx};
 use ntp_fpga::ipv4_rx::{IpMeta, Ipv4Rx};
 use ntp_fpga::ipv4_tx::{IpTxReq, Ipv4Tx};
-use ntp_fpga::stream::{FrameByte, Meta};
+use ntp_fpga::stream::{FrameByte, Meta, Ts};
 use ntp_fpga::tx_arb::TxArb;
 use ntp_fpga::udp4_rx::Udp4Rx;
 use ntp_fpga::udp4_tx::{Udp4Tx, UdpTxReq};
@@ -566,6 +566,7 @@ fn rx_run(inp: &[RxIn], gap: usize, take: impl Fn(usize) -> bool) -> RxOut {
                                     len: U::<16>::from(x.len),
                                     eth_src: U::<48>::from(x.eth_src),
                                     ttl: U::<8>::from(64u8),
+                                    rx_ts: U::<64>::from(0u64),
                                 });
                                 meta_sent[i] = true;
                             } else {
@@ -863,6 +864,11 @@ struct Chain {
     seen: Vec<(Meta, Vec<u8>, bool)>,
 }
 
+/// Stamp fed with the `k`-th frame of [`chain`] (distinct per frame).
+fn chain_stamp(k: usize) -> u64 {
+    0x4E54_5000_0000_0000 | ((k as u64) << 20) | 0x123
+}
+
 /// Feed `frames` (no FCS); the stand-in answers every clean NTP payload with
 /// the next entry of `replies` (payload bytes of the answer, ports swapped,
 /// to the sender's MAC and address).
@@ -909,6 +915,7 @@ fn chain(
     let (oh_t, oh) = chan::<EthHdr, DefaultClock>();
     let (opl_t, opl) = chan::<FrameByte, DefaultClock>();
     let (f_t, f_r) = chan::<FrameByte, DefaultClock>();
+    let (st_t, st_r) = chan::<Ts, DefaultClock>();
     let (mut d_eth, mut d_rx, mut d_urx, mut d_utx, mut d_itx, mut d_arb, mut d_etx) = (
         EthRx::default(),
         Ipv4Rx::default(),
@@ -921,7 +928,7 @@ fn chain(
     let mut sim = Running::new(join2(
         join2(
             join2(
-                d_eth.run((in_r, mac, sn), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)),
+                d_eth.run((in_r, mac, sn, st_r), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)),
                 d_rx.run((v4m, v4p, ip1), (im_t, i_t, um_t, u_t)),
             ),
             join2(
@@ -949,6 +956,7 @@ fn chain(
     }
     let mut out = Chain::default();
     let mut next = 0;
+    let mut next_st = 0;
     let mut cur_meta: Option<Meta> = None;
     let mut cur_pay: Vec<u8> = vec![];
     let mut metas: Vec<Meta> = vec![];
@@ -960,6 +968,11 @@ fn chain(
     let mut n_ans = 0;
     let total = q.len() * 6 + 6000 + replies.len() * 400;
     for t in 0..total {
+        // One receive stamp per frame, in order (T1.13).
+        if next_st < frames.len() && st_t.ready().to_bool() {
+            st_t.send(Ts::from(chain_stamp(next_st)));
+            next_st += 1;
+        }
         if next < q.len() {
             match q[next] {
                 None => next += 1,
@@ -1127,6 +1140,45 @@ fn chain_negative_vectors() {
             assert_eq!(f.len(), 14 + 76 + 4, "{name}: frame length");
             let _ = w;
         }
+    }
+}
+
+/// Interleaved ARP, ICMP, NTP, other-port and foreign-MAC frames, each with
+/// its own stamp: the `Meta.rx_ts` of every NTP datagram is the stamp of the
+/// frame that carried it (T1.13).
+#[test]
+fn chain_rx_ts_follows_its_frame() {
+    let first = |name: &str| {
+        vector(name)
+            .into_iter()
+            .filter(|(r, _)| *r)
+            .map(|(_, f)| f)
+            .collect::<Vec<_>>()
+    };
+    let ntp = first("ntp4_basic.hex")[0].clone();
+    let other = first("neg_udp_port.hex")[1].clone(); // port 9999
+    let arp = first("arp_request_reply.hex")[0].clone();
+    let icmp = first("ping4.hex")[0].clone();
+    let foreign = first("neg_foreign_mac.hex")[1].clone();
+    let tx = vector("ntp4_basic.hex").into_iter().find(|(r, _)| !*r).unwrap().1;
+    let reply = tx[42..].to_vec();
+    let frames = vec![
+        arp.clone(),     // 0
+        ntp.clone(),     // 1 NTP
+        icmp.clone(),    // 2
+        other.clone(),   // 3
+        foreign.clone(), // 4
+        ntp.clone(),     // 5 NTP
+        other.clone(),   // 6
+        arp.clone(),     // 7
+        icmp.clone(),    // 8
+        ntp.clone(),     // 9 NTP
+    ];
+    let want: Vec<u64> = [1usize, 5, 9].iter().map(|&k| chain_stamp(k)).collect();
+    for (gap, tk) in [(0usize, 0usize), (1, 1)] {
+        let o = chain(&frames, &vec![reply.clone(); 3], gap, |t| tk == 0 || t % 3 != 0);
+        let got: Vec<u64> = o.seen.iter().map(|s| s.0.rx_ts.raw() as u64).collect();
+        assert_eq!(got, want, "gap {gap}");
     }
 }
 
