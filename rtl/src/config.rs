@@ -365,6 +365,14 @@ impl<C: ConfigSet>
                 U::<24>::new(Self::SN as u128) == U::<24>::new((Self::GUA & 0xFF_FFFF) as u128),
                 "sn_low is the low 24 bits of both of our IPv6 addresses"
             );
+            check!(
+                U::<8>::new((C::GATEWAY_IP6 >> 120) as u128) != U::<8>::new(0xFF),
+                "the IPv6 gateway is not a multicast address (ff00::/8)"
+            );
+            check!(
+                U::<128>::new(C::GATEWAY_IP6) != U::<128>::new(0),
+                "the IPv6 gateway is not the unspecified address ::"
+            );
             local_mac.set(U::<48>::new(C::LOCAL_MAC as u128));
             local_ip4.set(U::<32>::new(C::LOCAL_IP4 as u128));
             local_ll.set(U::<128>::new(Self::LL));
