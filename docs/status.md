@@ -34,6 +34,14 @@ Serveur NTP **stratum 2, IPv4 + IPv6**, entièrement en logique, sur Arty A7-100
 - Le client suppose un chemin d'émission libre pour prédire T1 (corrigé par l'étalement des créneaux).
 - **Rien n'a tourné sur la carte ni dans Vivado** : le script `tools/vivado/build.tcl`, le timing à 100 MHz, les croisements d'horloge (BUFG/BUFGCE sur les horloges du PHY), le front de capture TX du PHY et la latence du PHY ne sont pas vérifiés.
 
+## Constats de la rédaction du guide de mise en service (T5.4)
+- **L'asymétrie de latence du PHY est invisible à NTP** : une carte à la fois client et serveur du même hôte ramène l'offset vu par l'hôte à environ 0 quel que soit le biais d'horodatage. Seule la somme des latences RX + TX est observable ; les biais ne peuvent pas être réglés par le seul offset. `docs/bringup.md` §5.3 donne le raisonnement (à confirmer) ; le design n'a pas de sortie PPS.
+- **Le servo ne saute l'horloge qu'à l'état initial.** Ensuite un grand décalage est résorbé en glissement (500 ppm au plus, soit 0,5 ms par seconde) ; pendant ce temps `synced = 0`. Un nouveau saut demande un reset.
+- `kod_enable` est à 0 (silence quand la limite est dépassée) et le client ne se met pas en retrait sur un KoD amont.
+- Les requêtes de contrôle `ntpq` (mode 6) ne reçoivent pas de réponse : le serveur ne traite que le mode 3.
+- Avec la config `Board`, l'amont IPv6 passe par `fe80::1` : `2001:db8::1` n'est pas dans le /64 de la carte.
+- Le script `build.tcl` écrit le bitstream avant le verdict de timing : un échec laisse quand même un `arty_ntp.bit`.
+
 ## Reste à faire
 1. **Sur machine avec Vivado** : `tools/vivado/README.md` ; revue de timing (T5.3). Points chauds : graine de checksum IPv6 (chaîne d'additions), multiplieurs de `ntp_server`/`selection`/`servo`.
 2. **Mise en service** (T5.4) : mesures contre chrony/ntpd, carte contre carte, latence PHY à ajouter aux biais.

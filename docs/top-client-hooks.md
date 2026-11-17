@@ -107,7 +107,7 @@ pour `ClientSync`, 1 600 pour le client et le cache ; le reste est surtout dans 
    `flush` (relié à 0) et la résolution d'une autre adresse IPv4 reste bloquée. Sans effet avec un seul
    amont IPv4 ou une seule passerelle, gênant avec deux sauts IPv4 dont un muet.
 4. Pas de vieillissement dans les caches ARP et de voisins (`flush` à 0).
-5. `STRATUM_OFFSET` n'est toujours lu par personne (`SyncState` annonce `stratum + 1`).
+5. `STRATUM_OFFSET` n'existe plus : le `+ 1` du stratum est fixé par le protocole dans `SyncState`.
 6. `poll_log2` du client et du servo vient de la configuration (pas d'adaptation).
 7. Le démultiplexeur NTP bloque en tête de file (une réponse cliente non prise retient les requêtes
    serveur derrière elle ; le client prend ses réponses en quelques cycles).
