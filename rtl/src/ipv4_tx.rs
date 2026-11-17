@@ -94,6 +94,27 @@ pub struct IpTxReq {
     pub len: U<16>,
 }
 
+/// Header checksum of an IPv4 header with version 4, IHL 5, DSCP 0, identification 0,
+/// flags DF, TTL [`TTL`], source `ip`, destination `dst`, `total` = total length:
+/// the complement of the folded one's complement sum of the ten 16-bit words with
+/// the checksum field at zero (RFC 791, RFC 1071). Pure function, proved against
+/// the RFC 1071 verification form by `ipv4_hdr_equiv` (formal).
+#[lower]
+pub fn ipv4_hdr_cksum(ip: U<32>, dst: U<32>, proto: U<8>, total: U<16>) -> U<16> {
+    let w_ver = U::<16>::from(0x4500u16);
+    let w_df = U::<16>::from(0x4000u16);
+    let w_ttl = U::<16>::from((TTL as u16) << 8) | proto.zext::<16>();
+    let s0 = csum_add(U::<32>::from(0u32), w_ver);
+    let s1 = csum_add(s0, total);
+    let s2 = csum_add(s1, w_df);
+    let s3 = csum_add(s2, w_ttl);
+    let s4 = csum_add(s3, ip.slice::<16, 16>());
+    let s5 = csum_add(s4, ip.slice::<0, 16>());
+    let s6 = csum_add(s5, dst.slice::<16, 16>());
+    let s7 = csum_add(s6, dst.slice::<0, 16>());
+    !csum_fold(s7)
+}
+
 const IDLE: u8 = 0;
 const HDR: u8 = 1;
 const PAY: u8 = 2;
@@ -154,15 +175,7 @@ impl Unit<(Rx<IpTxReq>, Rx<FrameByte>, In<U<32>>), (Tx<EthHdr>, Tx<FrameByte>)> 
             let w_ver = U::<16>::from(0x4500u16);
             let w_df = U::<16>::from(0x4000u16);
             let w_ttl = U::<16>::from((TTL as u16) << 8) | r.proto.zext::<16>();
-            let s0 = csum_add(U::<32>::from(0u32), w_ver);
-            let s1 = csum_add(s0, total);
-            let s2 = csum_add(s1, w_df);
-            let s3 = csum_add(s2, w_ttl);
-            let s4 = csum_add(s3, ip.slice::<16, 16>());
-            let s5 = csum_add(s4, ip.slice::<0, 16>());
-            let s6 = csum_add(s5, r.dst_ip.slice::<16, 16>());
-            let s7 = csum_add(s6, r.dst_ip.slice::<0, 16>());
-            let ck = !csum_fold(s7);
+            let ck = ipv4_hdr_cksum(ip, r.dst_ip, r.proto, total);
             let image_a = (w_ver.zext::<128>() << 112u32)
                 | (total.zext::<128>() << 96u32)
                 | (w_df.zext::<128>() << 64u32)
