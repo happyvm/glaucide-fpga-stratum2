@@ -2,6 +2,7 @@
 //! NTP server on Arty A7-100T, written in TxHDL.
 pub mod clock;
 pub mod clocks;
+pub mod arp;
 pub mod crc32;
 pub mod crc_equiv;
 pub mod csum;
