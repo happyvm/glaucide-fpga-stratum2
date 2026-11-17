@@ -132,7 +132,7 @@ use crate::nbr_cache::NbrCache;
 use crate::ntp_client::NtpClient;
 use crate::ntp_demux::NtpDemux;
 use crate::ntp_reply_route::{ps_to_ntp, NtpReplyRoute, TX_LATENCY_V4, TX_LATENCY_V6};
-use crate::ntp_server::{NtpReplyMeta, NtpServer};
+use crate::ntp_server::{NtpReplyMeta, NtpServer, rl_mult, RL_LEAK_Q16};
 use crate::ntp_types::Sample;
 use crate::rx_path::RxPath;
 use crate::stream::{FrameByte, Meta, Ts};
@@ -639,6 +639,8 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>
                                     tx_latency,
                                     rate_limit,
                                     tie(Bit::Zero),
+                                    tie(U::<64>::new(rl_mult(C::RATE_SECRET) as u128)),
+                                    tie(U::<16>::from(RL_LEAK_Q16)),
                                 ),
                                 (rm_tx, rp_tx),
                             ),

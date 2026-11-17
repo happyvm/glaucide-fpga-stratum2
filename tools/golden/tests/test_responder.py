@@ -161,6 +161,24 @@ class ResponderTest(unittest.TestCase):
         self.assertEqual((r.root_delay, r.root_dispersion), (CFG.root_delay, CFG.root_dispersion))
         self.assertGreaterEqual(r.xmit_ts, r.recv_ts)
 
+    def test_ntp_source_port_rule_n1b(self):
+        # N1b (F8): source ports 0, 7, 13, 17, 19, 37 get no answer; any other does.
+        req = V.ntp_request(self.rng)
+        for sport in (0, 7, 13, 17, 19, 37):
+            u = udp.UdpDatagram(sport, 123, req).build(V.CLI_IP4, V.SRV_IP4)
+            ip = ipv4.IPv4Packet(V.CLI_IP4, V.SRV_IP4, ipv4.PROTO_UDP, u).build()
+            fr = V._wire(eth.EthFrame(V.SRV_MAC, V.CLI_MAC, eth.ETHERTYPE_IPV4, ip).build())
+            self.assertEqual(respond(fr, CFG), [], sport)
+            u6 = udp.UdpDatagram(sport, 123, req).build(V.CLI_GUA, V.SRV_GUA)
+            ip6 = ipv6.IPv6Packet(V.CLI_GUA, V.SRV_GUA, ipv6.NH_UDP, u6).build()
+            fr6 = V._wire(eth.EthFrame(V.SRV_MAC, V.CLI_MAC, eth.ETHERTYPE_IPV6, ip6).build())
+            self.assertEqual(respond(fr6, CFG), [], sport)
+        for sport in (1, 6, 8, 12, 18, 20, 36, 38, 123, 1024, 40000, 65535):
+            u = udp.UdpDatagram(sport, 123, req).build(V.CLI_IP4, V.SRV_IP4)
+            ip = ipv4.IPv4Packet(V.CLI_IP4, V.SRV_IP4, ipv4.PROTO_UDP, u).build()
+            fr = V._wire(eth.EthFrame(V.SRV_MAC, V.CLI_MAC, eth.ETHERTYPE_IPV4, ip).build())
+            self.assertEqual(len(respond(fr, CFG)), 1, sport)
+
     def test_ntp_v6(self):
         for dst, src in ((V.SRV_GUA, V.CLI_GUA), (V.SRV_LL, V.CLI_LL)):
             req = V.ntp_request(self.rng)

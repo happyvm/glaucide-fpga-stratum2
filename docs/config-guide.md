@@ -25,6 +25,7 @@ contrôle des 24 bits (section 4) a produit l'erreur de compilation citée. Rien
 | `POLL_LOG2` | `u8` | intervalle d'interrogation en puissance de deux secondes (6 = 64 s) | 4 à 10 : vérifié à la compilation |
 | `PRECISION_LOG2` | `i8` | champ *precision* des réponses (-24 = environ 60 ns) | non vérifié |
 | `RATE_LIMIT_PER_S` | `u16` | réponses autorisées par seconde et par source | 0 = illimité |
+| `RATE_SECRET` | `u64` | clé secrète du hachage du limiteur de débit (qui décide de la case de chaque source) | **choisir une valeur aléatoire par déploiement** (`python3 -c 'import secrets; print(hex(secrets.randbits(64)))'`), ne pas la publier ; 0 déconseillé ; les valeurs de `Board` et `Test` sont publiques |
 
 ### Ce que `config.rs` en déduit
 
@@ -160,6 +161,7 @@ impl ConfigSet for MonReseau {
     const POLL_LOG2: u8 = 6;
     const PRECISION_LOG2: i8 = -24;
     const RATE_LIMIT_PER_S: u16 = 8;
+    const RATE_SECRET: u64 = 0x0123_4567_89AB_CDEF; // à remplacer par une valeur aléatoire
 }
 const _: () = Checks::<MonReseau>::OK;
 ```
@@ -209,8 +211,9 @@ alors 3). Pour la mise en service, voir [bringup.md](bringup.md).
    d'adresse en double (pas de sonde ARP).
 5. **Limite de débit** : `RATE_LIMIT_PER_S = 8` par source. Fenêtres d'une seconde calées sur les secondes NTP :
    un client en `minpoll 0` (1 requête par seconde) passe, un test de charge depuis une seule adresse non.
-   La limite est par adresse IPv4, par /64 en IPv6, avec une table de 64 mots : des sources différentes peuvent
-   partager un compteur. 0 désactive la limite (à ne pas faire sur un réseau exposé).
+   La limite est par adresse IPv4, par /64 en IPv6, avec une table de 4 096 mots indexée par un hachage à clé
+   secrète (`RATE_SECRET`) : des sources différentes peuvent encore partager un compteur, mais pas par choix d'un
+   attaquant. Au-delà de la limite, une requête sur 16 reçoit quand même une réponse (fuite, `RL_LEAK_LOG2`). 0 désactive la limite (à ne pas faire sur un réseau exposé).
 6. **Résolution ARP/NS en panne** : un amont IPv4 hors du masque passe par la passerelle ; si la passerelle ne
    répond pas à l'ARP, la résolution est abandonnée après environ 0,2 s et la carte réessaie au poll suivant.
    Une seule résolution ARP à la fois : un voisin muet retarde les autres adresses (délai 0,67 s).

@@ -15,6 +15,16 @@ NTP_PORT = 123
 REPLY_TTL = 64        # RFC 1122 section 3.2.1.7 / RFC 8200: any sensible default
 REPLY_HOP_LIMIT = 64  # echo and UDP replies; NDP uses 255 (RFC 4861 section 7.1)
 ALL_NODES = ipv6.addr("ff02::1")
+# UDP source ports a NTP request is never answered from (rule N1b, security finding F8):
+# 0 is reserved (no valid sender); 7 echo, 13 daytime, 17 qotd, 19 chargen, 37 time are the
+# classic small services that reflect or answer text back (RFC 862, 867, 865, 864, 868),
+# and so can form a loop with us or turn a spoofed request into a reflection.
+DENIED_SOURCE_PORTS = frozenset({0, 7, 13, 17, 19, 37})
+
+
+def source_port_ok(sport: int) -> bool:
+    """N1b: a request from this UDP source port may be answered."""
+    return sport not in DENIED_SOURCE_PORTS
 
 
 @dataclass
@@ -129,6 +139,9 @@ def _udp(f, src_ip: bytes, dst_ip: bytes, payload: bytes, cfg: Config, v6: bool)
     d = udp.UdpDatagram.parse(src_ip, dst_ip, payload)
     # U2: only destination port 123 is served.
     if d.dport != NTP_PORT:
+        return []
+    # N1b (F8): impossible or reflecting source ports are not answered.
+    if not source_port_ok(d.sport):
         return []
     # N1 (RFC 5905 section 7.3): at least the 48-byte header (extension fields tolerated).
     req = ntp.NtpPacket.parse(d.payload)

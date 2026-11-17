@@ -58,7 +58,12 @@
 //!   above its source), not a setting: there is no `STRATUM_OFFSET` in
 //!   `config.rs`.
 //! * `ref_id = peer_ref[S.peer]` if `ok`, else the last value (see below).
-//! * `ref_ts = S.upd` if `ok`, else the last value.
+//! * `ref_ts = S.upd & !0xFFFF_FFFF` (`S.upd` rounded DOWN to a whole second,
+//!   the 32 fraction bits cleared) if `ok`, else the last value. Rounding hides
+//!   the instant of each poll (and so the scheduler's phase) from whoever
+//!   queries the server (security finding F10; RFC 5905 only asks for the
+//!   time of the last update, a one-second resolution is within the intent
+//!   of the field and what ntpd's reference time carries in practice).
 //! * `root_delay = sat32(S.root_delay + sat32(ceil16(S.delay)))`.
 //! * `root_disp = sat32(S.root_disp + sat32(ceil48(T)))` with
 //!   `T = (S.disp + J) * 2^32 + PHI * age`, an exact integer in units of
@@ -321,7 +326,8 @@ impl
                 },
                 ok2 ? {
                     o_rid: self.p2_rid.get(),
-                    o_rts: self.p2_upd.get(),
+                    // F10: whole seconds only (clear the 32 fraction bits).
+                    o_rts: self.p2_upd.get() & U::<64>::from(0xFFFF_FFFF_0000_0000u64),
                     o_rdl: self.p2_rdl.get(),
                     o_rds: rds,
                 },

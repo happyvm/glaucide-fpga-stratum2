@@ -24,6 +24,7 @@
 //! | `POLL_LOG2` | 6 (64 s) | 6 |
 //! | `PRECISION_LOG2` | -24 | -24 |
 //! | `RATE_LIMIT_PER_S` | 8 | 8 |
+//! | `RATE_SECRET` | `0xA5C3_9E27_4B1D_6F83` (public development value: set your own) | `0x1F2E_3D4C_5B6A_7988` |
 //!
 //! The upstream servers of `Board` are the documentation addresses given
 //! in the roadmap; they are placeholders to replace before use on a
@@ -120,6 +121,16 @@ pub trait ConfigSet {
     const PRECISION_LOG2: i8;
     /// Responses allowed per second and per source before rate limiting.
     const RATE_LIMIT_PER_S: u16;
+    /// Secret key of the rate limiter's hash (`ntp_server.rs`, « Rate
+    /// limiter »): it decides which bucket each source falls in, so that an
+    /// attacker cannot choose sources that collide with a victim's bucket
+    /// or with each other. A build-time constant, NOT a runtime secret:
+    /// **every deployment must set its own random 64-bit value** (for
+    /// example `python3 -c 'import secrets; print(hex(secrets.randbits(64)))'`)
+    /// and keep it out of the public repository; the values of [`Board`]
+    /// and [`Test`] are public and for development only. Any value works
+    /// (the unit makes the multiplier odd), but avoid 0.
+    const RATE_SECRET: u64;
 }
 
 /// The real design (roadmap addresses, see the module header).
@@ -143,6 +154,8 @@ impl ConfigSet for Board {
     const POLL_LOG2: u8 = 6;
     const PRECISION_LOG2: i8 = -24;
     const RATE_LIMIT_PER_S: u16 = 8;
+    // Development value: replace it with a random one for each deployment.
+    const RATE_SECRET: u64 = 0xA5C3_9E27_4B1D_6F83;
 }
 
 /// The Python model (`tools/golden/vectors.py`): the addresses of the
@@ -169,6 +182,8 @@ impl ConfigSet for Test {
     const POLL_LOG2: u8 = 6;
     const PRECISION_LOG2: i8 = -24;
     const RATE_LIMIT_PER_S: u16 = 8;
+    // Test value, different from [`Board`]'s.
+    const RATE_SECRET: u64 = 0x1F2E_3D4C_5B6A_7988;
 }
 
 /// A MAC address (48 bits, byte 0 in the top byte) is unicast when the

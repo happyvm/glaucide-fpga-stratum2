@@ -14,7 +14,8 @@
 //!   per-bucket and global capacity of the rate limiter, KoD sizes.
 mod security_common;
 
-use ntp_fpga::ntp_server::{NtpReplyMeta, NtpServer, KOD_RATE, RL_ENTRIES};
+use ntp_fpga::config::{ConfigSet, Test};
+use ntp_fpga::ntp_server::{rl_index, rl_mult, NtpReplyMeta, NtpServer, KOD_RATE, RL_ENTRIES, RL_LEAK_Q16};
 use ntp_fpga::stream::{FrameByte, Meta};
 use ntp_fpga::top::FixedSync;
 use security_common::*;
@@ -26,9 +27,16 @@ use txhdl::types::{Bit, U};
 /// off-link sources.
 const PEER_MAC: u64 = 0x0200_0000_0002;
 
-/// The 6-bit rate-limiter index of an IPv4 source (`ntp_server::src_hash`,
-/// recomputed from its header: XOR fold of the zero-extended address).
-fn bucket4(ip: u32) -> u32 {
+/// The rate-limiter bucket of an IPv4 source under the test secret
+/// (`ntp_server::rl_index`, the exact function the unit computes).
+fn bucket4(ip: u32) -> usize {
+    rl_index(ip as u64, Test::RATE_SECRET)
+}
+
+/// The bucket of an IPv4 source under the OLD limiter (before the F1 fix):
+/// XOR fold of the zero-extended address into 6 bits, public and linear.
+/// Kept to build the sources an attacker would have chosen against it.
+fn old_bucket4(ip: u32) -> u32 {
     let k = ip as u64;
     let mut h = 0;
     for i in (0..64).step_by(6) {
@@ -37,7 +45,7 @@ fn bucket4(ip: u32) -> u32 {
     h as u32
 }
 
-/// IPv4 sources 198.51.100.k, k in 0..64: 64 distinct buckets.
+/// IPv4 sources 198.51.100.k.
 fn src_k(k: u32) -> u32 {
     0xC633_6400 | k
 }
@@ -165,7 +173,8 @@ fn only_client_mode_is_answered() {
     // spoofed request from another NTP server's port 123): mode 4, dropped.
     let sent0 = {
         let mut b0 = PinBench::new();
-        b0.frame(&ntp4_frame(PEER_MAC, src_k(1), 7, &ntp_payload(0x23, 48, 5)), 100, false);
+        // Port 8 (not 7: an echo service's port is itself filtered, F8).
+        b0.frame(&ntp4_frame(PEER_MAC, src_k(1), 8, &ntp_payload(0x23, 48, 5)), 100, false);
         b0.run::<FixedSync>(1500)
     };
     let echoed = ntp_replies(&sent0)[0].udp.as_ref().unwrap().5.clone();
@@ -189,21 +198,30 @@ fn only_client_mode_is_answered() {
 /// on the claimed source address, which an attacker forges. 8 spoofed
 /// requests "from" the victim V (they arrive from the attacker's MAC, or
 /// from the router for an off-link attacker) use up V's allowance: the 8
-/// replies go to V (or back to the attacker's MAC on the link), and V's own
-/// request in the same second gets no answer. A source W that merely shares
-/// V's 6-bit bucket is denied as well. A source in another bucket is served.
+/// replies go to V (or back to the attacker's MAC on the link). Before the
+/// F2 fix V's own request in the same second got no answer, nor did a
+/// source W that merely shared V's bucket. Now a request over the limit is
+/// still answered with probability 2^-4 (`leak`), so V and W are denied
+/// *most of the time* but not always: at most one reply each here (a single
+/// request each), and the forged requests' replies are bounded as well. A
+/// source in another bucket is served as before.
 #[test]
 fn rate_limiter_and_spoofed_victim() {
     const ATTACKER_MAC: u64 = 0x0200_0000_0bad;
     const VICTIM_MAC: u64 = 0x0200_0000_0003;
     let v = 0xC000_0203u32; // 192.0.2.3, the victim (on link here)
-    // W: another address with V's bucket (differs in two 6-bit chunks by
-    // the same pattern, so the fold cancels).
-    let w = v ^ (0x15 << 6) ^ 0x15;
+    // W: another address with V's bucket (found by search: the hash is
+    // keyed, so there is no formula).
+    let w = (1..2_000_000u32)
+        .map(|i| 0xC633_0000 + i)
+        .find(|&x| bucket4(x) == bucket4(v))
+        .unwrap();
     assert_ne!(w, v);
-    assert_eq!(bucket4(w), bucket4(v));
-    let other = src_k(bucket4(v) ^ 1);
-    assert_ne!(bucket4(other), bucket4(v));
+    let used = [src_k(5), src_k(6), v, w];
+    let other = (0..64u32)
+        .map(src_k)
+        .find(|&x| used.iter().all(|&u| bucket4(u) != bucket4(x)))
+        .unwrap();
     let mut b = PinBench::new();
     let mut tag = 0u64;
     let mut frames: Vec<(&str, u64, u64)> = vec![]; // (who, xmit, eth src)
@@ -235,11 +253,12 @@ fn rate_limiter_and_spoofed_victim() {
             .filter(|s| frames.iter().any(|f| f.0 == who && f.1 == origin(s)))
             .count()
     };
-    assert_eq!(count("flood"), 8, "a source gets at most 8 replies per second");
+    // 8 allowed, the 4 others each leak with probability 1/16.
+    assert!((8..=12).contains(&count("flood")), "8 per second plus rare leaks");
     assert_eq!(count("bystander"), 4, "another bucket is not affected");
     assert_eq!(count("spoofed-as-victim"), 8, "the forged requests are answered");
-    assert_eq!(count("victim"), 0, "the real victim is denied (F2)");
-    assert_eq!(count("same-bucket"), 0, "a source of the same bucket is denied (F2)");
+    assert!(count("victim") <= 1, "the real victim is (almost always) denied");
+    assert!(count("same-bucket") <= 1, "a source of the same bucket likewise");
     assert_eq!(count("other-bucket"), 1);
     // Where the 8 replies to the forged requests went: IP destination V,
     // Ethernet destination the MAC the forged frames came from.
@@ -259,6 +278,11 @@ type UReq = (bool, u128, Vec<u8>);
 /// given rate limit and KoD setting, the clock frozen inside one second;
 /// returns (meta, 48 bytes) per reply, in order.
 fn run_server(reqs: &[UReq], rate: u16, kod: bool) -> Vec<(NtpReplyMeta, Vec<u8>)> {
+    run_server_leak(reqs, rate, kod, 0)
+}
+
+/// [`run_server`] with the `leak` wire (units of 2^-16; 0 = no leak).
+fn run_server_leak(reqs: &[UReq], rate: u16, kod: bool, leak: u16) -> Vec<(NtpReplyMeta, Vec<u8>)> {
     let (m4_t, m4) = chan::<Meta, DefaultClock>();
     let (r4_t, r4) = chan::<FrameByte, DefaultClock>();
     let (m6_t, m6) = chan::<Meta, DefaultClock>();
@@ -285,6 +309,8 @@ fn run_server(reqs: &[UReq], rate: u16, kod: bool) -> Vec<(NtpReplyMeta, Vec<u8>
             tie(U::<64>::from(0u64)),
             tie(U::<16>::from(rate)),
             tie(Bit::from_bool(kod)),
+            tie(U::<64>::from(rl_mult(Test::RATE_SECRET))),
+            tie(U::<16>::from(leak)),
         ),
         (om_t, ob_t),
     ));
@@ -342,38 +368,100 @@ fn run_server(reqs: &[UReq], rate: u16, kod: bool) -> Vec<(NtpReplyMeta, Vec<u8>
     outs
 }
 
-/// Global capacity (finding F1): the table has 64 buckets, so at most
-/// 64 x 8 = 512 normal replies leave the server per second, whatever the
-/// number of clients; and an attacker who forges 9 requests for each of the
-/// 64 buckets (576 small packets, about 60 kB) silences every client for
-/// the rest of that second. The test shows both: 64 x 9 forged requests get
-/// 512 replies, then 64 requests from fresh, distinct sources get none.
+/// Forged sources chosen against the OLD limiter: `n` distinct IPv4
+/// addresses that all fall in old (XOR fold) bucket `k`.
+fn old_colliding_sources(base: u32, k: u32, n: u32) -> Vec<u32> {
+    (0..n)
+        .map(|i| {
+            let hi = base | (i << 6);
+            hi ^ (k ^ old_bucket4(hi))
+        })
+        .inspect(|&ip| assert_eq!(old_bucket4(ip), k))
+        .collect()
+}
+
+/// Global capacity (finding F1, fixed). Before: 64 buckets, so 64 x 9 = 576
+/// forged requests, 9 per old bucket (about 0.5 Mb/s), used up every bucket
+/// and silenced every legitimate client for the rest of the second. Now the
+/// table has 4096 buckets and a keyed multiply-shift hash: the same 576
+/// forged requests (built with the old attack's recipe: sources that were
+/// colliding under the old fold) spread over the table, and 64 legitimate
+/// clients with fresh addresses are all answered. The reply count matches
+/// the model of the hash exactly: per bucket, min(requests, 8).
 #[test]
 fn limiter_capacity_and_global_denial() {
-    assert_eq!(RL_ENTRIES, 64);
+    assert_eq!(RL_ENTRIES, 4096);
     let mut reqs: Vec<UReq> = vec![];
+    let mut srcs: Vec<u32> = vec![];
     for round in 0..9u32 {
         for k in 0..64u32 {
-            // A different forged address each time, bucket k.
-            let ip = (0x0A00_0000 | (round << 12)) ^ k ^ bucket4(0x0A00_0000 | (round << 12));
-            assert_eq!(bucket4(ip), k);
+            // A different forged address each time, old bucket k.
+            let ip = old_colliding_sources(0x0A00_0000 | (round << 20), k, 1)[0];
+            srcs.push(ip);
             reqs.push((false, ip as u128, ntp_payload(0x23, 48, 1)));
         }
     }
     // Then legitimate clients, one request each, all distinct addresses.
     for k in 0..64u32 {
+        srcs.push(0xC633_6400 | k);
         reqs.push((false, 0xC633_6400 | k as u128, ntp_payload(0x23, 48, 2)));
     }
+    let mut load = std::collections::HashMap::new();
+    for &ip in &srcs {
+        *load.entry(bucket4(ip)).or_insert(0usize) += 1;
+    }
+    let want: usize = load.values().map(|&l| l.min(8)).sum();
     let outs = run_server(&reqs, 8, false);
     let forged = outs.iter().filter(|o| o.1[24..32] == 1u64.to_be_bytes()).count();
     let legit = outs.iter().filter(|o| o.1[24..32] == 2u64.to_be_bytes()).count();
-    assert_eq!(forged, 64 * 8, "capacity: 8 replies per bucket per second");
-    assert_eq!(legit, 0, "every legitimate client is denied for the second (F1)");
+    assert_eq!(outs.len(), want, "per bucket, at most 8 replies");
+    assert!(forged >= 576 - 8, "the forged requests do not fill the table: {forged}");
+    assert_eq!(legit, 64, "every legitimate client is served (F1)");
+}
+
+/// Sources that collided under the old XOR fold (all in old bucket 17, an
+/// attacker's best case against it) now spread over the keyed table like
+/// random addresses: 2048 of them occupy about 4096 (1 - e^-0.5) = 1610
+/// buckets, and none is loaded beyond a few.
+#[test]
+fn old_colliding_sources_now_spread() {
+    let srcs = old_colliding_sources(0x0A00_0000, 17, 2048);
+    let mut load = std::collections::HashMap::new();
+    for &ip in &srcs {
+        *load.entry(bucket4(ip)).or_insert(0usize) += 1;
+    }
+    let distinct = load.len();
+    let max = *load.values().max().unwrap();
+    assert!(distinct > 1450, "only {distinct} distinct buckets for 2048 sources");
+    assert!(max <= 8, "bucket load {max}");
+    // The same under another secret: the spread does not depend on luck.
+    let mut load2 = std::collections::HashMap::new();
+    for &ip in &srcs {
+        *load2.entry(rl_index(ip as u64, 0x0123_4567_89AB_CDEF)).or_insert(0usize) += 1;
+    }
+    assert!(load2.len() > 1450);
+}
+
+/// Two different secrets give different bucket maps: a source set chosen
+/// to collide under one secret does not collide under the other.
+#[test]
+fn colliding_set_depends_on_the_secret() {
+    let s1 = Test::RATE_SECRET;
+    let s2 = 0xDEAD_BEEF_0BAD_F00Du64;
+    let target = rl_index(0xC000_0202, s1);
+    let coll: Vec<u64> = (0..400_000u64)
+        .map(|i| 0x0B00_0000 + i)
+        .filter(|&k| rl_index(k, s1) == target)
+        .take(64)
+        .collect();
+    assert_eq!(coll.len(), 64, "about 98 expected among 400k");
+    let same2 = coll.iter().filter(|&&k| rl_index(k, s2) == rl_index(coll[0], s2)).count();
+    assert!(same2 <= 4, "{same2} of 64 still collide under another secret");
 }
 
 /// IPv6 sources are keyed on their /64 (finding F2): two addresses of one
 /// /64 share a counter (an attacker inside a client's /64, or spoofing it,
-/// denies the whole /64); different /64s with the same fold collide too.
+/// denies the whole /64); different /64s have their own.
 #[test]
 fn ipv6_limiter_keyed_on_slash64() {
     let a = 0x2001_0DB8_0000_0001_0000_0000_0000_0001u128;
@@ -464,19 +552,17 @@ fn subnet_broadcast_source_is_still_answered() {
     assert_eq!(answered, vec![0xC000_02FFu128]);
 }
 
-/// Reflection towards UDP services (finding F8): a request forged with the
-/// source port of an echo (7), daytime (13), quote (17), chargen (19) or
-/// time (37) service, or port 0, is answered. Echo sends our 48-byte mode-4
-/// reply back: dropped (no loop, see `only_client_mode_is_answered`). But
-/// a text service answers with ASCII lines, and a line starting with `c`
-/// (0x63: LI 1, VN 4, mode 3) or `[` (0x5b: VN 3, mode 3) of 48 bytes or
-/// more is a valid request: the server answers it, to the service again,
-/// which answers again: a loop between us and the service, slowed only by
-/// the rate limiter (8 per second). The test shows both halves.
+/// Reflection towards UDP services (finding F8, server part, fixed): a
+/// request forged with the source port of an echo (7), daytime (13), quote
+/// (17), chargen (19) or time (37) service, or port 0, is not answered. This
+/// closes the loop with a text service (a chargen line starting with `c`
+/// (0x63: LI 1, VN 4, mode 3) or `[` (0x5b) of 48 bytes or more is a valid
+/// request): the line from port 19 gets no reply either. Neighbouring and
+/// ordinary ports are still served.
 #[test]
-fn service_ports_and_text_loops_today() {
+fn no_reply_to_service_ports() {
     let mut b = PinBench::new();
-    let mut k = 0;
+    let mut k = 0u32;
     for port in [0u16, 7, 13, 17, 19, 37] {
         b.frame(&ntp4_frame(PEER_MAC, src_k(20 + k), port, &ntp_payload(0x23, 48, xmit(k as u64))), 300, false);
         k += 1;
@@ -485,20 +571,12 @@ fn service_ports_and_text_loops_today() {
     // with 'c', arriving from port 19.
     let line: Vec<u8> = (0..72u8).map(|i| b'c' + (i % 30)).chain([b'\r', b'\n']).collect();
     b.frame(&ntp4_frame(PEER_MAC, src_k(40), 19, &line), 300, false);
-    let sent = b.run::<FixedSync>(1500);
-    let ports: Vec<u16> = ntp_replies(&sent).iter().map(|s| s.udp.as_ref().unwrap().4).collect();
-    assert_eq!(ports, vec![0, 7, 13, 17, 19, 37, 19], "every one answered, the chargen line too");
-}
-
-/// Desired behaviour behind F8: no reply to source port 0 or to the ports
-/// of the small UDP services (7, 13, 17, 19, 37), as for martian addresses.
-#[test]
-#[ignore = "FINDING F8: requests from UDP service ports are answered (docs/security.md)"]
-fn no_reply_to_service_ports() {
-    let mut b = PinBench::new();
-    for (k, port) in [0u16, 7, 13, 17, 19, 37].into_iter().enumerate() {
-        b.frame(&ntp4_frame(PEER_MAC, src_k(20 + k as u32), port, &ntp_payload(0x23, 48, xmit(k as u64))), 300, false);
+    // Ports next to the denied ones, 123 and ephemeral ports: answered.
+    let ok_ports = [1u16, 6, 8, 12, 14, 16, 18, 20, 36, 38, 123, 1024, 40000, 65535];
+    for (i, port) in ok_ports.into_iter().enumerate() {
+        b.frame(&ntp4_frame(PEER_MAC, src_k(41 + i as u32), port, &ntp_payload(0x23, 48, xmit(100 + i as u64))), 300, false);
     }
-    let sent = b.run::<FixedSync>(1500);
-    assert!(ntp_replies(&sent).is_empty());
+    let sent = b.run::<FixedSync>(1500 + 600 * 14);
+    let ports: Vec<u16> = ntp_replies(&sent).iter().map(|s| s.udp.as_ref().unwrap().4).collect();
+    assert_eq!(ports, ok_ports.to_vec(), "only the ordinary ports are answered");
 }

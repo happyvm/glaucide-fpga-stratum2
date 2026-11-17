@@ -36,6 +36,15 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(out.synced)
         self.assertEqual((out.stratum, out.leap, out.ref_id, out.ref_ts), (2, 0, REFS[1], NOW))
 
+    def test_ref_ts_rounded_down_to_the_second(self):
+        # F10: the published reference timestamp has no fraction.
+        for frac in (0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x12345678):
+            now = NOW + (77 << 32) + frac
+            st = sync.pop(State(), sel(), now)
+            out, held = sync.outputs(st, now, True, 0xE8, REFS)
+            self.assertEqual(out.ref_ts, now & ~0xFFFFFFFF)
+            self.assertEqual(held.ref_ts, out.ref_ts)
+
     def test_unusable_selected(self):
         st = sync.pop(State(), sel(), NOW)
         for bad in (sel(valid=False), sel(stratum=15), sel(stratum=16), sel(stratum=0)):

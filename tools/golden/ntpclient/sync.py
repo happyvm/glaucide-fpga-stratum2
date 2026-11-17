@@ -107,7 +107,7 @@ def outputs(state: State, now: int, servo_synced: bool, precision: int, peer_ref
     ok = state.v and servo_synced and fresh(state, now)
     if ok:
         s = state.sel
-        held = replace(state, ref_id=peer_refs[s.peer], ref_ts=state.upd,
+        held = replace(state, ref_id=peer_refs[s.peer], ref_ts=state.upd & ~M32 & M64,
                        root_delay=root_delay_of(s),
                        root_disp=root_disp_of(s, now, precision))
         return Out(True, s.stratum + 1, held.ref_id, held.ref_ts, held.root_delay,
