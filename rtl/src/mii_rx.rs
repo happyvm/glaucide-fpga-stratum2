@@ -60,51 +60,78 @@ use txhdl::{check, cover, lower, with, Trace};
 /// Longest frame accepted, FCS included.
 pub const MAX_RX_FRAME: usize = 1518;
 
-#[derive(Trace, Default)]
-pub struct MiiRx {
+/// Generic in its clock for the pin-level tests (real 25 MHz ratio);
+/// [`MiiRx`] is the design's instance.
+#[derive(Trace)]
+pub struct MiiRxG<C: Clock> {
     /// Frame body in progress (after the SFD).
-    pub body: Reg<Bit, ClkRx>,
+    pub body: Reg<Bit, C>,
     /// Waiting for `rx_dv` to fall (frame aborted or dropped).
-    pub skip: Reg<Bit, ClkRx>,
+    pub skip: Reg<Bit, C>,
     /// The low nibble of the byte in progress is in `lo`.
-    pub half: Reg<Bit, ClkRx>,
-    pub lo: Reg<U<4>, ClkRx>,
+    pub half: Reg<Bit, C>,
+    pub lo: Reg<U<4>, C>,
     /// `rx_er` seen in this frame.
-    pub er_seen: Reg<Bit, ClkRx>,
+    pub er_seen: Reg<Bit, C>,
     /// A byte is held back in `hold`.
-    pub have: Reg<Bit, ClkRx>,
-    pub hold: Reg<U<8>, ClkRx>,
+    pub have: Reg<Bit, C>,
+    pub hold: Reg<U<8>, C>,
     /// Bytes of the current frame completed so far (sent + held).
-    pub cnt: Reg<U<11>, ClkRx>,
+    pub cnt: Reg<U<11>, C>,
     /// The held byte must be sent as `last` when the channel has room.
-    pub pend: Reg<Bit, ClkRx>,
-    pub pend_err: Reg<Bit, ClkRx>,
-    pub sfd_r: Reg<Bit, ClkRx>,
+    pub pend: Reg<Bit, C>,
+    pub pend_err: Reg<Bit, C>,
+    pub sfd_r: Reg<Bit, C>,
     // Monitors (only read by check!/cover!; pruned in synthesis).
     /// Bytes sent so far in the current frame.
-    pub m_n: Reg<U<11>, ClkRx>,
+    pub m_n: Reg<U<11>, C>,
     /// An SFD was seen for the frame being sent.
-    pub m_in: Reg<Bit, ClkRx>,
+    pub m_in: Reg<Bit, C>,
     /// `sfd` was high in the previous cycle.
-    pub m_sfd: Reg<Bit, ClkRx>,
+    pub m_sfd: Reg<Bit, C>,
     /// `body` in the previous cycle.
-    pub m_body: Reg<Bit, ClkRx>,
+    pub m_body: Reg<Bit, C>,
+}
+
+/// The design's instance, at the board's `eth_rx_clk`.
+pub type MiiRx = MiiRxG<ClkRx>;
+
+impl<C: Clock> Default for MiiRxG<C> {
+    fn default() -> Self {
+        MiiRxG {
+            body: Default::default(),
+            skip: Default::default(),
+            half: Default::default(),
+            lo: Default::default(),
+            er_seen: Default::default(),
+            have: Default::default(),
+            hold: Default::default(),
+            cnt: Default::default(),
+            pend: Default::default(),
+            pend_err: Default::default(),
+            sfd_r: Default::default(),
+            m_n: Default::default(),
+            m_in: Default::default(),
+            m_sfd: Default::default(),
+            m_body: Default::default(),
+        }
+    }
 }
 
 #[lower]
-impl
+impl<C: Clock>
     Unit<
-        (In<U<4>, ClkRx>, In<Bit, ClkRx>, In<Bit, ClkRx>),
-        (Tx<FrameByte, ClkRx>, Out<Bit, ClkRx>),
-    > for MiiRx
+        (In<U<4>, C>, In<Bit, C>, In<Bit, C>),
+        (Tx<FrameByte, C>, Out<Bit, C>),
+    > for MiiRxG<C>
 {
     async fn run(
         &mut self,
-        (rxd, rx_dv, rx_er): (In<U<4>, ClkRx>, In<Bit, ClkRx>, In<Bit, ClkRx>),
-        (frames, sfd): (Tx<FrameByte, ClkRx>, Out<Bit, ClkRx>),
+        (rxd, rx_dv, rx_er): (In<U<4>, C>, In<Bit, C>, In<Bit, C>),
+        (frames, sfd): (Tx<FrameByte, C>, Out<Bit, C>),
     ) {
         loop {
-            ClkRx::rising().await;
+            C::rising().await;
             let d = rxd.get();
             let dv = rx_dv.get();
             let er = rx_er.get();

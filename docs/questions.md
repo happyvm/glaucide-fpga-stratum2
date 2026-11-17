@@ -32,3 +32,12 @@
    (c) `ConfigSet::STRATUM_OFFSET` et le fil `stratum_offset` de `Config` sont supprimés (le `+ 1` est
    fixé par le protocole, voir l'en-tête de `sync_state.rs`) ; `docs/top-client-hooks.md` ligne 110
    (point 5) est à retirer.
+
+## T1.15 — suite de la demande 2 (MII génériques)
+
+`MiiRxG<C>` / `MiiTxG<C>` sont génériques en l'horloge (alias `MiiRx`, `MiiTx` inchangés, netlists identiques) et
+`ArtyTopG<R, T, P, K>` / `ArtyTopClk` portent les horloges MII ; les tests `real_ratio_*` de `rtl/tests/top.rs`
+simulent le top complet à 25 MHz réels. Mesuré avec les vraies unités sur huit phases : erreur T2 0..+5 ns, T3
++5..+10 ns (modèle : T2 0..+5 ns, T3 -10..+10 ns). Point à noter : `mii_tx` écrit `txd.set(o_txd)`, donc en
+simulation la broche suit le registre avec un cycle `clk_tx` de retard (en netlist, `assign txd = o_txd`, pas de
+retard) ; le banc en tient compte pour l'instant SFD.

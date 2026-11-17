@@ -88,32 +88,37 @@ const HI: u8 = 3; // the high nibble of `byte` is on txd
 const DRAIN: u8 = 4; // tx_en low, discarding the rest of an ended frame
 
 #[derive(Trace)]
-pub struct MiiTx {
-    pub state: Reg<U<3>, ClkTx>,
+/// Generic in its clock for the pin-level tests (real 25 MHz ratio);
+/// [`MiiTx`] is the design's instance.
+pub struct MiiTxG<C: Clock> {
+    pub state: Reg<U<3>, C>,
     /// IDLE/DRAIN: cycles of gap still to wait. PRE: nibbles sent so far.
-    pub cnt: Reg<U<5>, ClkTx>,
+    pub cnt: Reg<U<5>, C>,
     /// Bytes taken in the current frame.
-    pub len: Reg<U<11>, ClkTx>,
-    pub byte: Reg<U<8>, ClkTx>,
-    pub last: Reg<Bit, ClkTx>,
-    pub err: Reg<Bit, ClkTx>,
-    pub o_txd: Reg<U<4>, ClkTx>,
-    pub en: Reg<Bit, ClkTx>,
-    pub o_sfd: Reg<Bit, ClkTx>,
-    pub und: Reg<Bit, ClkTx>,
+    pub len: Reg<U<11>, C>,
+    pub byte: Reg<U<8>, C>,
+    pub last: Reg<Bit, C>,
+    pub err: Reg<Bit, C>,
+    pub o_txd: Reg<U<4>, C>,
+    pub en: Reg<Bit, C>,
+    pub o_sfd: Reg<Bit, C>,
+    pub und: Reg<Bit, C>,
     // Ghosts, formal only.
-    pub g: Reg<U<5>, ClkTx>,
-    pub pst: Reg<U<3>, ClkTx>,
-    pub pen: Reg<Bit, ClkTx>,
-    pub plast: Reg<Bit, ClkTx>,
-    pub perr: Reg<Bit, ClkTx>,
-    pub psfd: Reg<Bit, ClkTx>,
-    pub seen: Reg<Bit, ClkTx>,
+    pub g: Reg<U<5>, C>,
+    pub pst: Reg<U<3>, C>,
+    pub pen: Reg<Bit, C>,
+    pub plast: Reg<Bit, C>,
+    pub perr: Reg<Bit, C>,
+    pub psfd: Reg<Bit, C>,
+    pub seen: Reg<Bit, C>,
 }
 
-impl Default for MiiTx {
+/// The design's instance, at the board's `eth_tx_clk`.
+pub type MiiTx = MiiTxG<ClkTx>;
+
+impl<C: Clock> Default for MiiTxG<C> {
     fn default() -> Self {
-        MiiTx {
+        MiiTxG {
             state: Reg::new(IDLE),
             // A full gap after reset.
             cnt: Reg::new((IFG_CYCLES - 1) as u8),
@@ -137,29 +142,29 @@ impl Default for MiiTx {
 }
 
 #[lower]
-impl
+impl<C: Clock>
     Unit<
-        Rx<FrameByte, ClkTx>,
+        Rx<FrameByte, C>,
         (
-            Out<U<4>, ClkTx>,
-            Out<Bit, ClkTx>,
-            Out<Bit, ClkTx>,
-            Out<Bit, ClkTx>,
+            Out<U<4>, C>,
+            Out<Bit, C>,
+            Out<Bit, C>,
+            Out<Bit, C>,
         ),
-    > for MiiTx
+    > for MiiTxG<C>
 {
     async fn run(
         &mut self,
-        frames: Rx<FrameByte, ClkTx>,
+        frames: Rx<FrameByte, C>,
         (txd, tx_en, sfd, underrun): (
-            Out<U<4>, ClkTx>,
-            Out<Bit, ClkTx>,
-            Out<Bit, ClkTx>,
-            Out<Bit, ClkTx>,
+            Out<U<4>, C>,
+            Out<Bit, C>,
+            Out<Bit, C>,
+            Out<Bit, C>,
         ),
     ) {
         loop {
-            ClkTx::rising().await;
+            C::rising().await;
             let st = self.state.get();
             let cnt = self.cnt.get();
             let len = self.len.get();
