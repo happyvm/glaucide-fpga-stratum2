@@ -72,7 +72,7 @@
 //! bits 58..89 (ticks of 2^-6 s). Each cycle in `SCAN`, either a reply is
 //! taken (below) or slot `cs` is examined, in this priority:
 //!
-//! 1. `up<cs>_en` = 0: its flags are cleared (`out`, `pend`, `sent`,
+//! 1. `up<cs>_en` = 0 and its flags are not all 0: they are cleared (`out`, `pend`, `sent`,
 //!    `burst`, `tries` = 0; an outstanding request is forgotten, **no
 //!    miss**); re-enabling restarts the iburst.
 //! 2. `out` and `now_s - tsent >= DEADLINE_S` (2, unsigned 32-bit wrapping
@@ -92,7 +92,7 @@
 //!    it (deadline or reply) and starts in the cycle after.
 //! 4. `pend` and (`tries` = 0 or `now_t - rt >= RETRY_TICKS` (2)):
 //!    go to `LKP` for slot `cs`.
-//! 5. otherwise nothing; `cs` advances (`cs + 1` mod 4).
+//! 5. otherwise (including a disabled slot with clear flags) nothing; `cs` advances (`cs + 1` mod 4).
 //!
 //! In cases 1-3 `cs` stays (the slot is re-examined next cycle), in case 4
 //! the request path keeps it. When a reply `Meta` is waiting and the slot
@@ -523,7 +523,7 @@ impl
                 | Bit::from((now_s - m_last) >= ival);
             let rt_ok = Bit::from(f_tries == U::<4>::from(0u8))
                 | Bit::from((now_t - m_rt) >= U::<32>::from(RETRY_TICKS));
-            let sc_dis = !s_en;
+            let sc_dis = !s_en & Bit::from(fl != U::<10>::from(0u8));
             let sc_dl = s_en & f_out & dl_due;
             let sc_fire = s_en & !f_out & !f_pend & due;
             let sc_lkp = s_en & !f_out & f_pend & rt_ok;

@@ -155,7 +155,8 @@ class VectorTest(unittest.TestCase):
                             "vectors", "client.txt")
         with open(path) as fh:
             text = fh.read()
-        want = client.HEADER + "".join(client.vector_line(c) + "\n" for c in client.gen_cases())
+        want = client.HEADER + "".join(client.request_line(*q) + "\n" for q in client.gen_requests())
+        want += "".join(client.vector_line(c) + "\n" for c in client.gen_cases())
         self.assertEqual(text, want)
         self.assertGreater(text.count(" -> S "), 150)
 

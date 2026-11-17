@@ -236,6 +236,8 @@ HEADER = """\
 #   S <peer> <offset> <delay> <disp> <t4> <stratum> <leap> <refid> <rootdelay> <rootdisp>
 #     (64-bit fields 0x + 16 digits, 32-bit fields 0x + 8 digits)
 #   R <reason> <miss 0/1>
+# Request lines (the 48 bytes the client sends for poll, precision and T1):
+#   request <poll> <prec> <t1> -> <payload>
 """
 
 V4_ADDRS = [0xC0000263, 0xC0000264, 0xC6336401, 0xCB007105]
@@ -327,9 +329,23 @@ def vector_line(case) -> str:
     return head + " -> " + tail
 
 
+def gen_requests(seed=0x0E57, n=24):
+    rng = random.Random(seed)
+    out = [(6, 0xE8, 0), (4, 0xE8, M64), (17, 0x80, 0xEC00000000000001)]
+    for _ in range(n - len(out)):
+        out.append((rng.randrange(256), rng.randrange(256), rng.randrange(1 << 64)))
+    return out
+
+
+def request_line(poll: int, prec: int, t1: int) -> str:
+    return "request %d %d 0x%016x -> %s" % (poll, prec, t1, build_request(poll, prec, t1).hex())
+
+
 def write_vectors(path: str) -> None:
     with open(path, "w") as fh:
         fh.write(HEADER)
+        for q in gen_requests():
+            fh.write(request_line(*q) + "\n")
         for c in gen_cases():
             fh.write(vector_line(c) + "\n")
 
