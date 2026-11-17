@@ -47,7 +47,18 @@
 //!   58: a one-line change of the destination class, to be made with the
 //!   model);
 //! * G8: UDP (next header 17) only to our unicast addresses (G5), never to
-//!   the solicited-node group; ICMPv6 to either.
+//!   the solicited-node group; ICMPv6 to either;
+//! * G9 (UDP only; RFC 4291 sections 2.5.2/2.5.3/2.5.5, RFC 6890; security
+//!   finding F8): a UDP (NTP) datagram is dropped when its source is the
+//!   unspecified address `::`, the loopback `::1`, an IPv4-mapped address
+//!   (`::ffff:0:0/96`) or one of our own addresses (`local_ll`, or
+//!   `local_gua` when `gua_valid`); multicast sources are G4's. The rule
+//!   is checked here rather than in `udp6_rx` because only this unit has
+//!   the local addresses; `udp6_rx` is unchanged. It does NOT apply to
+//!   ICMPv6: a DAD Neighbor Solicitation legitimately comes from `::` and
+//!   is forwarded to `icmpv6`, which applies its own rules. The verdict on
+//!   the source is registered every cycle (`usrc_ok_r`; the source is
+//!   complete from byte 25 on, the verdict is read on byte 40).
 //!
 //! The solicited-node group is matched with the single `sn_low` wire for
 //! both addresses (the model derives one per address, they coincide when
@@ -136,6 +147,8 @@ pub struct Ipv6Rx {
     pub nxt: Reg<U<8>>,
     pub hop: Reg<U<8>>,
     pub src: Reg<U<128>>,
+    /// G9 verdict on `src` (valid UDP source), registered every cycle.
+    pub usrc_ok_r: Reg<Bit>,
     pub dst: Reg<U<128>>,
     pub esrc: Reg<U<48>>,
     /// Receive timestamp of the frame in progress (from `EthMeta.ts`).
@@ -225,10 +238,17 @@ impl
             let nxt = self.nxt.get();
             let to_icmp = Bit::from(nxt == U::<8>::from(NH_ICMPV6));
             let to_udp = Bit::from(nxt == U::<8>::from(NH_UDP));
+            // G9: valid UDP source (registered from `src`).
+            let src_top = src >> 32u32;
+            let src_low = src.slice::<0, 32>();
+            let usrc_n = !(Bit::from(src_top == U::<128>::from(0u128)) & Bit::from(src_low <= U::<32>::from(1u32)))
+                & !Bit::from(src_top == U::<128>::from(0xFFFFu128))
+                & !Bit::from(src == local_ll.get())
+                & !(gua_valid.get() & Bit::from(src == local_gua.get()));
             let accept = ok_n
                 & Bit::from(plen != U::<16>::from(0u16))
                 & !last
-                & ((to_icmp & (own | sn)) | (to_udp & own));
+                & ((to_icmp & (own | sn)) | (to_udp & own & self.usrc_ok_r.get()));
             let dec_icmp = p39 & accept & to_icmp;
             let dec_udp = p39 & accept & to_udp;
             let dec_fwd = dec_icmp | dec_udp;
@@ -286,6 +306,7 @@ impl
             }
 
             with!(self <= {
+                usrc_ok_r: usrc_n,
                 take & in_h ? pos: pos + U::<6>::from(1u8),
                 take ? ok: ok_n,
                 take & p0 ? {

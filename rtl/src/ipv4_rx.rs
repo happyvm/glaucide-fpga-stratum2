@@ -26,8 +26,17 @@
 //! * I3: no fragment: MF clear and fragment offset 0 (DF is ignored);
 //! * I4: TTL not 0;
 //! * I5: destination address equals `local_ip` exactly;
-//! * I6: source is not `0.0.0.0`, not multicast (`224.0.0.0/4`) and not
-//!   `255.255.255.255`;
+//! * I6 (RFC 1122 section 3.2.1.3, RFC 6890; security finding F8): the source
+//!   is a valid unicast host address: not in `0.0.0.0/8`, not loopback
+//!   (`127.0.0.0/8`), not multicast (`224.0.0.0/4`), not class E
+//!   (`240.0.0.0/4`, which includes the limited broadcast `255.255.255.255`)
+//!   and not our own address (`local_ip`). Link-local `169.254.0.0/16`,
+//!   private and documentation prefixes are accepted. The subnet-directed
+//!   broadcast (`local_ip | !netmask`) is NOT filtered here: the unit has no
+//!   netmask input. The rule applies to both ICMP and UDP (an echo from
+//!   `127.x` or from ourselves is not answered). The comparison with
+//!   `local_ip` is registered (`src_ok_r`, valid from byte 16 on, read with
+//!   byte 20: the source is complete after byte 16);
 //! * the protocol is 1 (ICMP) or 17 (UDP); other protocols are dropped;
 //! * the frame has a byte after the header (not `last` on byte 20).
 //!
@@ -113,6 +122,9 @@ pub struct Ipv4Rx {
     pub acc: Reg<U<32>>,
     pub hi: Reg<U<8>>,
     pub src: Reg<U<32>>,
+    /// I6 verdict on `src`, registered every cycle (the source is stable from
+    /// byte 17 to byte 20, the verdict is read on byte 20).
+    pub src_ok_r: Reg<Bit>,
     pub dst: Reg<U<32>>,
     pub esrc: Reg<U<48>>,
     /// Receive timestamp of the frame in progress (from `EthMeta.ts`).
@@ -180,9 +192,13 @@ impl
             let ck_ok = csum_ok(sum_fin);
             let src = self.src.get();
             let dst_fin = (self.dst.get() << 8u32) | b.data.zext::<32>();
-            let src_ok = Bit::from(src != U::<32>::from(0u32))
-                & !Bit::from((src >> 28u32) == U::<32>::from(0xEu32))
-                & !Bit::from(src == U::<32>::from(0xFFFF_FFFFu32));
+            // I6: 0/8, 127/8, 224/4, 240/4 (incl. 255.255.255.255), our own address.
+            let hi8 = src >> 24u32;
+            let src_ok_n = Bit::from(hi8 != U::<32>::from(0u32))
+                & Bit::from(hi8 != U::<32>::from(127u32))
+                & Bit::from((src >> 29u32) != U::<32>::from(7u32))
+                & Bit::from(src != local_ip.get());
+            let src_ok = self.src_ok_r.get();
             let dst_ok = Bit::from(dst_fin == local_ip.get());
             let proto = self.proto.get();
             let to_icmp = Bit::from(proto == U::<8>::from(PROTO_ICMP));
@@ -244,6 +260,7 @@ impl
             }
 
             with!(self <= {
+                src_ok_r: src_ok_n,
                 take ? pos: pos + U::<16>::from(1u16),
                 take ? ok: ok_n,
                 take & p2 ? tl: b.data.zext::<16>() << 8u32,

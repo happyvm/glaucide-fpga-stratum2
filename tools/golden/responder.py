@@ -97,9 +97,11 @@ def _ipv4(f: eth.EthFrame, cfg: Config) -> List[bytes]:
     # I5: destination is exactly our unicast address.
     if p.dst != cfg.ipv4:
         return []
-    # I6 (RFC 1122 section 3.2.1.3): never answer a source that is 0.0.0.0, multicast or broadcast.
-    a = ipaddress.IPv4Address(p.src)
-    if a.is_unspecified or a.is_multicast or p.src == b"\xff\xff\xff\xff":
+    # I6 (RFC 1122 section 3.2.1.3, RFC 6890; F8): the source must be a valid unicast host address: never
+    # 0.0.0.0/8, 127.0.0.0/8 (loopback), 224.0.0.0/4 (multicast), 240.0.0.0/4 (class E, includes
+    # 255.255.255.255) or our own address. Link-local 169.254/16, private and documentation prefixes are
+    # allowed. The subnet-directed broadcast is not known to the RTL (no netmask): not filtered.
+    if p.src[0] in (0, 127) or p.src[0] >= 224 or p.src == cfg.ipv4:
         return []
     if p.proto == ipv4.PROTO_ICMP:
         return _icmp4(f, p, cfg)
@@ -201,6 +203,13 @@ def _ipv6(f: eth.EthFrame, cfg: Config) -> List[bytes]:
     if p.next_header == ipv6.NH_UDP:
         if p.dst not in ours:
             return []  # G8: NTP only over unicast
+        # G9 (RFC 4291 sections 2.5.2/2.5.3/2.5.5, RFC 6890; F8): UDP (NTP) is never answered to the
+        # unspecified address `::`, the loopback `::1`, an IPv4-mapped address `::ffff:0:0/96` or one of our
+        # own addresses (multicast sources are already dropped by G4). ICMPv6 is not affected: a DAD
+        # Neighbor Solicitation legitimately comes from `::`.
+        if (p.src == bytes(16) or p.src == bytes(15) + b"\x01" or p.src[:12] == bytes(10) + b"\xff\xff"
+                or p.src in ours):
+            return []
         return _udp(f, p.src, p.dst, p.payload, cfg, v6=True)
     return _icmp6(f, p, cfg, is_ns_dest and p.dst not in ours)
 
