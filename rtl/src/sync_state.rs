@@ -90,7 +90,9 @@
 //! (visible in `S` after `E`). Stage 1 (after `E+1`) computes from `S`,
 //! `time`, `servo_synced`, `precision`, `peer_ref*`: `age`, `ok`, the
 //! disp-base `S.disp + J`, `root_delay`, the muxed ref id, `stratum + 1`.
-//! Stage 2 (after `E+2`) multiplies `PHI * age`. The output registers
+//! Stage 2 (after `E+2`) multiplies `PHI * age`, as two 32 x 16 partial
+//! products (`p2_plo` = `PHI * age[31:0]`, `p2_phi` = `PHI * age[63:32]`;
+//! two DSP slices deep instead of four, task T5.3). The output registers
 //! (after `E+3`) hold the final sums. Every output of one cycle belongs to
 //! the same pipeline snapshot (no mixed old/new values). So output(`E+3`)
 //! is the function of `S` and of the inputs sampled at `E+1` (`time`,
@@ -174,7 +176,8 @@ pub struct SyncState {
     pub p1_rid: Reg<U<32>>,
     pub p1_upd: Reg<U<64>>,
     // ---- stage 2 ----
-    pub p2_prod: Reg<U<96>>,
+    pub p2_plo: Reg<U<48>>,
+    pub p2_phi: Reg<U<48>>,
     pub p2_ok: Reg<Bit>,
     pub p2_dj: Reg<U<65>>,
     pub p2_rdl: Reg<U<32>>,
@@ -271,10 +274,15 @@ impl
             );
 
             // ---------------------------------------------- stage 3
-            let total = (self.p2_dj.get().zext::<128>() << 32u32) + self.p2_prod.get().zext::<128>();
-            let rds = sat32(
-                self.p2_rds.get().zext::<96>() + sat32(ceil48(total)).zext::<96>(),
-            );
+            // ceil48(T) with T = (dj + phi) * 2^32 + plo (phi, plo: the two
+            // partial products of PHI * age): (T + 2^48 - 1) >> 48 =
+            // (dj + phi + ((plo + 2^48 - 1) >> 32)) >> 16, exactly (the low
+            // 32 bits of the shifted part only round within the floor).
+            let lo_up = (self.p2_plo.get().zext::<52>() + U::<52>::from(0xFFFF_FFFF_FFFFu64)) >> 32u32;
+            let hsum = self.p2_dj.get().zext::<68>()
+                + (self.p2_phi.get().zext::<68>() + lo_up.zext::<68>());
+            let c48 = (hsum >> 16u32).zext::<96>();
+            let rds = sat32(self.p2_rds.get().zext::<96>() + sat32(c48).zext::<96>());
             let ok2 = self.p2_ok.get();
 
             with!(self <= {
@@ -299,7 +307,8 @@ impl
                     p1_st: self.s_st.get() + U::<8>::from(1u8),
                     p1_rid: rid,
                     p1_upd: upd,
-                    p2_prod: self.p1_age.get().zext::<96>() * U::<96>::from(PHI_Q32),
+                    p2_plo: self.p1_age.get().slice::<0, 32>().zext::<48>() * U::<48>::from(PHI_Q32),
+                    p2_phi: self.p1_age.get().slice::<32, 32>().zext::<48>() * U::<48>::from(PHI_Q32),
                     p2_ok: self.p1_ok.get(),
                     p2_dj: self.p1_dj.get(),
                     p2_rdl: self.p1_rdl.get(),
