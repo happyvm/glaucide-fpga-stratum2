@@ -1,0 +1,6 @@
+# Cargo workspace used for fast simulation and Verilog generation.
+# TxHDL upstream builds with Bazel; these two manifests just point Cargo at its
+# sources (run tools/setup.sh first). Bazel remains the reference flow.
+[workspace]
+members = ["tools/cargo/txhdl_macros", "tools/cargo/txhdl", "rtl"]
+resolver = "2"

@@ -39,6 +39,6 @@ ntp_client (FSM) --> upstream stratum 1 (v4/v6) --> clock_servo (PI) --> discipl
 5. Robustesse : rate limit, KoD, MMCM/CDC, mesures d'offset/jitter.
 
 ## Outils
-- SandPiper (`pip install sandpiper-saas`, compilation via service cloud Redwood EDA, accès réseau requis) → SV.
-- Simulation : Verilator + cocotb (non installés dans ce conteneur actuellement).
-- Synthèse/P&R : Vivado sur la machine de l'utilisateur.
+- TxHDL (Rust → Verilog), simulation native en Rust (`Running::cycle`), traces FST/VCD. Épinglé via `tools/setup.sh`.
+- Synthèse/P&R : Vivado sur la machine de l'utilisateur, à partir de `out/*.v` et `constraints/arty_a7_100.xdc`.
+- Horloge : accumulateur 32.64 bits, incrément 2^64/100e6 (module `rtl/src/clock.rs`, vérifié en simulation).
