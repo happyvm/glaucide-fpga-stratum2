@@ -2,7 +2,7 @@
 //! `gen_all <module>`: print the Verilog of a design module.
 use ntp_fpga::{
     clock::NtpClock, crc32::FrameCrc, eth_rx::EthRx, eth_tx::EthTx, fcs_check::FcsCheck,
-    mii_rx::MiiRx, mii_tx::MiiTx, stream::FrameCounter,
+    mii_rx::MiiRx, mii_tx::MiiTx, stream::FrameCounter, tx_arb::TxArb, tx_path::TxPath,
 };
 
 fn main() {
@@ -14,9 +14,9 @@ fn main() {
         Some("mii_tx") => print!("{}", MiiTx::verilog("mii_tx")),
         Some("eth_rx") => print!("{}", EthRx::verilog("eth_rx")),
         Some("eth_tx") => print!("{}", EthTx::verilog("eth_tx")),
-        Some("tx_arb") => print!("{}", ntp_fpga::tx_arb::TxArb::verilog("tx_arb")),
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
-        Some("tx_path") => print!("{}", ntp_fpga::tx_path::TxPath::verilog("tx_path")),
+        Some("tx_arb") => print!("{}", TxArb::verilog("tx_arb")),
+        Some("tx_path") => print!("{}", TxPath::verilog("tx_path")),
         other => {
             eprintln!("unknown module {other:?}");
             std::process::exit(1);

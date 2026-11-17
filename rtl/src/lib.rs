@@ -11,3 +11,4 @@ pub mod mii_rx;
 pub mod mii_tx;
 pub mod stream;
 pub mod tx_arb;
+pub mod tx_path;
