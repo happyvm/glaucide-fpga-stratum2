@@ -12,6 +12,7 @@ pub mod eth_tx;
 pub mod fcs_check;
 pub mod formal_smoke;
 pub mod icmp_echo;
+pub mod icmpv6;
 pub mod ipv4_rx;
 pub mod ipv4_tx;
 pub mod ipv6_rx;
