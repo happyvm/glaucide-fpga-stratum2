@@ -528,6 +528,21 @@ impl<C: ConfigSet> Default for ClientSync<C> {
     }
 }
 
+/// Number of enabled upstream slots of `C` (`UPSTREAM[i].2`, the
+/// `up<i>_en` wires of `config`): the selection's `n_en` (start-up
+/// majority, security finding F4).
+pub const fn n_enabled<C: ConfigSet>() -> u8 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < 4 {
+        if C::UPSTREAM[i].2 {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
 /// Our Reference ID if upstream slot `i` of `C` is the system peer.
 pub const fn peer_ref<C: ConfigSet>(i: usize) -> u32 {
     let (v6, addr, _) = C::UPSTREAM[i];
@@ -593,7 +608,10 @@ impl<C: ConfigSet>
             join2(
                 join2(
                     self.filter.run((samples, miss), st_tx),
-                    self.selection.run((st_rx, now), sel_tx),
+                    self.selection.run(
+                        (st_rx, now, tie(U::<3>::new(n_enabled::<C>() as u128))),
+                        sel_tx,
+                    ),
                 ),
                 join2(
                     self.fork.run(sel_rx, (sv_tx, ss_tx)),

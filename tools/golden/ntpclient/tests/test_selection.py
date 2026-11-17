@@ -130,23 +130,25 @@ class VectorsTest(unittest.TestCase):
         with open(sel.VECTORS) as f:
             sc = sel.parse_vectors(f.read())
         self.assertEqual(len(sc), len(sel.all_scenarios()))
-        names = [n for n, _ in sc]
+        names = [n for n, _, _ in sc]
         for want in ("single", "two_agree", "two_disagree", "three_one_false", "four_two_false",
                      "leap3", "stratum16", "unreachable", "maxdist_exact", "hysteresis_keep", "tie_identical"):
             self.assertIn(want, names)
-        for name, evs in sc:
-            m = Selection()
+        for name, n_en, evs in sc:
+            m = Selection(n_en)
             for now, s, want in evs:
                 self.assertEqual(m.process(s, now), want, name)
 
     def test_coverage(self):
         """The vectors exercise every branch of the algorithm."""
         seen = set()
-        for _, evs in sel.all_scenarios():
-            m = Selection()
+        for _, n_en, evs in sel.all_scenarios():
+            m = Selection(n_en)
             for now, s in evs:
                 out = m.process(s, now)
                 i = m.info
+                if i.get("startup_gate"):
+                    seen.add("startup_gate_%d" % n_en)
                 if not out.valid:
                     seen.add("none_no_candidate" if not any(i["el"]) else "none_no_majority")
                     continue
@@ -160,8 +162,49 @@ class VectorsTest(unittest.TestCase):
                 if out.peer != i["best"]:
                     seen.add("hysteresis_kept")
         for want in ("none_no_candidate", "none_no_majority", "valid_1", "valid_2", "valid_3", "valid_4",
-                     "cluster_drop", "cluster_keep", "falseticker", "hysteresis_kept"):
+                     "cluster_drop", "cluster_keep", "falseticker", "hysteresis_kept",
+                     "startup_gate_2", "startup_gate_3", "startup_gate_4"):
             self.assertIn(want, seen)
+
+
+class StartupMajorityTest(unittest.TestCase):
+    """F4: until the first valid selection, a majority of the enabled slots
+    (n_en // 2 + 1 truechimers) is required; afterwards the usual rules."""
+
+    def test_thresholds(self):
+        a, b, c, d = (st(i, 0.010 + i * 0.001) for i in range(4))
+        for n_en, need in [(0, 1), (1, 1), (2, 2), (3, 2), (4, 3), (7, 4)]:
+            for k in range(1, 5):
+                m = Selection(n_en)
+                out = None
+                for p in (a, b, c, d)[:k]:
+                    out = m.process(p, T0)
+                self.assertEqual(out.valid, int(k >= need), (n_en, k))
+
+    def test_gate_only_before_the_first_selection(self):
+        m = Selection(2)
+        self.assertEqual(m.process(st(0, 0.010), T0).valid, 0)
+        self.assertFalse(m.ever)
+        self.assertEqual(m.process(st(1, 0.011), T0).valid, 1)
+        self.assertTrue(m.ever)
+        # peer 1 lost: peer 0 alone is selected again (no gate any more)
+        out = m.process(st(1, 0.011, valid=0), T0)
+        self.assertEqual((out.valid, out.peer), (1, 0))
+
+    def test_gated_event_clears_the_system_peer(self):
+        m = Selection(4)
+        m.process(st(0, 0.010), T0)
+        self.assertEqual(m.process(st(1, 0.011), T0).valid, 0)
+        self.assertIsNone(m.sys)
+        self.assertTrue(m.info["startup_gate"])
+
+    def test_one_liar_of_two_cannot_start(self):
+        m = Selection(2)
+        year = 365 * 86400 * S
+        for k in range(4):
+            self.assertEqual(m.process(st(0, off=year, t4=T0 + 2 * k * S), T0 + 2 * k * S).valid, 0)
+        self.assertEqual(m.process(st(1, 0.001, t4=T0 + 8 * S), T0 + 8 * S).valid, 0)
+        self.assertFalse(m.ever)
 
 
 class FloatReferenceTest(unittest.TestCase):

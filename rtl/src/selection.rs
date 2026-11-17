@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | `stats` | `Rx<PeerStat>` | one per update of a peer, from the clock filter (T4.3) |
 //! | `now` | `In<U<64>>` | our NTP time, 32.32 (ageing of the samples) |
+//! | `n_en` | `In<U<3>>` | number of enabled upstream slots (a configuration constant, `top.rs` `n_enabled`); start-up majority, step 3b |
 //! | `selected` | `Tx<Selected>` | one per `PeerStat` taken, to the servo (T4.5) and the sync state (T4.6) |
 //!
 //! # Timing and flow
@@ -24,7 +25,8 @@
 //!   with `valid = 0` also replaces it) and `now` is sampled (`now_r`): the
 //!   whole event uses that one value of `now`. `now` is not read otherwise.
 //! * The unit then computes for a fixed number of cycles that depends only on
-//!   the number of survivors `n` (below), with no other input:
+//!   the number of survivors `n` (below; an event stopped by the start-up
+//!   majority of step 3b counts as `n` = 0), with no other input:
 //!   [`event_cycles`] gives the cycle (counted from T = 0) in which
 //!   `selected` is offered, at most [`MAX_EVENT_CYCLES`] = 545 cycles
 //!   (5.45 µs at 100 MHz).
@@ -32,8 +34,9 @@
 //!   `ready`); exactly one `Selected` per `PeerStat` taken, in order. The
 //!   next `PeerStat` is taken at the earliest in the cycle after the
 //!   `Selected` is sent (no overlap: a stalled consumer stalls `stats`).
-//! * After reset the 4 peers are empty (all zero: `valid` = 0, ineligible)
-//!   and there is no previous system peer.
+//! * After reset the 4 peers are empty (all zero: `valid` = 0, ineligible),
+//!   there is no previous system peer, and `ever` = 0 (no valid selection
+//!   yet, step 3b).
 //!
 //! # Arithmetic (all exact integers; Q32 = 2^-32 s)
 //!
@@ -69,6 +72,23 @@
 //!    eligible peers with edge(low) ≤ θ ≤ edge(high); there is at least one
 //!    on success, and any two are less than 2·MAXDIST = 3 s (< 2^34 Q32)
 //!    apart (a majority of the intervals contains [low, high]).
+//!
+//!    **3b. Start-up majority** (security finding F4; RFC 5905's NSANE /
+//!    MINCLOCK in spirit). While `ever` = 0 (no valid selection since
+//!    reset), success also needs at least `n_en / 2 + 1` truechimers (floor):
+//!    1 enabled slot: 1 (the single source decides: the **residual risk**,
+//!    nothing else is possible; configure three or more upstreams); 2: both,
+//!    i.e. their intersection; 3: 2; 4: 3 (`n_en` above 4 asks for more than
+//!    the 4 peers can give: never). Otherwise there is no selection (as for
+//!    a failed intersection: `valid = 0`, the previous system peer is
+//!    cleared). `ever` := 1 with the first valid selection and stays 1 until
+//!    reset: afterwards the usual rules (a majority of the *eligible*
+//!    peers). Effect: the servo's start-up step (NSET, any size, `servo.rs`)
+//!    is no longer decided by the first source to reach 4 samples. The
+//!    hardware counts the truechimers for both allows (`n_t0`, `n_t1`, the
+//!    survivor tests below) and registers the comparisons (`g0`, `g1`) in
+//!    every cycle; FIN1 reads them (their inputs are final from the end of
+//!    INTER): no cycle is added.
 //!    Hardware: no sort; each of the 12 tuples is compared with the 12
 //!    (one comparison per cycle) to get its rank and the counts above. The
 //!    comparator is a two-stage pipeline (task T5.3): the edges of a pair
@@ -116,7 +136,8 @@
 //! # Deviations from RFC 5905 (decisions, see the report of T4.4)
 //!
 //! * The MAXDIST test is `rd < MAXDIST` (no `PHI·2^poll` allowance) and there
-//!   is no loop test on the reference ID (`fit`), no NSANE/MINCLOCK counts.
+//!   is no loop test on the reference ID (`fit`); no NSANE/MINCLOCK counts
+//!   except the start-up majority of step 3b.
 //! * Clustering runs the §11.2.2 test with the RMS selection jitter; the
 //!   A.5.5.1 pseudocode bugs (`qmax = q`, survivors gathered from all tuples)
 //!   are not reproduced.
@@ -137,6 +158,8 @@
 //!   `root_dist` < MAXDIST, its `stratum` in 1..=15, its `leap` ≠ 3; the
 //!   survivors are a subset of the eligible peers and number at least
 //!   `m − allow` > m/2 before clustering (a majority of the eligible peers).
+//! * `ever = 0` and `valid = 1` ⇒ the truechimers number at least
+//!   `n_en / 2 + 1` (step 3b); `ever` never returns to 0.
 //! * A falseticker (eligible, θ outside [low, high]) has `sv` = 0 and enters
 //!   none of `nn`, `dd`, `jj`: it does not influence `offset` or `jitter`.
 //!   Its own fields can change freely without changing the output, as long
@@ -361,6 +384,13 @@ pub struct Selection {
     pub mr3: Reg<U<4>>,
     /// Allow = 0 succeeded (decided in FIN0).
     pub s0: Reg<Bit>,
+    /// Start-up majority (F4): the truechimers of allow = 0 / allow = 1
+    /// number at least `n_en / 2 + 1` (registered every cycle; read in
+    /// FIN1, its inputs are constant from the end of INTER).
+    pub g0: Reg<Bit>,
+    pub g1: Reg<Bit>,
+    /// A valid selection has been made since reset (F4).
+    pub ever: Reg<Bit>,
     /// Survivors.
     pub sv0: Reg<Bit>,
     pub sv1: Reg<Bit>,
@@ -406,8 +436,12 @@ pub struct Selection {
 }
 
 #[lower]
-impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
-    async fn run(&mut self, (stats, now): (Rx<PeerStat>, In<U<64>>), selected: Tx<Selected>) {
+impl Unit<(Rx<PeerStat>, In<U<64>>, In<U<3>>), Tx<Selected>> for Selection {
+    async fn run(
+        &mut self,
+        (stats, now, n_en): (Rx<PeerStat>, In<U<64>>, In<U<3>>),
+        selected: Tx<Selected>,
+    ) {
         loop {
             DefaultClock::rising().await;
             let st = self.st.get();
@@ -655,8 +689,23 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
             let nsv2 = el2 & Bit::from(mr2 > rlo) & Bit::from(mr2 < rhi);
             let nsv3 = el3 & Bit::from(mr3 > rlo) & Bit::from(mr3 < rhi);
             let all4 = nsv0 & nsv1 & nsv2 & nsv3;
-            let fin_fail = s_fin1 & !success;
-            let fin_ok = s_fin1 & success;
+            // Start-up majority (F4): truechimer counts for both allows,
+            // registered (g0, g1) and used in FIN1 until the first valid
+            // selection (`ever`).
+            let maj = (n_en.get() >> 1u32) + U::<3>::from(1u8);
+            let t00 = el0 & Bit::from(mr0 > lr0) & Bit::from(mr0 < hr0);
+            let t01 = el1 & Bit::from(mr1 > lr0) & Bit::from(mr1 < hr0);
+            let t02 = el2 & Bit::from(mr2 > lr0) & Bit::from(mr2 < hr0);
+            let t03 = el3 & Bit::from(mr3 > lr0) & Bit::from(mr3 < hr0);
+            let t10 = el0 & Bit::from(mr0 > lr1) & Bit::from(mr0 < hr1);
+            let t11 = el1 & Bit::from(mr1 > lr1) & Bit::from(mr1 < hr1);
+            let t12 = el2 & Bit::from(mr2 > lr1) & Bit::from(mr2 < hr1);
+            let t13 = el3 & Bit::from(mr3 > lr1) & Bit::from(mr3 < hr1);
+            let n_t0 = (t00.zext::<3>() + t01.zext::<3>()) + (t02.zext::<3>() + t03.zext::<3>());
+            let n_t1 = (t10.zext::<3>() + t11.zext::<3>()) + (t12.zext::<3>() + t13.zext::<3>());
+            let gate = self.ever.get() | mux(s0, self.g0.get(), self.g1.get());
+            let fin_fail = s_fin1 & !(success & gate);
+            let fin_ok = s_fin1 & success & gate;
 
             // ------------------------------------------------ clustering
             let cp = self.cp.get();
@@ -946,6 +995,8 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
             with!(self <= {
                 // Multiplier pipeline, every cycle.
                 rdx: rdx_n,
+                g0: Bit::from(n_t0 >= maj),
+                g1: Bit::from(n_t1 >= maj),
                 ma: opa,
                 mb: opb,
                 mp: prod,
@@ -1035,6 +1086,7 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
                 s_fin0 ? { s0: ok_a0, st: U::<5>::from(FIN1) },
                 fin_fail ? { ok: Bit::Zero, prev_v: Bit::Zero, st: U::<5>::from(OUT) },
                 fin_ok ? {
+                    ever: Bit::One,
                     ok: Bit::One,
                     sv0: nsv0,
                     sv1: nsv1,

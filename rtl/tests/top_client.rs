@@ -880,8 +880,9 @@ fn startup<F: Future<Output = ()>>(b: &mut Pins<F>) -> (TxFrame, TxFrame, Vec<Tx
 /// request to each: byte-exact against `build_request` (48 bytes, ports
 /// 123 -> 123, valid IPv4 header and UDP checksums, destination MAC learnt
 /// from the ARP reply / NA, source = our link-local address for the
-/// link-local upstream), T1 = the timestamp the client stored, consistent
-/// with the SFD on `txd`.
+/// link-local upstream), Transmit Timestamp = the Origin nonce (the
+/// seconds of the T1 the client stored, a random fraction: F3), T1
+/// consistent with the SFD on `txd`.
 #[test]
 fn startup_resolves_and_sends_requests() {
     // The Python model's own bytes for one T1 (client.py::build_request).
@@ -922,17 +923,21 @@ fn startup_resolves_and_sends_requests() {
         r4.sfd_tick / 2,
         r6.sfd_tick / 2
     );
-    for (f, v6, slot) in [(&r4, false, 0), (&r6, true, 1)] {
-        let Kind::Req(_, t1) = kind(&f.bytes) else {
+    for (f, v6, slot) in [(&r4, false, 0usize), (&r6, true, 1)] {
+        let Kind::Req(_, sent) = kind(&f.bytes) else {
             unreachable!()
         };
-        let want = if v6 { want_req6(t1) } else { want_req4(t1) };
+        let want = if v6 { want_req6(sent) } else { want_req4(sent) };
         same(
             &f.bytes,
             &want,
             if v6 { "IPv6 request" } else { "IPv4 request" },
         );
-        assert_eq!(b.p.m_t1.read(slot).raw() as u64, t1, "stored T1 = sent T1");
+        // F3: the Transmit Timestamp sent is the Origin nonce (T1's seconds,
+        // a random fraction from the entropy unit); T1 is kept in `m_t1`.
+        let t1 = b.p.m_t1.read(slot).raw() as u64;
+        assert_eq!(sent >> 32, t1 >> 32, "nonce seconds = stored T1 seconds");
+        assert_ne!(sent, t1, "the nonce is not the clock reading");
         assert!(b.p.out(slot), "request outstanding");
         let k = if v6 {
             CLIENT_TX_LATENCY_V6
@@ -945,20 +950,28 @@ fn startup_resolves_and_sends_requests() {
     }
 }
 
-/// (b): a spoofed reply (Origin != T1) does not reach the clock filter and
-/// leaves the request outstanding; the valid reply closes it and its sample
-/// (offset, delay bit-exact with `client.py::arith` from the T1 sent, the
+/// (b): a spoofed reply (Origin != the nonce sent, including Origin = the
+/// clock reading T1 itself) does not reach the clock filter and leaves the
+/// request outstanding; the valid reply closes it and its sample (offset,
+/// delay bit-exact with `client.py::arith` from the stored T1, the
 /// chosen T2/T3 and the receive stamp T4) is the state of peer 0 in the
 /// selection, with the reply's stratum and reference id.
 #[test]
 fn reply_reaches_the_filter_and_spoof_does_not() {
     let mut b = pins::<CliCfg, WarpClock<A_PINS>>();
     let (r4, _r6, _) = startup(&mut b);
-    let Kind::Req(_, t1) = kind(&r4.bytes) else {
+    let Kind::Req(_, sent) = kind(&r4.bytes) else {
         unreachable!()
     };
+    // The clock reading T1 of slot 0, for the arithmetic (F3: not sent).
+    let t1 = b.p.m_t1.read(0usize).raw() as u64;
     let delta = 5u64 << 32; // the upstream is 5 s ahead
-    answer_request(&mut b, &r4, 3, 0xBAD0_BAD0, Some(t1 ^ 0xFFFF), delta, 0, 12);
+    answer_request(&mut b, &r4, 3, 0xBAD0_BAD0, Some(sent ^ 0xFFFF), delta, 0, 12);
+    b.run(3000);
+    assert!(b.p.out(0), "spoofed reply: request still outstanding");
+    assert_eq!(b.p.rid0.get().raw(), 0, "spoofed reply: no sample");
+    // The clock reading itself as Origin: rejected too (F3).
+    answer_request(&mut b, &r4, 3, 0xBAD0_BAD0, Some(t1), delta, 0, 12);
     b.run(3000);
     assert!(b.p.out(0), "spoofed reply: request still outstanding");
     assert_eq!(b.p.rid0.get().raw(), 0, "spoofed reply: no sample");
@@ -1304,7 +1317,7 @@ impl<T: Clock> Unit<Rx<FrameByte, T>, (Out<Bit, T>, Out<Bit, T>)> for MiiTxModel
 fn clocks<R: Clock, T: Clock, C: ConfigSet, K: TestClock>(
     pre: &[(Vec<u8>, usize)],
     max_ticks: u64,
-    mut react: impl FnMut(&[u8], u64, &TimeLog) -> (Vec<(Vec<u8>, usize)>, bool),
+    mut react: impl FnMut(&[u8], u64, &TimeLog, &Probes) -> (Vec<(Vec<u8>, usize)>, bool),
 ) -> Vec<u64> {
     let acts = Rc::new(RefCell::new(VecDeque::new()));
     for (f, g) in pre {
@@ -1355,7 +1368,7 @@ fn clocks<R: Clock, T: Clock, C: ConfigSet, K: TestClock>(
             if n > seen {
                 let (f, t) = log.borrow()[seen].clone();
                 seen = n;
-                let (more, stop) = react(&f, t - t0, &times);
+                let (more, stop) = react(&f, t - t0, &times, &p);
                 if stop {
                     // End on a clk_sys edge: the next run starts there.
                     while (now() - t0) % 2 != 0 {
@@ -1405,7 +1418,7 @@ clock!(Tx40h, 8, 4);
 fn t1_through_core<C: ConfigSet, R: Clock, T: Clock>() -> f64 {
     let mut e = None;
     let mut prev_end = 0u64;
-    clocks::<R, T, C, WarpClock<A_CLK>>(&[], 400_000, |f, sfd, times| {
+    clocks::<R, T, C, WarpClock<A_CLK>>(&[], 400_000, |f, sfd, times, p| {
         let f = &f[..f.len() - 4];
         let mut more = vec![];
         let idle = sfd > prev_end + (24 + 16 + 8) * T::PERIOD;
@@ -1413,13 +1426,17 @@ fn t1_through_core<C: ConfigSet, R: Clock, T: Clock>() -> f64 {
         match kind(f) {
             Kind::ArpReq(ip) if ip == UP4 => more.push((arp_reply(UP4, UP4_MAC), 12)),
             Kind::Ns(t) if t == UP6 => more.push((na(UP6, UP6_MAC), 12)),
-            Kind::Req(v6, t1) => {
+            Kind::Req(v6, sent) => {
                 let (k, want) = if v6 {
-                    (CLIENT_TX_LATENCY_V6, want_req6(t1))
+                    (CLIENT_TX_LATENCY_V6, want_req6(sent))
                 } else {
-                    (CLIENT_TX_LATENCY_V4, want_req4(t1))
+                    (CLIENT_TX_LATENCY_V4, want_req4(sent))
                 };
                 assert_eq!(f, &want[..], "request bytes");
+                // The clock reading T1 (CliCfg4: slot 0, CliCfg6: slot 1);
+                // the Transmit Timestamp sent is the Origin nonce (F3).
+                let t1 = p.m_t1.read(if v6 { 1usize } else { 0 }).raw() as u64;
+                assert_eq!(sent >> 32, t1 >> 32, "nonce seconds = T1 seconds");
                 assert!(idle, "the request found the transmit path idle");
                 let x = diff_ns(times.unwarp(t1, k), ntp_at(sfd));
                 let fam = if v6 { "IPv6" } else { "IPv4" };
@@ -1475,7 +1492,7 @@ fn server_through_core<R: Clock, T: Clock>() -> Vec<(f64, f64)> {
     let mut got = vec![];
     let ticks = (8 + 2 * (1500 + 15 + 240)) * R::PERIOD + 6000;
     let pre = [(v4.0.clone(), 1500), (v6.0.clone(), 1500)];
-    let rx = clocks::<R, T, CliCfg, DisciplinedClock>(&pre, ticks, |f, sfd, _| {
+    let rx = clocks::<R, T, CliCfg, DisciplinedClock>(&pre, ticks, |f, sfd, _, _| {
         let f = &f[..f.len() - 4];
         match kind(f) {
             Kind::Reply(v6, ..) => {

@@ -4,7 +4,7 @@
 //! back-to-back events, stalled consumer, cycle count per event, lowering.
 use ntp_fpga::ntp_types::{PeerStat, Selected};
 use ntp_fpga::selection::{event_cycles, Selection, MAX_EVENT_CYCLES};
-use txhdl::comp::{chan, signal, DefaultClock, Running, Unit};
+use txhdl::comp::{chan, signal, tie, DefaultClock, Running, Unit};
 use txhdl::types::{Bit, U};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -49,6 +49,8 @@ struct Event {
 
 struct Scenario {
     name: String,
+    /// Enabled upstream slots (the unit's `n_en`, start-up majority F4).
+    n_en: u64,
     events: Vec<Event>,
 }
 
@@ -73,6 +75,7 @@ fn load() -> Vec<Scenario> {
         match w[0] {
             "scenario" => out.push(Scenario {
                 name: w[1].to_string(),
+                n_en: w[2].parse().unwrap(),
                 events: vec![],
             }),
             "stat" => {
@@ -176,6 +179,7 @@ const CHAN: usize = 2;
 /// room; all events must then share one `now`. `take(t)`: the consumer is
 /// ready in cycle t.
 fn drive(
+    n_en: u64,
     events: &[(u64, Stat)],
     back_to_back: bool,
     gap: impl Fn(usize) -> usize,
@@ -191,7 +195,8 @@ fn drive(
     let (st_tx, st_rx) = chan::<PeerStat, DefaultClock>();
     let (sel_tx, sel_rx) = chan::<Selected, DefaultClock>();
     let mut dut = Selection::default();
-    let mut sim = Running::new(dut.run((st_rx, now), sel_tx));
+    let n_en = tie::<U<3>, DefaultClock>(U::<3>::from(n_en as u8));
+    let mut sim = Running::new(dut.run((st_rx, now, n_en), sel_tx));
     let mut out: Vec<Got> = vec![];
     let mut sent_at: Vec<usize> = vec![];
     let mut wait_until = gap(0);
@@ -264,7 +269,7 @@ fn reference_vectors() {
     assert!(sc.len() > 300);
     let mut n = 0;
     for s in &sc {
-        let got = drive(&events_of(s), false, |_| 0, always);
+        let got = drive(s.n_en, &events_of(s), false, |_| 0, always);
         check(s, &got);
         for g in &got {
             let l = (g.recv - g.sent - CHAN) as u64;
@@ -290,11 +295,15 @@ fn cycles_per_event() {
         ("cluster_drop", 3, true),
         ("cluster_keep", 4, true),
         ("widest_spread4_keep", 4, true),
+        // F4: the start-up majority is not met (2 truechimers of 4 enabled
+        // slots): no selection, in the cycles of an event without one.
+        ("startup_gate_fails", 0, false),
+        ("startup_four_cluster", 3, true),
     ];
     let mut max = 0;
     for (name, n, tc4) in cases {
         let s = find(&sc, name);
-        let got = drive(&events_of(s), false, |i| 3 * i, always);
+        let got = drive(s.n_en, &events_of(s), false, |i| 3 * i, always);
         check(s, &got);
         let g = got.last().unwrap();
         let l = (g.recv - g.sent - CHAN) as u64;
@@ -327,19 +336,19 @@ fn back_to_back_and_gaps() {
         };
         let evs = events_of(s);
         if evs.iter().all(|e| e.0 == evs[0].0) {
-            let got = drive(&evs, true, |_| 0, always);
+            let got = drive(s.n_en, &evs, true, |_| 0, always);
             check(s, &got);
             // Back to back: each event is taken right after the previous output.
             for w in got.windows(2) {
                 assert!(w[1].recv > w[0].recv);
             }
         }
-        let got = drive(&evs, false, |i| (i * 37) % 101, always);
+        let got = drive(s.n_en, &evs, false, |i| (i * 37) % 101, always);
         check(s, &got);
     }
     // Random scenarios (each event has its own `now`) with gaps.
     for s in sc.iter().filter(|s| s.name.starts_with("random_")).take(60) {
-        let got = drive(&events_of(s), false, |i| (i * 13) % 7, always);
+        let got = drive(s.n_en, &events_of(s), false, |i| (i * 13) % 7, always);
         check(s, &got);
     }
 }
@@ -353,9 +362,9 @@ fn stalled_consumer() {
         let s = find(&sc, name);
         let evs = events_of(s);
         // Ready one cycle in 97, and never during a long first stall.
-        let got = drive(&evs, true, |_| 0, |t| t > 3000 && t % 97 == 0);
+        let got = drive(s.n_en, &evs, true, |_| 0, |t| t > 3000 && t % 97 == 0);
         check(s, &got);
-        let got = drive(&evs, false, |_| 0, |t| t % 5 == 4);
+        let got = drive(s.n_en, &evs, false, |_| 0, |t| t % 5 == 4);
         check(s, &got);
     }
     // Explicitly: the output channel buffers two Selected; with it full and
@@ -367,7 +376,8 @@ fn stalled_consumer() {
     let (sel_tx, sel_rx) = chan::<Selected, DefaultClock>();
     let mut dut = Selection::default();
     let state = dut.st;
-    let mut sim = Running::new(dut.run((st_rx, now), sel_tx));
+    let n_en = tie::<U<3>, DefaultClock>(U::<3>::from(1u8));
+    let mut sim = Running::new(dut.run((st_rx, now, n_en), sel_tx));
     now_o.set(U::<64>::from(s.events[0].now));
     let mut sent = 0;
     for _ in 0..5000 {
@@ -400,7 +410,7 @@ fn extremes() {
     let sc = load();
     let last = |name: &str| {
         let s = find(&sc, name);
-        let got = drive(&events_of(s), false, |_| 0, always);
+        let got = drive(s.n_en, &events_of(s), false, |_| 0, always);
         check(s, &got);
         got.last().unwrap().sel
     };
@@ -429,8 +439,36 @@ fn extremes() {
 fn falseticker_ignored() {
     let sc = load();
     let s = find(&sc, "three_one_false");
-    let got = drive(&events_of(s), false, |_| 0, always);
+    let got = drive(s.n_en, &events_of(s), false, |_| 0, always);
     check(s, &got);
     assert_eq!(got[2].sel.valid, 1);
     assert_eq!(got[2].sel, got[1].sel);
+}
+
+/// Security finding F4: until the first valid selection a majority of the
+/// enabled slots (`n_en / 2 + 1` truechimers) is required. One liar of two
+/// enabled slots never produces a selection (no start-up step); two of four
+/// are not enough, three are; once a selection has been made, one peer
+/// alone is accepted again. One enabled slot: the single source decides
+/// (residual risk).
+#[test]
+fn startup_majority() {
+    let sc = load();
+    let valid = |name: &str| -> Vec<u64> {
+        let s = find(&sc, name);
+        let got = drive(s.n_en, &events_of(s), false, |_| 0, always);
+        check(s, &got);
+        got.iter().map(|g| g.sel.valid).collect()
+    };
+    assert_eq!(valid("startup_one_enabled"), vec![1]);
+    assert_eq!(valid("startup_two_one_lies"), vec![0, 0, 0]);
+    assert_eq!(valid("startup_two_need_both"), vec![0, 1, 1, 1]);
+    assert_eq!(valid("startup_three"), vec![0, 0, 1]);
+    assert_eq!(valid("startup_four"), vec![0, 0, 1, 1, 1, 1, 1]);
+    assert_eq!(valid("startup_four_falseticker"), vec![0, 0, 0, 1]);
+    assert_eq!(valid("startup_seven"), vec![0, 0, 0, 1]);
+    // The same events with one enabled slot: selected at once.
+    let s = find(&sc, "startup_two_need_both");
+    let got = drive(1, &events_of(s), false, |_| 0, always);
+    assert_eq!(got[0].sel.valid, 1);
 }

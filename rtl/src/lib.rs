@@ -7,6 +7,7 @@ pub mod config;
 pub mod arp;
 pub mod crc32;
 pub mod crc_equiv;
+pub mod entropy;
 pub mod csum;
 pub mod eth_rx;
 pub mod eth_tx;

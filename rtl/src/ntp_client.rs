@@ -7,7 +7,8 @@
 //! accepted reply into one [`Sample`] for the clock filter (T4.3), or a
 //! `miss` when a poll got no usable answer. Bit-exact specification: the
 //! Python model `tools/golden/ntpclient/client.py` (`build_request`,
-//! `make_sample`, `next_hop4`, `next_hop6`, `src6`), replayed against
+//! `nonce`, `make_sample`, `next_hop4`, `next_hop6`, `src6`, `kod_backoff`),
+//! replayed against
 //! `tools/golden/ntpclient/vectors/client.txt` by `rtl/tests/ntp_client.rs`.
 //!
 //! # Ports (flat, in this order)
@@ -28,6 +29,7 @@
 //! | `precision` | `In<U<8>>` | our precision, signed log2 s, two's complement (`PRECISION_LOG2`) |
 //! | `tx_latency4`, `tx_latency6` | `In<U<64>>` | K of the IPv4 / IPv6 transmit path, 2^-32 s (`ntp_server::TX_LATENCY_V4/V6`) |
 //! | `time` | `In<U<96>>` | clock accumulator; NTP time (32.32) = `time >> 32`, NTP seconds = bits 64..95 |
+//! | `rnd` | `In<U<64>>` | entropy word (`entropy.rs`), low 32 bits sampled in cycle S (« Origin nonce ») |
 //! | `meta`, `rep` | `Rx<Meta>`, `Rx<FrameByte>` | mode-4 replies from `ntp_demux`: one `Meta` then the UDP payload, `err` on `last` = bad datagram |
 //! | `arp_rsp`, `nd_rsp` | `Rx<ArpEntry>` | answers to `arp_lookup` / `nd_lookup` (one per lookup) |
 //!
@@ -41,6 +43,7 @@
 //! | `req6`, `pay6` | `Tx<Udp6TxReq>`, `Tx<FrameByte>` | IPv6 request to `udp6_tx`, same |
 //! | `samples` | `Tx<Sample>` | one per accepted reply (to the clock filter) |
 //! | `miss` | `Tx<U<2>>` | slot index of a poll counted as unanswered |
+//! | `rx_stamp` | `Out<U<64>>` | `Meta.rx_ts` of the last reply `Meta` taken (register `rxts`; 0 after reset): stirring input of the entropy unit |
 //!
 //! All channels must be registered channels or FIFOs (netlist note of
 //! `stream.rs`). The neighbor units must answer every lookup (exactly one
@@ -55,8 +58,9 @@
 //! examines), and `cs`, the slot of the event in progress (reply or request
 //! path). In every cycle the slot wires and the per-slot state are read,
 //! and written, at `ix` = `sp` in `SCAN`, `cs` in every other state.
-//! Per-slot state lives in three 4-word distributed RAMs read
-//! asynchronously at `ix`: `m_t1` (T1 of the outstanding request), `m_tm`
+//! Per-slot state lives in four 4-word distributed RAMs read
+//! asynchronously at `ix`: `m_t1` (T1, the clock reading of the outstanding
+//! request), `m_org` (the 32-bit fraction of the Origin nonce sent), `m_tm`
 //! (`last`: tick of the last poll start, or of the arming (see
 //! Scheduler), bits 95..64; `tsent`: NTP second at which T1 was sampled,
 //! 63..32; `rt`: tick of the last failed lookup, 31..0, a tick being 2^-6
@@ -66,7 +70,10 @@
 //! `burst` = polls started since enable (saturates at 4), bits 9..6
 //! `tries` = failed lookups of the current poll, bit 10 `arm` = the slot's
 //! start time `last` was taken, meaningful while `burst` = 0). All memories start at zero (no reset). At most one write per
-//! memory per cycle.
+//! memory per cycle. The Kiss-o'-Death state of slot i is in registers
+//! (reset 0): `kx<i>` (RATE back-off exponent, 0 = none) and `dd<i>` (`dead`: DENY or
+//! RSTR received), read at `ix` like the RAMs and cleared with the flags
+//! when the slot is disabled (action 1).
 //!
 //! States: `SCAN` (idle: takes a reply or examines slot `sp`), reply path
 //! `RX` → `CHK` → `C2` → `SMP`, request path `LKP` → `LWT` → `REQ` →
@@ -97,9 +104,15 @@
 //!    `arm` = 1 and) `now_t - last >= 16 * sp` ticks, i.e. the slot's own
 //!    **stagger** `sp * 2^-2 s` has elapsed since its arming; or `burst` >= 1
 //!    and `now_t - last >= I * 64` ticks with `I` = 2 s ([`IBURST_GAP_S`])
-//!    while `burst < 4`, else `I = 2^clamp(poll_log2, 4, 17)` s (sampled
-//!    then). The poll starts: `last` := `now_t`, `pend` := 1, `tries` := 0,
-//!    `arm` := 0, `burst` := min(burst + 1, 4).
+//!    while `burst < 4`, else `I = 2^max(clamp(poll_log2, 4, 17), kx)` s
+//!    (`kx` is the slot's RATE back-off, « Kiss-o'-Death » below, 0 when
+//!    none; this interval is registered per slot in `pt<i>` every cycle, so
+//!    it follows `poll_log2` and `kx` one cycle late). The poll starts:
+//!    `last` := `now_t`, `pend` := 1, `tries` := 0, `arm` := 0, `burst` :=
+//!    min(burst + 1, 4). For a **dead** slot (`dd` = 1) the poll starts the
+//!    same way, then action 5 enters `LKP`, which abandons it at once
+//!    (`pend` := 0, `MISS`: one miss, no lookup, no request): the clock
+//!    filter sees an unreachable peer every `2^poll` s.
 //!
 //!    **Staggered schedule.** All slots of a freshly enabled (or reset)
 //!    unit are armed within a few cycles of one another, at `t0` (to a few
@@ -146,7 +159,8 @@
 //!   `fe80::/10` or (`gua_valid` and its upper 64 bits equal `local_gua`'s)
 //!   else `gateway6`.
 //! * `LKP`: sends `arp_lookup(next hop)` (IPv4) or `nd_lookup` (IPv6) when
-//!   the channel has room, then `LWT`.
+//!   the channel has room, then `LWT`; for a dead slot (KoD DENY / RSTR)
+//!   nothing is sent: `pend` := 0 and `MISS`.
 //! * `LWT`: waits for the answer on `arp_rsp` / `nd_rsp` (one per lookup;
 //!   the other channel is not read). `found`: the MAC is kept, `REQ`.
 //!   Not found: `tries` += 1, `rt` := `now_t`, and `arp_resolve` /
@@ -167,8 +181,9 @@
 //! * `PAY`: the 48 bytes on `pay4` / `pay6`, one per cycle when the channel
 //!   has room, `last` on byte 47, `err` = 0: byte 0 = 0x23 (LI 0, VN 4,
 //!   mode 3), byte 2 = `poll_log2` (raw, sampled when byte 2 is sent), byte
-//!   3 = `precision` (sampled when byte 3 is sent), bytes 40..47 = T1 big
-//!   endian, every other byte 0 (Python `build_request`).
+//!   3 = `precision` (sampled when byte 3 is sent), bytes 40..47 = the
+//!   **Origin nonce** (below) big endian, every other byte 0 (Python
+//!   `build_request`).
 //!
 //! ## Transmit timestamp T1 (same rule as the server's T3)
 //!
@@ -182,6 +197,38 @@
 //! integration may need to add the cycles of an extra channel stage). In S
 //! `m_t1[cs]` := T1 and `tsent` := `now_s`; when byte 47 is sent, `out` :=
 //! 1, `pend` := 0, `sent` := 1, and the unit returns to `SCAN`.
+//!
+//! ## Origin nonce (security finding F3)
+//!
+//! T1 is our clock reading, predictable to about 7 bits for anyone who
+//! queries our server (`docs/security.md`, F3): sent as is, it lets an
+//! off-path attacker forge upstream replies. So the Transmit Timestamp of
+//! the request (bytes 40..47) is a **nonce**: `N = {T1[63:32], T1[31:0] ^
+//! rnd[31:0]}` with `rnd` sampled in cycle S (`entropy.rs`). In S
+//! `m_org[cs]` := `N[31:0]`; T1 itself goes to `m_t1` as before and is
+//! the only value the arithmetic uses. A reply is matched against `N`
+//! (`CHK`).
+//!
+//! * The **seconds** stay T1's: the nonce is a plausible timestamp (a
+//!   server copies it to the reply's Origin without interpreting it, RFC
+//!   5905 §8; a middlebox or a strict server sees a sane date), and the
+//!   seconds carry no secret anyway. Randomising low seconds bits would add
+//!   entropy but send a timestamp up to 2^k s off, which RFC 5905 does not
+//!   forbid but which data-minimisation leaves to a fully random field
+//!   (chrony): kept for future work.
+//! * The **32 fraction bits** are uniform when `rnd` is (XOR with T1's own
+//!   fraction keeps them uniform): ntpd only randomises the bits below its
+//!   precision; here all 32 are. Entropy budget: 32 bits per request, fresh
+//!   for every request (the generator advances every cycle). An off-path
+//!   attacker must match the exact 64-bit Origin (32 unknown bits) and also
+//!   the upstream's address, source port 123 and a reply that arrives
+//!   before the real one or the 1-2 s deadline: each forged packet succeeds
+//!   with probability 2^-32 (2^31 packets, about 190 GB at 90 bytes each,
+//!   for an even chance per poll), against 2^7 before. The bound assumes
+//!   the entropy unit's output is unknown to him: see `entropy.rs` for what
+//!   that rests on (per-device seed, network arrival jitter; no TRNG).
+//! * An on-path attacker sees the nonce and is not stopped by it (nor by
+//!   anything short of authentication, `docs/security.md` F7).
 //!
 //! # Reply path
 //!
@@ -197,12 +244,43 @@
 //!   ignored. When `last` is taken: dropped (back to `SCAN`, nothing sent)
 //!   if `err`, fewer than 48 bytes or not `hit`; else `CHK`.
 //! * `CHK` (slot `cs`): the reply is **authentic** iff `out` = 1, mode = 4,
-//!   VN = 3 or 4, and Origin == `m_t1[cs]` (anti-spoofing). Not authentic:
-//!   dropped, the request stays outstanding (a bogus reply never causes a
-//!   miss nor closes the request). Authentic: `out` := 0 (so a second reply
-//!   to the same request is dropped as not outstanding), and if stratum = 0
-//!   (KoD), stratum >= 16 or LI = 3 (alarm): `MISS` (the poll is counted as
-//!   a miss at once, no sample); else the first arithmetic stage, `C2`.
+//!   VN = 3 or 4, and Origin == `{m_t1[cs][63:32], m_org[cs]}`, the nonce
+//!   sent (anti-spoofing; the comparison is registered, `oke`, in the last
+//!   `RX` cycle: Origin is complete from byte 31 on and the RAMs are not
+//!   written during `RX`). Not authentic: dropped, the request stays
+//!   outstanding (a bogus reply never causes a miss nor closes the
+//!   request). Authentic: `out` := 0 (so a second reply to the same
+//!   request is dropped as not outstanding), and if stratum = 0 (KoD,
+//!   below), stratum >= 16 or LI = 3 (alarm): `MISS` (the poll is counted
+//!   as a miss at once, no sample); else the first arithmetic stage, `C2`.
+//!
+//! ## Kiss-o'-Death (security finding F9, RFC 5905 §7.4)
+//!
+//! An authentic reply of stratum 0 is a KoD; its kiss code is the Reference
+//! ID (bytes 12..15). `CHK` registers the kind (`kr`: RATE, `kd`: DENY or
+//! RSTR; both cleared in every other `SCAN` cycle) and the state `MISS`
+//! that follows applies it (slot `cs`; repeated, idempotent, while `miss`
+//! stalls), besides the miss:
+//!
+//! * `"RATE"` ([`KOD_RATE`]): back off. With `e` = max(clamp(`poll_log2`,
+//!   4, 17), `kx`), the exponent in use: if `e` < [`KOD_POLL_MAX`] (10),
+//!   `kx` := `e` + 1; else nothing (the
+//!   interval is already 2^10 s or more). The iburst ends (`burst` := 4).
+//!   The slot's polls are then at least `2^kx` s apart (scheduler action
+//!   4), so each RATE doubles the interval in use, up to 2^10 s, never below
+//!   the configured poll; it stays until reset or the slot is disabled.
+//! * `"DENY"` or `"RSTR"` ([`KOD_DENY`], [`KOD_RSTR`]): the slot is
+//!   **dead** (`dd` := 1, `burst` := 4) until reset (or until it is
+//!   disabled and enabled again, impossible on the board where `up<i>_en`
+//!   are synthesis constants): no lookup, no request any more, each later
+//!   poll start a miss.
+//! * Any other kiss code: no state change (one miss, as for an unusable
+//!   reply).
+//!
+//! A KoD acts only if it passes the Origin check: forging one is as hard as
+//! forging a reply (2^-32 per packet off path, F3). An on-path attacker can
+//! silence one upstream slot with a forged DENY; the selection's majority
+//! (F4, `selection.rs`) and three or more upstreams contain that.
 //! * `C2`, `SMP`: arithmetic (below); `SMP` sends the `Sample` when
 //!   `samples` has room and returns to `SCAN`.
 //! * `MISS`: sends `miss(cs)` when `miss` has room, returns to `SCAN`.
@@ -236,8 +314,9 @@
 //!
 //! # Deviations from RFC 5905 (v1 decisions)
 //!
-//! No poll adaptation from the reply's poll, no KoD `RATE`/`DENY` handling
-//! beyond counting the poll as missed, no duplicate test on T3 (the single
+//! No poll adaptation from the reply's poll (a RATE KoD only raises the
+//! slot's own interval, without ever lowering it again), no duplicate test
+//! on T3 (the single
 //! outstanding Origin makes a replay useless), no check of T2/T3 being
 //! nonzero, a fixed 1-2 s reply deadline instead of "until the next poll",
 //! and the reply is taken only from source port 123.
@@ -246,7 +325,7 @@ use crate::ntp_types::{Sample, PEERS, PHI_Q32};
 use crate::stream::{FrameByte, Meta};
 use crate::udp4_tx::UdpTxReq;
 use crate::udp6_tx::Udp6TxReq;
-use txhdl::comp::{mux, Clock, DefaultClock, In, Mem, Reg, Rx, Tx, Unit};
+use txhdl::comp::{mux, Clock, DefaultClock, In, Mem, Out, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{lower, with, Trace};
 
@@ -268,8 +347,16 @@ pub const RES_TRIES: u8 = 8;
 pub const RETRY_TICKS: u32 = 2;
 /// Byte 0 of a request: LI 0, VN 4, mode 3.
 pub const REQ_B0: u8 = 0x23;
+/// Kiss codes (RFC 5905 §7.4) in the Reference ID of a stratum-0 reply.
+pub const KOD_RATE: u32 = 0x5241_5445; // "RATE"
+pub const KOD_DENY: u32 = 0x4445_4E59; // "DENY"
+pub const KOD_RSTR: u32 = 0x5253_5452; // "RSTR"
+/// Largest poll exponent a RATE back-off reaches (2^10 s).
+pub const KOD_POLL_MAX: u8 = 10;
 
 const _: () = assert!(PEERS == 4);
+// The iburst tick mask (`ival_m`, all bits from 7 up) is 2 s = 2^7 ticks.
+const _: () = assert!(IBURST_GAP_S == 2);
 
 const S_SCAN: u8 = 0;
 const S_RX: u8 = 1;
@@ -302,16 +389,22 @@ pub fn prec_pow(pr: U<8>) -> U<64> {
     )
 }
 
-/// `2^clamp(p, 4, 17)` seconds, as a 32-bit count.
+/// `clamp(p, 4, 17)`.
 #[lower]
-pub fn poll_secs(p: U<8>) -> U<32> {
+pub fn poll_clamp(p: U<8>) -> U<8> {
     let lo = Bit::from(p < U::<8>::from(POLL_MIN));
     let hi = Bit::from(p > U::<8>::from(POLL_MAX));
-    let c = mux(
+    mux(
         lo,
         U::<8>::from(POLL_MIN),
         mux(hi, U::<8>::from(POLL_MAX), p),
-    );
+    )
+}
+
+/// `2^clamp(p, 4, 17)` seconds, as a 32-bit count.
+#[lower]
+pub fn poll_secs(p: U<8>) -> U<32> {
+    let c = poll_clamp(p);
     let sh = c.slice::<0, 5>();
     let x0 = U::<32>::from(1u32);
     let x1 = mux(sh.bit(0), x0 << 1u32, x0);
@@ -344,6 +437,10 @@ pub struct NtpClient {
     /// Bytes 0..15, byte 0 in bits 127..120 once complete.
     pub hdr: Reg<U<128>>,
     pub org: Reg<U<64>>,
+    /// `org` == the nonce of slot `ix`, registered every cycle (task F3:
+    /// the 64-bit compare ends at a register; in `CHK` it holds the
+    /// comparison of the last `RX` cycle, whose operands are final).
+    pub oke: Reg<Bit>,
     pub t2: Reg<U<64>>,
     pub t3: Reg<U<64>>,
     // Arithmetic.
@@ -361,9 +458,38 @@ pub struct NtpClient {
     pub t1r: Reg<U<64>>,
     /// `(time >> 32) + latency` of the previous cycle.
     pub t1p: Reg<U<64>>,
+    // Per-slot KoD state (security finding F9), slot i.
+    /// RATE back-off exponent (0: none, else 5..=KOD_POLL_MAX).
+    pub kx0: Reg<U<4>>,
+    pub kx1: Reg<U<4>>,
+    pub kx2: Reg<U<4>>,
+    pub kx3: Reg<U<4>>,
+    /// Regular poll interval of slot i as a tick mask: the ticks count `T`
+    /// = `2^max(clamp(poll_log2), kx<i>) * 64` = 2^k with k in 10..=23 is
+    /// kept as bits 7..23 of `-T` mod 2^32 (the bits at and above k), so
+    /// that `since >= T` is `since[31:24] != 0 | (since[23:7] & pt) != 0`
+    /// (no carry chain); registered every cycle (one cycle behind its
+    /// inputs).
+    pub pt0: Reg<U<17>>,
+    pub pt1: Reg<U<17>>,
+    pub pt2: Reg<U<17>>,
+    pub pt3: Reg<U<17>>,
+    /// The authentic reply checked in `CHK` was a RATE / a DENY or RSTR KoD
+    /// (registered; its effect is applied in `MISS`, which follows).
+    pub kr: Reg<Bit>,
+    pub kd: Reg<Bit>,
+    /// DENY / RSTR received: no more requests (`dead`).
+    pub dd0: Reg<Bit>,
+    pub dd1: Reg<Bit>,
+    pub dd2: Reg<Bit>,
+    pub dd3: Reg<Bit>,
     // Per-slot state.
     #[distributed]
     pub m_t1: Mem<U<64>, 4, DefaultClock>,
+    /// Fraction (low 32 bits) of the Origin nonce sent: the Transmit
+    /// Timestamp of the request is `{m_t1[63:32], m_org}` (F3).
+    #[distributed]
+    pub m_org: Mem<U<32>, 4, DefaultClock>,
     /// `{last[95:64] (tick), tsent[63:32] (second), rt[31:0] (tick)}`.
     #[distributed]
     pub m_tm: Mem<U<96>, 4, DefaultClock>,
@@ -401,6 +527,7 @@ impl
             In<U<64>>,
             In<U<64>>,
             In<U<96>>,
+            In<U<64>>,
             Rx<Meta>,
             Rx<FrameByte>,
             Rx<ArpEntry>,
@@ -417,6 +544,7 @@ impl
             Tx<FrameByte>,
             Tx<Sample>,
             Tx<U<2>>,
+            Out<U<64>>,
         ),
     > for NtpClient
 {
@@ -448,6 +576,7 @@ impl
             tx_latency4,
             tx_latency6,
             time,
+            rnd,
             meta,
             rep,
             arp_rsp,
@@ -478,12 +607,25 @@ impl
             In<U<64>>,
             In<U<64>>,
             In<U<96>>,
+            In<U<64>>,
             Rx<Meta>,
             Rx<FrameByte>,
             Rx<ArpEntry>,
             Rx<ArpEntry>,
         ),
-        (arp_lookup, arp_resolve, nd_lookup, nd_resolve, req4, pay4, req6, pay6, samples, miss): (
+        (
+            arp_lookup,
+            arp_resolve,
+            nd_lookup,
+            nd_resolve,
+            req4,
+            pay4,
+            req6,
+            pay6,
+            samples,
+            miss,
+            rx_stamp,
+        ): (
             Tx<U<32>>,
             Tx<U<32>>,
             Tx<U<128>>,
@@ -494,11 +636,13 @@ impl
             Tx<FrameByte>,
             Tx<Sample>,
             Tx<U<2>>,
+            Out<U<64>>,
         ),
     ) {
         loop {
             DefaultClock::rising().await;
             let _ = local_mac.get();
+            rx_stamp.set(self.rxts.get());
             let st = self.st.get();
             let cs = self.cs.get();
             let pos = self.pos.get();
@@ -538,10 +682,26 @@ impl
             let s_addr = mux(c1, mux(c0, a3, a2), mux(c0, a1, a0));
             let s_v6 = mux(c1, mux(c0, v3, v2), mux(c0, v1, v0));
             let s_en = mux(c1, mux(c0, e3, e2), mux(c0, e1, e0));
+            // Per-slot KoD state of slot ix.
+            let kx_s = mux(
+                c1,
+                mux(c0, self.kx3.get(), self.kx2.get()),
+                mux(c0, self.kx1.get(), self.kx0.get()),
+            );
+            let dd_s = mux(
+                c1,
+                mux(c0, self.dd3.get(), self.dd2.get()),
+                mux(c0, self.dd1.get(), self.dd0.get()),
+            );
+            let ix0 = Bit::from(ix == 0);
+            let ix1 = Bit::from(ix == 1);
+            let ix2 = Bit::from(ix == 2);
+            let ix3 = Bit::from(ix == 3);
 
             let fl = self.m_fl.read(ix);
             let tm = self.m_tm.read(ix);
             let t1s = self.m_t1.read(ix);
+            let orgs = self.m_org.read(ix);
             let f_out = fl.bit(0);
             let f_pend = fl.bit(1);
             let f_sent = fl.bit(2);
@@ -568,11 +728,25 @@ impl
             // ------------------------------------------- scheduler (SCAN)
             let dl_due = Bit::from((now_s - m_tsent) >= U::<32>::from(DEADLINE_S));
             let in_burst = Bit::from(f_burst < U::<3>::from(IBURST_COUNT));
-            let ival = mux(
-                in_burst,
-                U::<32>::from(IBURST_GAP_S),
-                poll_secs(poll_log2.get()),
+            // Interval in ticks: 2 s in the iburst, else the slot's registered
+            // regular interval `pt` (2^max(clamp(poll_log2), kx) s, the RATE
+            // back-off of F9; a 4:1 register multiplexer in parallel with the
+            // RAM read and `since`).
+            let pt_s = mux(
+                c1,
+                mux(c0, self.pt3.get(), self.pt2.get()),
+                mux(c0, self.pt1.get(), self.pt0.get()),
             );
+            // Iburst: 2 s = 2^7 ticks, every bit from 7 up.
+            let ival_m = mux(in_burst, U::<17>::from(0x1_FFFFu32), pt_s);
+            let pcl = poll_clamp(poll_log2.get());
+            let kxw = kx_s.zext::<8>();
+            let ecur = mux(kxw > pcl, kxw, pcl);
+            // `pt` of slot i from its own `kx`.
+            let pe0 = mux(self.kx0.get().zext::<8>() > pcl, self.kx0.get().zext::<8>(), pcl);
+            let pe1 = mux(self.kx1.get().zext::<8>() > pcl, self.kx1.get().zext::<8>(), pcl);
+            let pe2 = mux(self.kx2.get().zext::<8>() > pcl, self.kx2.get().zext::<8>(), pcl);
+            let pe3 = mux(self.kx3.get().zext::<8>() > pcl, self.kx3.get().zext::<8>(), pcl);
             // Ticks since `last` (the arming or the previous poll start).
             let since = now_t - m_last;
             // First poll: `ix * 16` ticks (ix * 2^-2 s) after the arming.
@@ -580,7 +754,8 @@ impl
             let due = mux(
                 Bit::from(f_burst == U::<3>::from(0u8)),
                 f_arm & Bit::from(since >= stagger),
-                Bit::from(since >= (ival << 6u32)),
+                Bit::from(since.slice::<24, 8>() != U::<8>::from(0u8))
+                    | Bit::from((since.slice::<7, 17>() & ival_m) != U::<17>::from(0u8)),
             );
             let rt_ok = Bit::from(f_tries == U::<4>::from(0u8))
                 | Bit::from((now_t - m_rt) >= U::<32>::from(RETRY_TICKS));
@@ -657,13 +832,30 @@ impl
             let r_li = r_b0.slice::<6, 2>();
             let r_st = hdr.slice::<112, 8>();
             let r_prec = hdr.slice::<96, 8>();
+            // Origin must be the nonce sent: T1's seconds, `m_org` fraction (F3).
+            let r_org = self.org.get();
+            let org_eq = Bit::from(r_org.slice::<32, 32>() == t1s.slice::<32, 32>())
+                & Bit::from(r_org.slice::<0, 32>() == orgs);
             let auth = f_out
                 & Bit::from(r_mode == 4)
                 & (Bit::from(r_vn == 3) | Bit::from(r_vn == 4))
-                & Bit::from(self.org.get() == t1s);
+                & self.oke.get();
             let unusable = Bit::from(r_st == U::<8>::from(0u8))
                 | Bit::from(r_st >= U::<8>::from(16u8))
                 | Bit::from(r_li == 3);
+            // Kiss-o'-Death (F9): RATE backs off, DENY / RSTR kill the slot.
+            let r_rid = hdr.slice::<0, 32>();
+            let kod = Bit::from(r_st == U::<8>::from(0u8));
+            let k_rate = kod & Bit::from(r_rid == U::<32>::from(KOD_RATE));
+            let k_deny = kod
+                & (Bit::from(r_rid == U::<32>::from(KOD_DENY))
+                    | Bit::from(r_rid == U::<32>::from(KOD_RSTR)));
+            // Applied in MISS (registered in CHK: off the Origin compare path).
+            let w_rate = is_miss & self.kr.get();
+            let w_deny = is_miss & self.kd.get();
+            let w_kod = w_rate | w_deny;
+            let bo = w_rate & Bit::from(ecur < U::<8>::from(KOD_POLL_MAX));
+            let enew = (ecur + U::<8>::from(1u8)).slice::<0, 4>();
             let rxts = self.rxts.get();
             let t2 = self.t2.get();
             let t3 = self.t3.get();
@@ -714,8 +906,8 @@ impl
             }
 
             // ------------------------------------------- LKP / LWT
-            let send_l4 = is_lkp & !s_v6 & arp_lookup.ready();
-            let send_l6 = is_lkp & s_v6 & nd_lookup.ready();
+            let send_l4 = is_lkp & !dd_s & !s_v6 & arp_lookup.ready();
+            let send_l6 = is_lkp & !dd_s & s_v6 & nd_lookup.ready();
             if send_l4.to_bool() {
                 arp_lookup.send(nh4);
             }
@@ -770,6 +962,10 @@ impl
             }
             let t1p = self.t1p.get();
             let t1r = self.t1r.get();
+            // The Transmit Timestamp sent (Origin nonce, F3): T1's seconds,
+            // T1's fraction XOR 32 random bits sampled in cycle S.
+            let nonce_lo = t1p.slice::<0, 32>() ^ rnd.get().slice::<0, 32>();
+            let nonce = t1p.slice::<32, 32>().concat::<32, 64>(nonce_lo);
             let at40 = Bit::from(k == 40);
             let ts_b = mux(at40, t1p.slice::<56, 8>(), t1r.slice::<56, 8>());
             let pb = mux(
@@ -807,8 +1003,14 @@ impl
             let fl_fire = (burst_n.zext::<11>() << 3u32)
                 | (fl & U::<11>::from(0b00000000101u16))
                 | U::<11>::from(0b10u8);
+            // dead slot in LKP: the poll is abandoned at once (pend 0) and
+            // counted as a miss, no lookup (off the SCAN path)
+            let w_dead = is_lkp & dd_s;
+            let fl_dead = fl & U::<11>::from(0b11111111101u16);
             // deadline / authentic reply: out 0
             let fl_noout = fl & U::<11>::from(0b11111111110u16);
+            // authentic RATE / DENY / RSTR: out 0 and the iburst ends (burst 4)
+            let fl_kod = (fl_noout & U::<11>::from(0b11111000111u16)) | U::<11>::from(0b100000u8);
             // lookup failed: tries + 1, or abandon (pend 0, tries 0)
             let fl_fail = mux(
                 give_up,
@@ -823,7 +1025,7 @@ impl
             let w_fire = do_sc & !sc_dis & !sc_dl & !sc_arm & sc_fire;
             let w_auth = is_chk & auth;
             let w_sent = send_p & p_last;
-            let fl_we = w_dis | w_dl | w_arm | w_fire | w_auth | fail | w_sent;
+            let fl_we = w_dis | w_dl | w_arm | w_fire | w_auth | w_kod | w_dead | fail | w_sent;
             let fl_wd = mux(
                 w_dis,
                 U::<11>::from(0u8),
@@ -833,7 +1035,15 @@ impl
                     mux(
                         w_arm,
                         fl | U::<11>::from(0b10000000000u16),
-                        mux(fail, fl_fail, mux(w_sent, fl_sent, fl_noout)),
+                        mux(
+                            fail,
+                            fl_fail,
+                            mux(
+                                w_sent,
+                                fl_sent,
+                                mux(w_kod, fl_kod, mux(w_dead, fl_dead, fl_noout)),
+                            ),
+                        ),
                     ),
                 ),
             );
@@ -862,6 +1072,11 @@ impl
             );
 
             with!(self <= {
+                oke: org_eq,
+                pt0: (U::<32>::from(0u8) - (poll_secs(pe0) << 6u32)).slice::<7, 17>(),
+                pt1: (U::<32>::from(0u8) - (poll_secs(pe1) << 6u32)).slice::<7, 17>(),
+                pt2: (U::<32>::from(0u8) - (poll_secs(pe2) << 6u32)).slice::<7, 17>(),
+                pt3: (U::<32>::from(0u8) - (poll_secs(pe3) << 6u32)).slice::<7, 17>(),
                 t1p: now.slice::<32, 64>() + mux(s_v6, tx_latency6.get(), tx_latency4.get()),
                 is_scan ? pri: !self.pri.get(),
                 take_m ? {
@@ -874,6 +1089,8 @@ impl
                 do_sc ? {
                     st: sc_next,
                     cs: ix,
+                    kr: Bit::Zero,
+                    kd: Bit::Zero,
                 },
                 is_scan & !sc_act ? sp: ix + U::<2>::from(1u8),
                 take_b & Bit::from(pos < 48) ? pos: pos + U::<6>::from(1u8),
@@ -883,6 +1100,8 @@ impl
                 take_b & Bit::from(pos >= 40) & Bit::from(pos < 48) ? t3: (t3 << 8u32) | d64,
                 rx_done ? st: mux(rx_ok, U::<4>::from(S_CHK), U::<4>::from(S_SCAN)),
                 is_chk ? {
+                    kr: auth & k_rate,
+                    kd: auth & k_deny,
                     st: mux(auth, mux(unusable, U::<4>::from(S_MISS), U::<4>::from(S_C2)), U::<4>::from(S_SCAN)),
                     ra: c_a,
                     rb: c_b,
@@ -898,6 +1117,7 @@ impl
                 },
                 send_s | send_x ? st: U::<4>::from(S_SCAN),
                 send_l4 | send_l6 ? st: U::<4>::from(S_LWT),
+                w_dead ? st: U::<4>::from(S_MISS),
                 got ? {
                     st: lwt_next,
                     mac: rmac,
@@ -907,12 +1127,26 @@ impl
                     k: U::<6>::from(0u8),
                 },
                 send_p ? k: k + U::<6>::from(1u8),
-                w_t40 ? t1r: t1p << 8u32,
+                w_t40 ? t1r: nonce << 8u32,
                 send_p & Bit::from(k > 40) ? t1r: t1r << 8u32,
                 w_sent ? st: U::<4>::from(S_SCAN),
                 fl_we ? m_fl.at(ix): fl_wd,
                 tm_we ? m_tm.at(ix): tm_wd,
                 w_t40 ? m_t1.at(ix): t1p,
+                w_t40 ? m_org.at(ix): nonce_lo,
+                // Per-slot KoD state: cleared when the slot is disabled.
+                w_dis & ix0 ? { kx0: U::<4>::from(0u8), dd0: Bit::Zero },
+                w_dis & ix1 ? { kx1: U::<4>::from(0u8), dd1: Bit::Zero },
+                w_dis & ix2 ? { kx2: U::<4>::from(0u8), dd2: Bit::Zero },
+                w_dis & ix3 ? { kx3: U::<4>::from(0u8), dd3: Bit::Zero },
+                bo & ix0 ? kx0: enew,
+                bo & ix1 ? kx1: enew,
+                bo & ix2 ? kx2: enew,
+                bo & ix3 ? kx3: enew,
+                w_deny & ix0 ? dd0: Bit::One,
+                w_deny & ix1 ? dd1: Bit::One,
+                w_deny & ix2 ? dd2: Bit::One,
+                w_deny & ix3 ? dd3: Bit::One,
             });
         }
     }
