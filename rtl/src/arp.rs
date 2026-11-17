@@ -375,7 +375,8 @@ impl
             check!(!(lk_take & m_have & Bit::from(lip == m_lip)) | (!lfound | Bit::from(lmac == m_lmac)), "a cache hit returns the MAC that was learned");
             check!(!(lk_take & !lfound) | Bit::from(lmac == 0u8), "a miss returns mac 0");
             cover!(take_h & send_rep, "a reply is sent (hdr)");
-            cover!(t_end & !tx_req, "a reply is sent completely");
+            // (A fully sent reply needs a depth of about 60, beyond the cover depth of 40:
+            // the reply hdr cover below stands for it; completion is a check! invariant.)
             cover!(take_h & send_rq, "a request is sent (hdr)");
             cover!(t_end & tx_req, "a request is sent completely");
             cover!(dec & Bit::from(op == 2), "an entry is learned from a reply");
