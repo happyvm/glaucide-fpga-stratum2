@@ -618,10 +618,19 @@ impl<C: ConfigSet>
 }
 impl<C: ConfigSet> SyncSource for ClientSync<C> {}
 
-/// The board build with the client-side discipline wired (Phase B): the
-/// same as [`ArtyBoard`] until the NTP client feeds `samples`/`miss`.
-pub type ArtyBoardWithClient =
-    ArtyTop<crate::config::Board, ClientSync<crate::config::Board>, crate::phy_init::Board>;
+/// The stratum-2 board build (task T1.14): `Board` addresses, the server
+/// and the NTP client wired ([`ArtyCoreClient`](crate::top_client::ArtyCoreClient):
+/// mode demultiplexers, ARP / neighbor cache, UDP arbiters, [`ClientSync`]),
+/// the real clock, real PHY timings.
+pub type ArtyBoardWithClient = ArtyTopOf<
+    crate::phy_init::Board,
+    crate::top_client::ArtyCoreClient<
+        ClkRx,
+        ClkTx,
+        crate::config::Board,
+        crate::clock::DisciplinedClock,
+    >,
+>;
 
 // ---------------------------------------------------------------------
 // The core: everything between the MII byte streams
@@ -1062,7 +1071,22 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
 // The top: MII units, PHY management, core
 // ---------------------------------------------------------------------
 
-/// The design as the board wrapper instantiates it (module `arty_top`).
+/// The core of a top (what sits between the MII units): [`ArtyCore`] (the
+/// server path, Phase A) or [`ArtyCoreClient`](crate::top_client::ArtyCoreClient)
+/// (server and NTP client, the stratum-2 board), at the board's MII clocks.
+pub trait TopCore:
+    Unit<(Rx<FrameByte, ClkRx>, In<Bit, ClkRx>, In<Bit, ClkTx>, In<Bit, ClkTx>), Tx<FrameByte, ClkTx>>
+    + Lower
+    + Port
+    + Traceable
+    + Default
+{
+}
+impl<C: ConfigSet, S: SyncSource> TopCore for ArtyCore<ClkRx, ClkTx, C, S> {}
+
+/// The design as the board wrapper instantiates it (module `arty_top`),
+/// generic in its core `K` ([`TopCore`]); [`ArtyTop`] is the server-only
+/// form (core [`ArtyCore`]), [`ArtyBoardWithClient`] the stratum-2 board.
 ///
 /// Ports: `rxd` (`In<U<4>, ClkRx>`), `rx_dv`, `rx_er` (`In<Bit, ClkRx>`),
 /// `mdio_i` (`In<Bit>`) in; `txd` (`Out<U<4>, ClkTx>`), `tx_en`
@@ -1072,16 +1096,16 @@ impl<R: Clock, T: Clock, C: ConfigSet, S: SyncSource>
 /// go straight into `mii_rx`. The netlist adds the clock inputs `clk`
 /// (`clk_sys`), `clk_rx`, `clk_tx` and `rst`.
 #[derive(Trace)]
-pub struct ArtyTop<C: ConfigSet, S: SyncSource, P: PhyTiming> {
+pub struct ArtyTopOf<P: PhyTiming, K: TopCore> {
     pub mii_rx: MiiRx,
     pub mii_tx: MiiTx,
     pub phy: PhyInit<P>,
-    pub core: ArtyCore<ClkRx, ClkTx, C, S>,
+    pub core: K,
 }
 
-impl<C: ConfigSet, S: SyncSource, P: PhyTiming> Default for ArtyTop<C, S, P> {
+impl<P: PhyTiming, K: TopCore> Default for ArtyTopOf<P, K> {
     fn default() -> Self {
-        ArtyTop {
+        ArtyTopOf {
             mii_rx: Default::default(),
             mii_tx: Default::default(),
             phy: Default::default(),
@@ -1090,12 +1114,16 @@ impl<C: ConfigSet, S: SyncSource, P: PhyTiming> Default for ArtyTop<C, S, P> {
     }
 }
 
+/// The server-only top: core [`ArtyCore`] with configuration `C` and
+/// synchronisation source `S` (Phase A; the system tests of `top.rs`).
+pub type ArtyTop<C, S, P> = ArtyTopOf<P, ArtyCore<ClkRx, ClkTx, C, S>>;
+
 /// The board build: `Board` addresses, never synchronised (Phase A), real
 /// PHY timings.
 pub type ArtyBoard = ArtyTop<crate::config::Board, Standalone, crate::phy_init::Board>;
 
 #[lower]
-impl<C: ConfigSet, S: SyncSource, P: PhyTiming>
+impl<P: PhyTiming, K: TopCore>
     Unit<
         (In<U<4>, ClkRx>, In<Bit, ClkRx>, In<Bit, ClkRx>, In<Bit>),
         (
@@ -1109,7 +1137,7 @@ impl<C: ConfigSet, S: SyncSource, P: PhyTiming>
             Out<Bit>,
             Out<Bit>,
         ),
-    > for ArtyTop<C, S, P>
+    > for ArtyTopOf<P, K>
 {
     async fn run(
         &mut self,
