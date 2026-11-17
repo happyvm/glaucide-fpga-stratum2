@@ -34,6 +34,14 @@ Pour qu'une unité soit prouvable, il faut la déclarer dans `rtl/src/bin/formal
 - **Point de confiance 2** : les modèles de référence d'équivalence (CRC, checksum) sont des unités TxHDL simples et lentes, écrites en Rust ; on prouve que la version rapide leur est égale (F1.1, F2.1). Leur exactitude se valide contre les vecteurs normatifs (`123456789` → `0xCBF43926`, RFC 1071).
 - Non retenu : preuve directe du Rust (type Kani), car la sémantique prouvée serait celle du Rust et non du circuit ; fichiers SystemVerilog externes liés par `bind`, remplacés par les moniteurs Rust (F0.5).
 
+## Partage des rôles (décision du propriétaire du projet)
+
+**Les agents qui écrivent le RTL livrent le RTL et les tests, et ne rédigent pas les propriétés formelles de leur propre module.** L'orchestrateur écrit les `check!`/`assume!`/`cover!` et lance les preuves **après fusion**, à partir de ce catalogue, des RFC et du modèle Python `tools/golden/`, et non à partir de l'implémentation : l'auteur d'un module ne doit pas être celui qui écrit ses propriétés, qui reproduiraient ses erreurs. Les modules livrés avant cette décision (T1.1 à T1.8, T3.2) contiennent des propriétés écrites par leurs auteurs ; elles sont **revues** et complétées par l'orchestrateur, module par module (suivi dans `docs/formal-report.md`).
+
+## Équivalences avec une référence indépendante
+
+Pour prouver qu'un opérateur rapide égale sa définition, la référence ne doit pas réutiliser le code testé. Exemple : `rtl/src/crc_equiv.rs` (généré par `tools/formal/gen_crc_equiv.py`, F1.1) : le CRC-32 octet par octet est linéaire sur GF(2) ; le script calcule en Python, à partir du seul polynôme, la matrice de l'application ; l'unité affirme, pour les 2^40 entrées, `crc32_step(crc, octet)` = produit matriciel de `crc ^ octet`. Preuve : k-induction, PASS ; mutation (un bit du polynôme changé à un étage) : FAIL dès le cas de base.
+
 ## Méthode : garantie/hypothèse
 
 1. **Chaque module prouve ses garanties** (`check!`) sous des hypothèses sur ses entrées (`assume!`).
