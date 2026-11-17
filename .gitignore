@@ -2,3 +2,5 @@
 /third_party/hdl-txhdl/
 /out/
 /.claude/worktrees/
+__pycache__/
+*.pyc
