@@ -23,6 +23,7 @@ pub mod mii_rx;
 pub mod ntp_demux;
 pub mod ntp_types;
 pub mod mii_tx;
+pub mod nbr_cache;
 pub mod ntp_server;
 pub mod phy_init;
 pub mod refid;

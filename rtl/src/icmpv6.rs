@@ -24,7 +24,9 @@
 //!   continues after byte 1: echo to answer (below);
 //! * type 135, code 0, `meta.hop == 255` (rule M1), `meta.len >= 24`, message
 //!   continues: neighbor solicitation to examine (below);
-//! * anything else (other types, RA/NA/Redirect, code != 0, hop limit of an
+//! * type 136 (NA), code 0, `meta.hop == 255`, `meta.len >= 24`, message
+//!   continues: neighbor advertisement to learn from (T3.6, below);
+//! * anything else (other types, RA/Redirect, code != 0, hop limit of an
 //!   NS != 255, too short, echo to the solicited-node group): **nothing is
 //!   sent**, no `req`, no payload byte; the message is swallowed up to its
 //!   `last`.
@@ -93,6 +95,61 @@
 //! The seed `pseudo_v6` is a single-cycle path (19 chained 32-bit additions)
 //! from the registered `meta` to `acc`: a timing watch point.
 //!
+//! # Neighbor discovery as an initiator (task T3.6)
+//!
+//! Extra ports: `resolve` (`Rx<U<128>>`, input, last): an IPv6 address to
+//! resolve; `learn` (`Tx<NdLearn>`, output, last): `NdLearn { ip, mac }`, a
+//! neighbor learnt from the wire, for `NbrCache`. Learning never produces an
+//! output frame by itself. Rules in `tools/golden/responder.py` (`solicit`,
+//! `learn`, rules N1-N5).
+//!
+//! ## Solicitation (N1-N3)
+//!
+//! `resolve` is taken only when the unit is idle at a message boundary (state
+//! GATHER, byte 0 not yet taken); while a message is being read, an echo reply
+//! or an NA is being sent, it waits in its channel (replies first). A pending
+//! `resolve` also holds back the start of the next incoming message (its meta
+//! and bytes stay in the `ipv6_rx` channels), so it cannot starve. One cycle
+//! after it is taken (state RS1, from registers):
+//!
+//! * target equal to `local_ll`, or to `local_gua` with `gua_valid`: dropped,
+//!   nothing is sent (N3);
+//! * else one NS is sent: `Ip6TxReq { dst_mac = 33:33:ff:T[2]:T[1]:T[0]` (low
+//!   24 bits of the target), `dst_ip = ff02::1:ffT[2]T[1]T[0]`, `src_ip` =
+//!   `local_ll` if the target is in `fe80::/10`, else `local_gua` if
+//!   `gua_valid`, else `local_ll` (N2), `next` 58, `len` 32, `hop` 255 }
+//!   followed by the 32 bytes: type 135, code 0, checksum, 4 zero bytes
+//!   (reserved), target, option 1 (SLLA) / length 1 / `local_mac`. Same
+//!   output path and request-then-32-bytes contract as the NA; `err` never set.
+//!
+//! Checksum (same two registered adder stages as the NA): CK2 sums the
+//! pseudo-header `pseudo_v6(src_ip, dst_ip, 58, 32)` (the NS reuses the
+//! `msrc`/`mdst` registers: addition commutes, so the order of the two
+//! addresses is irrelevant); CK3 adds `pseudo_v6(target, mac << 80, 0,
+//! 0x8700_0101)`, i.e. the target words, the three MAC words and the words
+//! `0x8700` (type, code), `0x0000` (reserved), `0x0000`, `0x0101` (option
+//! type, length); the checksum word itself is zero. The checksum is the
+//! complement of the fold, in `0..=0xFFFE`. The NS starts about 6 cycles after
+//! `resolve` is taken. Retransmission, timeouts and duplicate suppression are
+//! the caller's job (no state is kept per target).
+//!
+//! ## Learning (N4, N5): state CK1
+//!
+//! * NA: type 136, code 0, `hop == 255`, `len >= 24`, checksum good, input
+//!   `err` clear, options well formed (as for the NS: length 0 or overrun
+//!   rejects the message), target not multicast (first byte != 0xFF), at most
+//!   one Target LLA option (type 2) and then of length 1, else nothing is
+//!   learnt (S/O/R flags are ignored). `learn{ ip = target, mac = TLLA if
+//!   present, else meta.eth_src }`. No frame is sent. Whatever destination
+//!   `ipv6_rx` lets through is accepted (the unit does not look at it). Other
+//!   options, including a Source LLA, are skipped.
+//! * NS that the unit answers (rules M1-M6 above, i.e. after the NA decision
+//!   is positive) with a source other than `::` and a Source LLA option:
+//!   `learn{ ip = meta.src, mac = SLLA }` (the same value the NA is addressed
+//!   to). Not for DAD probes, not without the option (the Ethernet source is
+//!   not used for an NS). The `learn` is sent before the NA is built; if
+//!   `learn` has no room the unit waits in CK1 (the cache always drains).
+//!
 //! # Integration
 //!
 //! Inputs and outputs must be registered channels or FIFOs (never port to
@@ -107,6 +164,15 @@ use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{lower, with, Trace};
+use txhdl::{Transaction as TransactionDerive, Value as ValueDerive};
+
+/// A neighbor learnt from the wire (output `learn`): IPv6 address and the
+/// link-layer address it is reachable at.
+#[derive(TransactionDerive, ValueDerive, Clone, Copy, Default, Debug)]
+pub struct NdLearn {
+    pub ip: U<128>,
+    pub mac: U<48>,
+}
 
 pub const NH_ICMPV6: u8 = 58;
 pub const TYPE_ECHO_REQUEST: u8 = 128;
@@ -126,6 +192,7 @@ const CK2: u8 = 6;
 const CK3: u8 = 7;
 const REQ: u8 = 8;
 const NAO: u8 = 9;
+const RS1: u8 = 10;
 
 #[derive(Trace, Default)]
 pub struct Icmpv6 {
@@ -160,6 +227,10 @@ pub struct Icmpv6 {
     /// NA flag S.
     pub fl: Reg<Bit>,
     pub ck: Reg<U<16>>,
+    /// The NDP message in progress is a neighbor advertisement (else a NS).
+    pub isna: Reg<Bit>,
+    /// The frame being built is a solicitation we generate (else an NA).
+    pub gsol: Reg<Bit>,
 }
 
 #[lower]
@@ -172,21 +243,23 @@ impl
             In<U<128>>,
             In<Bit>,
             In<U<48>>,
+            Rx<U<128>>,
         ),
-        (Tx<Ip6TxReq>, Tx<FrameByte>),
+        (Tx<Ip6TxReq>, Tx<FrameByte>, Tx<NdLearn>),
     > for Icmpv6
 {
     async fn run(
         &mut self,
-        (meta, payload, local_ll, local_gua, gua_valid, local_mac): (
+        (meta, payload, local_ll, local_gua, gua_valid, local_mac, resolve): (
             Rx<Ip6Meta>,
             Rx<FrameByte>,
             In<U<128>>,
             In<U<128>>,
             In<Bit>,
             In<U<48>>,
+            Rx<U<128>>,
         ),
-        (req, out_payload): (Tx<Ip6TxReq>, Tx<FrameByte>),
+        (req, out_payload, learn): (Tx<Ip6TxReq>, Tx<FrameByte>, Tx<NdLearn>),
     ) {
         loop {
             DefaultClock::rising().await;
@@ -211,6 +284,8 @@ impl
             let smac = self.smac.get();
             let fl = self.fl.get();
             let ck = self.ck.get();
+            let isna = self.isna.get();
+            let gsol = self.gsol.get();
             let is_g = Bit::from(st == GATHER);
             let is_out = Bit::from(st == OUT);
             let is_pass = Bit::from(st == PASS);
@@ -221,6 +296,7 @@ impl
             let is_ck3 = Bit::from(st == CK3);
             let is_req = Bit::from(st == REQ);
             let is_nao = Bit::from(st == NAO);
+            let is_rs1 = Bit::from(st == RS1);
             let p0 = is_g & Bit::from(pos == 0);
             let p1 = is_g & Bit::from(pos == 1);
             let p2 = is_g & Bit::from(pos == 2);
@@ -244,11 +320,22 @@ impl
                 & Bit::from(mlen >= 24)
                 & self.h255.get();
             let echo_go = p1 & echo_acc;
-            let ns_go = p1 & ns_acc;
+            let na_acc = Bit::from(hi == U::<8>::from(TYPE_NA))
+                & Bit::from(b.data == U::<8>::from(0u8))
+                & !last
+                & Bit::from(mlen >= 24)
+                & self.h255.get();
+            let ns_go = p1 & (ns_acc | na_acc);
+            // A pending resolve request starts a solicitation when idle, at the
+            // start of a message (before byte 0 is taken).
+            let rv = Bit::from(resolve.peek().is_some());
+            let rs_take = p0 & rv;
+            let _ = resolve.recv_if(rs_take);
+            let rt = resolve.head();
             let can = is_g | is_pass | is_drop | is_nsi;
             let take = have
                 & can
-                & (!p0 | mv)
+                & (!p0 | (mv & !rv))
                 & (!echo_go | req.ready())
                 & (!is_pass | out_payload.ready());
             let _ = payload.recv_if(take);
@@ -281,7 +368,9 @@ impl
             let o_l = is_nsi & in_opt & Bit::from(ost == 1);
             let o_b = is_nsi & in_opt & Bit::from(ost == 2);
             let zero_len = o_l & Bit::from(b.data == U::<8>::from(0u8));
-            let slla_hdr = o_l & Bit::from(ot == U::<8>::from(1u8));
+            // Link-layer option of interest: source (1) in a NS, target (2) in a NA.
+            let want_t = mux(isna, U::<8>::from(2u8), U::<8>::from(1u8));
+            let slla_hdr = o_l & Bit::from(ot == want_t);
             let sbad_n = sbad
                 | (slla_hdr & (sseen | Bit::from(b.data != U::<8>::from(1u8))));
             let clean = Bit::from(pos == 23) | (o_b & Bit::from(orem == 1));
@@ -310,12 +399,37 @@ impl
             let len_k = ((U::<16>::from(0x8800u16) + flag_hi).zext::<32>() << 16u32)
                 | U::<32>::from(0x0201u32);
             let req_go = is_req & req.ready();
+            // Solicitation we generate: source address, solicited-node group.
+            let ll_tgt = Bit::from(tgt.slice::<118, 10>() == U::<10>::from(0x3FAu16));
+            let gen_src = mux(ll_tgt | !gua_valid.get(), local_ll.get(), local_gua.get());
+            let gen_mac = U::<48>::from(0x3333_ff00_0000u64)
+                | (tgt & U::<128>::from(0x00FF_FFFFu128)).slice::<0, 48>();
+            let len_ns = U::<32>::from(0x8700_0101u32);
+            let len_sel = mux(gsol, len_ns, len_k);
+            // Learning (state CK1): NA target / NS source with their MAC.
+            let need_ns = ok_ns & !unspec & sseen;
+            let need_na = notmc & !sbad;
+            let lrn_want = is_ck1 & mux(isna, need_na, need_ns);
+            let lrn_go = lrn_want & learn.ready();
+            if lrn_go.to_bool() {
+                learn.send(NdLearn {
+                    ip: mux(isna, tgt, msrc),
+                    mac: mux(isna, mux(sseen, smac, esrc), smac),
+                });
+            }
+            let ns_ok = is_ck1 & !isna & ok_ns;
+            let ns_adv = ns_ok & (!need_ns | learn.ready());
+            let na_done = is_ck1 & isna & (!need_na | learn.ready());
+            let na_fail = is_ck1 & !isna & !ok_ns;
+            let na_end = na_fail | na_done;
+            let rs_own = is_rs1 & own;
+            let rs_go = is_rs1 & !own;
             // One request port: echo (with byte 1) or NA (state REQ).
             if ((take & echo_go) | req_go).to_bool() {
                 req.send(Ip6TxReq {
                     dst_mac: esrc,
                     dst_ip: msrc,
-                    src_ip: mux(is_req, tgt, mdst),
+                    src_ip: mux(is_req & !gsol, tgt, mdst),
                     next: U::<8>::from(NH_ICMPV6),
                     len: mux(is_req, U::<16>::from(32u16), mlen),
                     hop: mux(is_req, U::<8>::from(NDP_HOP), U::<8>::from(ECHO_HOP)),
@@ -334,13 +448,13 @@ impl
                     U::<8>::from(1u8),
                     mux(
                         Bit::from(oc == 24),
-                        U::<8>::from(2u8),
+                        mux(gsol, U::<8>::from(1u8), U::<8>::from(2u8)),
                         mux(
                             Bit::from(oc >= 8),
                             nao_top,
                             mux(
                                 Bit::from(oc == 4),
-                                flag_b,
+                                mux(gsol, U::<8>::from(0u8), flag_b),
                                 mux(
                                     Bit::from(oc == 3),
                                     ck.slice::<0, 8>(),
@@ -349,7 +463,7 @@ impl
                                         ck.slice::<8, 8>(),
                                         mux(
                                             Bit::from(oc == 0),
-                                            U::<8>::from(TYPE_NA),
+                                            mux(gsol, U::<8>::from(TYPE_NS), U::<8>::from(TYPE_NA)),
                                             U::<8>::from(0u8),
                                         ),
                                     ),
@@ -388,11 +502,26 @@ impl
                 & !(is_g & (Bit::from(pos == 2) | Bit::from(pos == 3)));
             let end_out = send_o & Bit::from(oc == 3) & abort;
             let rst = end_in | end_out;
-            let na_fail = is_ck1 & !ok_ns;
             with!(self <= {
                 take ? {
                     pos: pos + U::<16>::from(1u16),
                     hi: b.data,
+                },
+                take & p1 ? isna: na_acc,
+                // Solicitation to send: latch the target, check it next cycle.
+                rs_take ? {
+                    tgt: rt,
+                    st: U::<4>::from(RS1),
+                },
+                rs_own ? st: U::<4>::from(GATHER),
+                rs_go ? {
+                    st: U::<4>::from(CK2),
+                    gsol: Bit::One,
+                    fl: Bit::Zero,
+                    mdst: gen_src,
+                    msrc: sn_tgt,
+                    esrc: gen_mac,
+                    smac: local_mac.get(),
                 },
                 take & (is_g | is_pass | is_nsi) ? acc: next,
                 take & p0 ? {
@@ -404,7 +533,7 @@ impl
                     mmc: m.multicast,
                     h255: Bit::from(m.hop == U::<8>::from(NDP_HOP)),
                 },
-                take & p1 & !echo_acc & !ns_acc & !last ? st: U::<4>::from(DROP),
+                take & p1 & !echo_acc & !ns_acc & !na_acc & !last ? st: U::<4>::from(DROP),
                 take & ns_go ? st: U::<4>::from(NSI),
                 to_out ? {
                     st: U::<4>::from(OUT),
@@ -433,7 +562,7 @@ impl
                     orem: orem - U::<12>::from(1u16),
                     ost: mux(Bit::from(orem == 1), U::<2>::from(0u8), U::<2>::from(2u8)),
                 },
-                take & o_b & Bit::from(ot == U::<8>::from(1u8)) ? smac: (smac << 8u32) | b.data.zext::<48>(),
+                take & o_b & Bit::from(ot == want_t) ? smac: (smac << 8u32) | b.data.zext::<48>(),
                 take & is_nsi ? bad: bad_n,
                 ns_end ? {
                     st: mux(good, U::<4>::from(CK1), U::<4>::from(GATHER)),
@@ -446,20 +575,20 @@ impl
                     sbad: Bit::Zero,
                 },
                 // NA: checks, checksum stages, request, bytes.
-                is_ck1 & ok_ns ? {
+                ns_adv ? {
                     st: U::<4>::from(CK2),
                     msrc: mux(unspec, all_nodes, msrc),
                     esrc: na_dst_mac,
                     smac: local_mac.get(),
                     fl: !unspec,
                 },
-                na_fail ? {
+                na_end ? {
                     st: U::<4>::from(GATHER),
                     sseen: Bit::Zero,
                     sbad: Bit::Zero,
                 },
                 is_ck2 ? {
-                    acc: pseudo_v6(tgt, msrc, U::<8>::from(NH_ICMPV6), U::<32>::from(32u32)),
+                    acc: pseudo_v6(mux(gsol, mdst, tgt), msrc, U::<8>::from(NH_ICMPV6), U::<32>::from(32u32)),
                     st: U::<4>::from(CK3),
                 },
                 is_ck3 ? {
@@ -468,7 +597,7 @@ impl
                             tgt,
                             smac.zext::<128>() << 80u32,
                             U::<8>::from(0u8),
-                            len_k,
+                            len_sel,
                         ),
                     st: U::<4>::from(REQ),
                 },
@@ -482,6 +611,7 @@ impl
                 send_n & Bit::from(oc >= 26) ? smac: smac << 8u32,
                 n_end ? {
                     st: U::<4>::from(GATHER),
+                    gsol: Bit::Zero,
                     oc: U::<5>::from(0u8),
                     sseen: Bit::Zero,
                     sbad: Bit::Zero,

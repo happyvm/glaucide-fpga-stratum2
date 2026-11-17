@@ -254,3 +254,60 @@ def _icmp6(f, p, cfg, to_solicited_node: bool) -> List[bytes]:
 def _ip6_frame(src_mac, dst_mac, src, dst, icmp_body, hop_limit) -> bytes:
     pkt = ipv6.IPv6Packet(src, dst, ipv6.NH_ICMPV6, icmp_body, hop_limit=hop_limit).build()
     return eth.EthFrame(dst_mac, src_mac, eth.ETHERTYPE_IPV6, pkt).build()
+
+
+# ---------------------------------------------------------------- IPv6 neighbor discovery, initiator side (T3.6)
+# Added functions only; `respond` is unchanged. Rules:
+#   N1 (RFC 4861 section 7.2.2): to resolve target T send an NS to the solicited-node multicast address of T
+#      (Ethernet 33:33:ff:xx:xx:xx), target T, Source Link-Layer Address option = our MAC, hop limit 255.
+#   N2 (RFC 4861 section 7.2.2 / 7.2.3): source address = our link-local if T is link-local (fe80::/10),
+#      else our global address when we have one, else our link-local.
+#   N3: a resolution of one of our own addresses is not sent.
+#   N4 (RFC 4861 section 7.2.5): a valid NA (type 136, code 0, hop limit 255, length >= 24, good checksum,
+#      well-formed options, non-multicast target, at most one Target LLA option of length 1) teaches
+#      (target, TLLA or the Ethernet source). S/O flags are not required.
+#   N5 (RFC 4861 section 7.2.3): an NS that we answer (rules M1-M6) with a Source LLA option and a source
+#      other than :: teaches (source, SLLA).
+def solicit(target: bytes, cfg: Config) -> Optional[bytes]:
+    """NS frame to resolve `target`, or None (own address)."""
+    if target in cfg.v6_addresses():
+        return None
+    link_local = target[0] == 0xFE and (target[1] & 0xC0) == 0x80
+    src = cfg.ipv6_ll if (link_local or cfg.ipv6_global is None) else cfg.ipv6_global
+    dst = ipv6.solicited_node(target)
+    ns = icmpv6.NeighborSolicitation(target, [(icmpv6.OPT_SLLA, cfg.mac)])
+    return _ip6_frame(cfg.mac, ipv6.multicast_mac(dst), src, dst, ns.build(src, dst), 255)
+
+
+def learn(frame: bytes, cfg: Config):
+    """(ip, mac) the frame teaches, or None. Never produces output frames."""
+    try:
+        f = eth.EthFrame.parse(frame)
+        if f.ethertype != eth.ETHERTYPE_IPV6:
+            return None
+        p = ipv6.IPv6Packet.parse(f.payload)
+        if p.next_header != ipv6.NH_ICMPV6 or p.hop_limit != 255 or p.src[0] == 0xFF:
+            return None
+        ours = cfg.v6_addresses()
+        if p.payload[:1] == bytes([icmpv6.T_NA]):
+            if p.dst in ours:
+                if f.dst != cfg.mac:
+                    return None
+            elif p.dst != ALL_NODES:
+                return None
+            na = icmpv6.NeighborAdvertisement.parse(p.src, p.dst, p.payload)
+            if na.target[0] == 0xFF:
+                return None
+            tlla = [v for (ot, v) in na.options if ot == icmpv6.OPT_TLLA]
+            if len(tlla) > 1 or (tlla and len(tlla[0]) != 6):
+                return None
+            return na.target, (tlla[0] if tlla else f.src)
+        if p.payload[:1] == bytes([icmpv6.T_NS]) and p.src != bytes(16):
+            if not respond(frame, cfg):  # answered under M1-M6
+                return None
+            ns = icmpv6.NeighborSolicitation.parse(p.src, p.dst, p.payload)
+            slla = [v for (ot, v) in ns.options if ot == icmpv6.OPT_SLLA]
+            return (p.src, slla[0]) if slla else None
+    except ParseError:
+        return None
+    return None
