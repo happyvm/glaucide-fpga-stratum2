@@ -307,10 +307,6 @@ impl<F: Future<Output = ()>> Bench<F> {
         assert!(self.inq.is_empty(), "reply not consumed");
         self.run(40);
     }
-
-    fn ntp(&self) -> u64 {
-        (self.now >> 32) as u64
-    }
 }
 
 fn reply_bytes(li: u8, vn: u8, mode: u8, stratum: u8, org: u64, t2: u64, t3: u64) -> Vec<u8> {
