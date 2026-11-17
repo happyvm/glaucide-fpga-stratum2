@@ -107,6 +107,15 @@ use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{lower, with, Trace};
+use txhdl::{Transaction as TransactionDerive, Value as ValueDerive};
+
+/// A neighbor learnt from the wire (output `learn`): IPv6 address and the
+/// link-layer address it is reachable at.
+#[derive(TransactionDerive, ValueDerive, Clone, Copy, Default, Debug)]
+pub struct NdLearn {
+    pub ip: U<128>,
+    pub mac: U<48>,
+}
 
 pub const NH_ICMPV6: u8 = 58;
 pub const TYPE_ECHO_REQUEST: u8 = 128;
@@ -126,6 +135,7 @@ const CK2: u8 = 6;
 const CK3: u8 = 7;
 const REQ: u8 = 8;
 const NAO: u8 = 9;
+const RS1: u8 = 10;
 
 #[derive(Trace, Default)]
 pub struct Icmpv6 {
@@ -160,6 +170,10 @@ pub struct Icmpv6 {
     /// NA flag S.
     pub fl: Reg<Bit>,
     pub ck: Reg<U<16>>,
+    /// The NDP message in progress is a neighbor advertisement (else a NS).
+    pub isna: Reg<Bit>,
+    /// The frame being built is a solicitation we generate (else an NA).
+    pub gsol: Reg<Bit>,
 }
 
 #[lower]
@@ -172,21 +186,23 @@ impl
             In<U<128>>,
             In<Bit>,
             In<U<48>>,
+            Rx<U<128>>,
         ),
-        (Tx<Ip6TxReq>, Tx<FrameByte>),
+        (Tx<Ip6TxReq>, Tx<FrameByte>, Tx<NdLearn>),
     > for Icmpv6
 {
     async fn run(
         &mut self,
-        (meta, payload, local_ll, local_gua, gua_valid, local_mac): (
+        (meta, payload, local_ll, local_gua, gua_valid, local_mac, resolve): (
             Rx<Ip6Meta>,
             Rx<FrameByte>,
             In<U<128>>,
             In<U<128>>,
             In<Bit>,
             In<U<48>>,
+            Rx<U<128>>,
         ),
-        (req, out_payload): (Tx<Ip6TxReq>, Tx<FrameByte>),
+        (req, out_payload, learn): (Tx<Ip6TxReq>, Tx<FrameByte>, Tx<NdLearn>),
     ) {
         loop {
             DefaultClock::rising().await;
@@ -211,6 +227,8 @@ impl
             let smac = self.smac.get();
             let fl = self.fl.get();
             let ck = self.ck.get();
+            let isna = self.isna.get();
+            let gsol = self.gsol.get();
             let is_g = Bit::from(st == GATHER);
             let is_out = Bit::from(st == OUT);
             let is_pass = Bit::from(st == PASS);
@@ -221,6 +239,7 @@ impl
             let is_ck3 = Bit::from(st == CK3);
             let is_req = Bit::from(st == REQ);
             let is_nao = Bit::from(st == NAO);
+            let is_rs1 = Bit::from(st == RS1);
             let p0 = is_g & Bit::from(pos == 0);
             let p1 = is_g & Bit::from(pos == 1);
             let p2 = is_g & Bit::from(pos == 2);
@@ -244,11 +263,22 @@ impl
                 & Bit::from(mlen >= 24)
                 & self.h255.get();
             let echo_go = p1 & echo_acc;
-            let ns_go = p1 & ns_acc;
+            let na_acc = Bit::from(hi == U::<8>::from(TYPE_NA))
+                & Bit::from(b.data == U::<8>::from(0u8))
+                & !last
+                & Bit::from(mlen >= 24)
+                & self.h255.get();
+            let ns_go = p1 & (ns_acc | na_acc);
+            // A pending resolve request starts a solicitation when idle, at the
+            // start of a message (before byte 0 is taken).
+            let rv = Bit::from(resolve.peek().is_some());
+            let rs_take = p0 & rv;
+            let _ = resolve.recv_if(rs_take);
+            let rt = resolve.head();
             let can = is_g | is_pass | is_drop | is_nsi;
             let take = have
                 & can
-                & (!p0 | mv)
+                & (!p0 | (mv & !rv))
                 & (!echo_go | req.ready())
                 & (!is_pass | out_payload.ready());
             let _ = payload.recv_if(take);
@@ -281,7 +311,9 @@ impl
             let o_l = is_nsi & in_opt & Bit::from(ost == 1);
             let o_b = is_nsi & in_opt & Bit::from(ost == 2);
             let zero_len = o_l & Bit::from(b.data == U::<8>::from(0u8));
-            let slla_hdr = o_l & Bit::from(ot == U::<8>::from(1u8));
+            // Link-layer option of interest: source (1) in a NS, target (2) in a NA.
+            let want_t = mux(isna, U::<8>::from(2u8), U::<8>::from(1u8));
+            let slla_hdr = o_l & Bit::from(ot == want_t);
             let sbad_n = sbad
                 | (slla_hdr & (sseen | Bit::from(b.data != U::<8>::from(1u8))));
             let clean = Bit::from(pos == 23) | (o_b & Bit::from(orem == 1));
@@ -310,12 +342,37 @@ impl
             let len_k = ((U::<16>::from(0x8800u16) + flag_hi).zext::<32>() << 16u32)
                 | U::<32>::from(0x0201u32);
             let req_go = is_req & req.ready();
+            // Solicitation we generate: source address, solicited-node group.
+            let ll_tgt = Bit::from(tgt.slice::<118, 10>() == U::<10>::from(0x3FAu16));
+            let gen_src = mux(ll_tgt | !gua_valid.get(), local_ll.get(), local_gua.get());
+            let gen_mac = U::<48>::from(0x3333_ff00_0000u64)
+                | (tgt & U::<128>::from(0x00FF_FFFFu128)).slice::<0, 48>();
+            let len_ns = U::<32>::from(0x8700_0101u32);
+            let len_sel = mux(gsol, len_ns, len_k);
+            // Learning (state CK1): NA target / NS source with their MAC.
+            let need_ns = ok_ns & !unspec & sseen;
+            let need_na = notmc & !sbad;
+            let lrn_want = is_ck1 & mux(isna, need_na, need_ns);
+            let lrn_go = lrn_want & learn.ready();
+            if lrn_go.to_bool() {
+                learn.send(NdLearn {
+                    ip: mux(isna, tgt, msrc),
+                    mac: mux(isna, mux(sseen, smac, esrc), smac),
+                });
+            }
+            let ns_ok = is_ck1 & !isna & ok_ns;
+            let ns_adv = ns_ok & (!need_ns | learn.ready());
+            let na_done = is_ck1 & isna & (!need_na | learn.ready());
+            let na_fail = is_ck1 & !isna & !ok_ns;
+            let na_end = na_fail | na_done;
+            let rs_own = is_rs1 & own;
+            let rs_go = is_rs1 & !own;
             // One request port: echo (with byte 1) or NA (state REQ).
             if ((take & echo_go) | req_go).to_bool() {
                 req.send(Ip6TxReq {
                     dst_mac: esrc,
                     dst_ip: msrc,
-                    src_ip: mux(is_req, tgt, mdst),
+                    src_ip: mux(is_req & !gsol, tgt, mdst),
                     next: U::<8>::from(NH_ICMPV6),
                     len: mux(is_req, U::<16>::from(32u16), mlen),
                     hop: mux(is_req, U::<8>::from(NDP_HOP), U::<8>::from(ECHO_HOP)),
@@ -334,13 +391,13 @@ impl
                     U::<8>::from(1u8),
                     mux(
                         Bit::from(oc == 24),
-                        U::<8>::from(2u8),
+                        mux(gsol, U::<8>::from(1u8), U::<8>::from(2u8)),
                         mux(
                             Bit::from(oc >= 8),
                             nao_top,
                             mux(
                                 Bit::from(oc == 4),
-                                flag_b,
+                                mux(gsol, U::<8>::from(0u8), flag_b),
                                 mux(
                                     Bit::from(oc == 3),
                                     ck.slice::<0, 8>(),
@@ -349,7 +406,7 @@ impl
                                         ck.slice::<8, 8>(),
                                         mux(
                                             Bit::from(oc == 0),
-                                            U::<8>::from(TYPE_NA),
+                                            mux(gsol, U::<8>::from(TYPE_NS), U::<8>::from(TYPE_NA)),
                                             U::<8>::from(0u8),
                                         ),
                                     ),
@@ -388,11 +445,26 @@ impl
                 & !(is_g & (Bit::from(pos == 2) | Bit::from(pos == 3)));
             let end_out = send_o & Bit::from(oc == 3) & abort;
             let rst = end_in | end_out;
-            let na_fail = is_ck1 & !ok_ns;
             with!(self <= {
                 take ? {
                     pos: pos + U::<16>::from(1u16),
                     hi: b.data,
+                },
+                take & p1 ? isna: na_acc,
+                // Solicitation to send: latch the target, check it next cycle.
+                rs_take ? {
+                    tgt: rt,
+                    st: U::<4>::from(RS1),
+                },
+                rs_own ? st: U::<4>::from(GATHER),
+                rs_go ? {
+                    st: U::<4>::from(CK2),
+                    gsol: Bit::One,
+                    fl: Bit::Zero,
+                    mdst: gen_src,
+                    msrc: sn_tgt,
+                    esrc: gen_mac,
+                    smac: local_mac.get(),
                 },
                 take & (is_g | is_pass | is_nsi) ? acc: next,
                 take & p0 ? {
@@ -404,7 +476,7 @@ impl
                     mmc: m.multicast,
                     h255: Bit::from(m.hop == U::<8>::from(NDP_HOP)),
                 },
-                take & p1 & !echo_acc & !ns_acc & !last ? st: U::<4>::from(DROP),
+                take & p1 & !echo_acc & !ns_acc & !na_acc & !last ? st: U::<4>::from(DROP),
                 take & ns_go ? st: U::<4>::from(NSI),
                 to_out ? {
                     st: U::<4>::from(OUT),
@@ -446,20 +518,20 @@ impl
                     sbad: Bit::Zero,
                 },
                 // NA: checks, checksum stages, request, bytes.
-                is_ck1 & ok_ns ? {
+                ns_adv ? {
                     st: U::<4>::from(CK2),
                     msrc: mux(unspec, all_nodes, msrc),
                     esrc: na_dst_mac,
                     smac: local_mac.get(),
                     fl: !unspec,
                 },
-                na_fail ? {
+                na_end ? {
                     st: U::<4>::from(GATHER),
                     sseen: Bit::Zero,
                     sbad: Bit::Zero,
                 },
                 is_ck2 ? {
-                    acc: pseudo_v6(tgt, msrc, U::<8>::from(NH_ICMPV6), U::<32>::from(32u32)),
+                    acc: pseudo_v6(mux(gsol, mdst, tgt), msrc, U::<8>::from(NH_ICMPV6), U::<32>::from(32u32)),
                     st: U::<4>::from(CK3),
                 },
                 is_ck3 ? {
@@ -468,7 +540,7 @@ impl
                             tgt,
                             smac.zext::<128>() << 80u32,
                             U::<8>::from(0u8),
-                            len_k,
+                            len_sel,
                         ),
                     st: U::<4>::from(REQ),
                 },
@@ -482,6 +554,7 @@ impl
                 send_n & Bit::from(oc >= 26) ? smac: smac << 8u32,
                 n_end ? {
                     st: U::<4>::from(GATHER),
+                    gsol: Bit::Zero,
                     oc: U::<5>::from(0u8),
                     sseen: Bit::Zero,
                     sbad: Bit::Zero,
