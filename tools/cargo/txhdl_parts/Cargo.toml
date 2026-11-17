@@ -1,0 +1,9 @@
+[package]
+name = "txhdl_parts"
+version = "0.0.0"
+edition = "2021"
+[lib]
+path = "../../../third_party/hdl-txhdl/lib/parts/src/lib.rs"
+[dependencies]
+txhdl = { path = "../txhdl" }
+txhdl_macros = { path = "../txhdl_macros" }

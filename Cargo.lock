@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "txhdl",
  "txhdl_macros",
+ "txhdl_parts",
 ]
 
 [[package]]
@@ -111,6 +112,14 @@ dependencies = [
 [[package]]
 name = "txhdl_macros"
 version = "0.0.0"
+
+[[package]]
+name = "txhdl_parts"
+version = "0.0.0"
+dependencies = [
+ "txhdl",
+ "txhdl_macros",
+]
 
 [[package]]
 name = "unicode-ident"
