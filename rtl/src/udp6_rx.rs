@@ -139,13 +139,17 @@ impl Unit<(Rx<Ip6Meta>, Rx<FrameByte>), (Tx<Meta>, Tx<FrameByte>)> for Udp6Rx {
             let is_h = Bit::from(st == HDR);
             let is_f = Bit::from(st == FWD);
             let is_d = Bit::from(st == DROP);
-            let p0 = is_h & Bit::from(pos == 0);
-            let p1 = is_h & Bit::from(pos == 1);
-            let p2 = is_h & Bit::from(pos == 2);
-            let p3 = is_h & Bit::from(pos == 3);
-            let p4 = is_h & Bit::from(pos == 4);
-            let p5 = is_h & Bit::from(pos == 5);
-            let p7 = is_h & Bit::from(pos == 7);
+            // In HDR `pos` is at most 7 (HDR is left at byte 7, or `pos`
+            // returns to 0 on a `last`): its low 3 bits decode the header
+            // position (shorter than a 16-bit compare, task T5.3).
+            let ph = pos.slice::<0, 3>();
+            let p0 = is_h & Bit::from(ph == 0);
+            let p1 = is_h & Bit::from(ph == 1);
+            let p2 = is_h & Bit::from(ph == 2);
+            let p3 = is_h & Bit::from(ph == 3);
+            let p4 = is_h & Bit::from(ph == 4);
+            let p5 = is_h & Bit::from(ph == 5);
+            let p7 = is_h & Bit::from(ph == 7);
 
             let have = Bit::from(payload.peek().is_some());
             let b = payload.head();

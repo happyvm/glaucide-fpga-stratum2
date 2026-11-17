@@ -299,6 +299,9 @@ pub struct Selection {
     pub el1: Reg<Bit>,
     pub el2: Reg<Bit>,
     pub el3: Reg<Bit>,
+    /// Root distance of peer `ia` without its `phi` term (written every
+    /// cycle, read in phase 3 of the distance step).
+    pub rdx: Reg<U<67>>,
     /// Peer loop index (distances, system peer, combine).
     pub ia: Reg<U<2>>,
     /// Multiplier sub-phase: issue at 0, result at 3.
@@ -522,12 +525,14 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
             let dsum = (rdl.zext::<67>() << 16u32) + dly.zext::<67>();
             let half = mux(dsum < MINDISP_Q32, U::<67>::from(MINDISP_Q32), dsum) >> 1u32;
             let phi = mq >> 16u32;
-            let rd67 = half
-                + (rds.zext::<67>() << 16u32)
-                + dsp.zext::<67>()
-                + jit.zext::<67>()
-                + phi.zext::<67>()
-                + RHO_Q32;
+            // Everything but `phi` is summed into the register `rdx` (task
+            // T5.3; `ia` is constant over the 4 phases of a peer, `rdx` is
+            // read in phase 3), as a tree; `phi` is added in phase 3. The
+            // same integer as the chain of additions (no wrap in 67 bits).
+            let rdx_n = half
+                + (((rds.zext::<67>() << 16u32) + dsp.zext::<67>())
+                    + (jit.zext::<67>() + U::<67>::from(RHO_Q32)));
+            let rd67 = self.rdx.get() + phi.zext::<67>();
             let rd_sat = mux(
                 rd67 > 0x1_ffff_ffffu64,
                 U::<33>::from(0x1_ffff_ffffu64),
@@ -940,6 +945,7 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
 
             with!(self <= {
                 // Multiplier pipeline, every cycle.
+                rdx: rdx_n,
                 ma: opa,
                 mb: opb,
                 mp: prod,
