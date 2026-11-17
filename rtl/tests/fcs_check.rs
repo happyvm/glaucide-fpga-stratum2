@@ -2,7 +2,8 @@
 //! Tests of the FCS checker (T1.12).
 use ntp_fpga::fcs_check::FcsCheck;
 use ntp_fpga::stream::FrameByte;
-use txhdl::comp::{chan, DefaultClock, Running, Unit};
+use txhdl::comp::{chan, signal, DefaultClock, Running, Unit};
+use txhdl::types::U;
 
 /// Independent bitwise CRC-32 (reflected, poly 0xEDB88320), complemented.
 fn crc32(data: &[u8]) -> u32 {
@@ -50,10 +51,19 @@ struct Got {
 /// Feed `input`, one byte per cycle when the unit is ready; the consumer
 /// accepts at cycle `t` when `take(t)`. Returns the output bytes.
 fn run(input: &[FrameByte], take: impl Fn(usize) -> bool) -> Vec<Got> {
+    run_pick(input, take, 0)
+}
+
+/// Same, with the formal witness input `pick` (the symbolic position `p`
+/// the proof quantifies over) held at `pick`: the in-simulation `check!`s of
+/// the delay line run for that position too.
+fn run_pick(input: &[FrameByte], take: impl Fn(usize) -> bool, pick: u16) -> Vec<Got> {
     let (tx, rx) = chan::<FrameByte, DefaultClock>();
     let (otx, orx) = chan::<FrameByte, DefaultClock>();
+    let (pick_out, pick_in) = signal::<U<11>, DefaultClock>();
+    pick_out.set(U::<11>::from(pick));
     let mut m = FcsCheck::default();
-    let mut sim = Running::new(m.run(rx, otx));
+    let mut sim = Running::new(m.run((rx, pick_in), otx));
     let mut next = 0;
     let mut out = Vec::new();
     for t in 0..input.len() * 4 + 30 {
@@ -265,5 +275,15 @@ fn output_length_is_input_length_minus_four() {
         let f = frames(&run(&bytes(&raw, false), |t| t % 2 == 0));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].len(), n - 4);
+    }
+}
+
+/// The symbolic-position checks hold for every position in simulation too.
+#[test]
+fn delay_line_checks_hold_for_every_position() {
+    let raw = with_fcs(&body(66));
+    for pick in 0..80u16 {
+        let out = run_pick(&bytes(&raw, false), |_| true, pick);
+        assert_eq!(data(&out), raw[..raw.len() - 4].to_vec(), "pick {pick}");
     }
 }

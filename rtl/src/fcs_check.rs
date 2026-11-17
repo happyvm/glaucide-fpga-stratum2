@@ -43,7 +43,7 @@
 //! (`m_*`) only feed `check!`/`cover!` and are pruned in synthesis.
 use crate::crc32::{crc32_step, INIT, RESIDUE};
 use crate::stream::FrameByte;
-use txhdl::comp::{Clock, DefaultClock, Reg, Rx, Tx, Unit};
+use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{assume, check, cover, lower, with, Trace};
 
@@ -65,6 +65,13 @@ pub struct FcsCheck {
     pub m_out: Reg<U<11>>,
     /// First byte of the current frame.
     pub m_first: Reg<U<8>>,
+    // Symbolic-position witness (formal only, see `pick` below).
+    /// The chosen position `p`, frozen after the first cycle.
+    pub g_p: Reg<U<11>>,
+    /// `g_p` has been loaded.
+    pub g_set: Reg<Bit>,
+    /// The raw byte at position `p` of the current frame.
+    pub g_cap: Reg<U<8>>,
 }
 
 impl Default for FcsCheck {
@@ -79,13 +86,16 @@ impl Default for FcsCheck {
             m_in: Reg::default(),
             m_out: Reg::default(),
             m_first: Reg::default(),
+            g_p: Reg::default(),
+            g_set: Reg::default(),
+            g_cap: Reg::default(),
         }
     }
 }
 
 #[lower]
-impl Unit<Rx<FrameByte>, Tx<FrameByte>> for FcsCheck {
-    async fn run(&mut self, raw: Rx<FrameByte>, frames: Tx<FrameByte>) {
+impl Unit<(Rx<FrameByte>, In<U<11>>), Tx<FrameByte>> for FcsCheck {
+    async fn run(&mut self, (raw, pick): (Rx<FrameByte>, In<U<11>>), frames: Tx<FrameByte>) {
         loop {
             DefaultClock::rising().await;
             // Invariants, emitted in every cycle (the k-induction needs
@@ -133,6 +143,35 @@ impl Unit<Rx<FrameByte>, Tx<FrameByte>> for FcsCheck {
                 "delay line: the first byte of the frame sits in d3 until emitted"
             );
 
+            // Symbolic position (formal witness, written by the orchestrator,
+            // task F1.2): `pick` is a free input; the first value it has is
+            // frozen into `g_p`, so a proof about `g_p` holds for EVERY
+            // position of a frame. In the real design `pick` is tied to 0 and
+            // all of this is pruned. Claim: the byte emitted at output index
+            // `p` is the byte taken at input index `p` (the delay line only
+            // delays, it never reorders, drops or alters a data byte).
+            let gset = self.g_set.get();
+            let p = mux(gset, self.g_p.get(), pick.get());
+            let cap = self.g_cap.get();
+            let m_in12 = m_in.zext::<12>();
+            let p12 = p.zext::<12>();
+            check!(
+                (m_in12 != p12 + 1) | (self.d0.get() == cap),
+                "delay line: the byte taken at position p sits in d0 right after"
+            );
+            check!(
+                (m_in12 != p12 + 2) | (self.d1.get() == cap),
+                "delay line: the byte taken at position p sits in d1 one byte later"
+            );
+            check!(
+                (m_in12 != p12 + 3) | (self.d2.get() == cap),
+                "delay line: the byte taken at position p sits in d2 two bytes later"
+            );
+            check!(
+                (m_in12 != p12 + 4) | (self.d3.get() == cap),
+                "delay line: the byte taken at position p sits in d3 three bytes later"
+            );
+
             // A byte is taken when it can go on: always while the delay
             // line fills (nothing is emitted), else when `frames` has room.
             let take = !full | frames.ready();
@@ -165,6 +204,11 @@ impl Unit<Rx<FrameByte>, Tx<FrameByte>> for FcsCheck {
             cover!(emit & b.last & b.err, "an input err flags the frame");
             cover!(got & b.last & !full, "a runt frame emits nothing");
 
+            check!(
+                !(emit & (m_out.zext::<12>() == p12)) | (self.d3.get() == cap),
+                "the byte emitted at output position p is the byte taken at input position p"
+            );
+            cover!(emit & (m_out.zext::<12>() == p12) & (p != 0), "position p is emitted (p not 0)");
             if emit.to_bool() {
                 frames.send(FrameByte {
                     data: self.d3.get(),
@@ -184,6 +228,9 @@ impl Unit<Rx<FrameByte>, Tx<FrameByte>> for FcsCheck {
                 got & !full ? fill: fill + 1,
                 got & (m_in == 0) ? m_first: b.data,
                 emit ? m_out: m_out + 1,
+                !gset ? g_p: pick.get(),
+                !gset ? g_set: Bit::One,
+                got & (m_in12 == p12) ? g_cap: b.data,
                 got & b.last ? {
                     crc: INIT,
                     fill: U::<3>::from(0u8),
