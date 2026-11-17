@@ -246,7 +246,7 @@ use crate::ntp_types::{Sample, PEERS, PHI_Q32};
 use crate::stream::{FrameByte, Meta};
 use crate::udp4_tx::UdpTxReq;
 use crate::udp6_tx::Udp6TxReq;
-use txhdl::comp::{mux, Clock, DefaultClock, In, Mem, Reg, Rx, Tx, Unit};
+use txhdl::comp::{mux, Clock, DefaultClock, In, Mem, Out, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{lower, with, Trace};
 
@@ -268,6 +268,12 @@ pub const RES_TRIES: u8 = 8;
 pub const RETRY_TICKS: u32 = 2;
 /// Byte 0 of a request: LI 0, VN 4, mode 3.
 pub const REQ_B0: u8 = 0x23;
+/// Kiss codes (RFC 5905 §7.4) in the Reference ID of a stratum-0 reply.
+pub const KOD_RATE: u32 = 0x5241_5445; // "RATE"
+pub const KOD_DENY: u32 = 0x4445_4E59; // "DENY"
+pub const KOD_RSTR: u32 = 0x5253_5452; // "RSTR"
+/// Largest poll exponent a RATE back-off reaches (2^10 s).
+pub const KOD_POLL_MAX: u8 = 10;
 
 const _: () = assert!(PEERS == 4);
 
@@ -302,16 +308,22 @@ pub fn prec_pow(pr: U<8>) -> U<64> {
     )
 }
 
-/// `2^clamp(p, 4, 17)` seconds, as a 32-bit count.
+/// `clamp(p, 4, 17)`.
 #[lower]
-pub fn poll_secs(p: U<8>) -> U<32> {
+pub fn poll_clamp(p: U<8>) -> U<8> {
     let lo = Bit::from(p < U::<8>::from(POLL_MIN));
     let hi = Bit::from(p > U::<8>::from(POLL_MAX));
-    let c = mux(
+    mux(
         lo,
         U::<8>::from(POLL_MIN),
         mux(hi, U::<8>::from(POLL_MAX), p),
-    );
+    )
+}
+
+/// `2^clamp(p, 4, 17)` seconds, as a 32-bit count.
+#[lower]
+pub fn poll_secs(p: U<8>) -> U<32> {
+    let c = poll_clamp(p);
     let sh = c.slice::<0, 5>();
     let x0 = U::<32>::from(1u32);
     let x1 = mux(sh.bit(0), x0 << 1u32, x0);
@@ -319,6 +331,30 @@ pub fn poll_secs(p: U<8>) -> U<32> {
     let x3 = mux(sh.bit(2), x2 << 4u32, x2);
     let x4 = mux(sh.bit(3), x3 << 8u32, x3);
     mux(sh.bit(4), x4 << 16u32, x4)
+}
+
+/// `2^(e + 6) - 1` on 16 bits, for a RATE back-off exponent `e` in
+/// 5..=10 (the tick bits below the back-off interval `2^e` s); `0xFFFF`
+/// for any other `e` (only 5..=10 occur).
+#[lower]
+pub fn kod_zmask(e: U<4>) -> U<16> {
+    mux(
+        Bit::from(e == 5),
+        U::<16>::from(0x07FFu16),
+        mux(
+            Bit::from(e == 6),
+            U::<16>::from(0x0FFFu16),
+            mux(
+                Bit::from(e == 7),
+                U::<16>::from(0x1FFFu16),
+                mux(
+                    Bit::from(e == 8),
+                    U::<16>::from(0x3FFFu16),
+                    mux(Bit::from(e == 9), U::<16>::from(0x7FFFu16), U::<16>::from(0xFFFFu16)),
+                ),
+            ),
+        ),
+    )
 }
 
 /// `a` is in `fe80::/10`.
@@ -361,9 +397,30 @@ pub struct NtpClient {
     pub t1r: Reg<U<64>>,
     /// `(time >> 32) + latency` of the previous cycle.
     pub t1p: Reg<U<64>>,
+    // Per-slot KoD state (security finding F9), slot i.
+    /// RATE back-off exponent (0: none, else 5..=KOD_POLL_MAX).
+    pub kx0: Reg<U<4>>,
+    pub kx1: Reg<U<4>>,
+    pub kx2: Reg<U<4>>,
+    pub kx3: Reg<U<4>>,
+    /// Bits of `since[15:0]` that do not count for the back-off interval:
+    /// `2^(kx + 6) - 1` (0 when `kx` = 0).
+    pub kz0: Reg<U<16>>,
+    pub kz1: Reg<U<16>>,
+    pub kz2: Reg<U<16>>,
+    pub kz3: Reg<U<16>>,
+    /// DENY / RSTR received: no more requests (`dead`).
+    pub dd0: Reg<Bit>,
+    pub dd1: Reg<Bit>,
+    pub dd2: Reg<Bit>,
+    pub dd3: Reg<Bit>,
     // Per-slot state.
     #[distributed]
     pub m_t1: Mem<U<64>, 4, DefaultClock>,
+    /// Fraction (low 32 bits) of the Origin nonce sent: the Transmit
+    /// Timestamp of the request is `{m_t1[63:32], m_org}` (F3).
+    #[distributed]
+    pub m_org: Mem<U<32>, 4, DefaultClock>,
     /// `{last[95:64] (tick), tsent[63:32] (second), rt[31:0] (tick)}`.
     #[distributed]
     pub m_tm: Mem<U<96>, 4, DefaultClock>,
@@ -401,6 +458,7 @@ impl
             In<U<64>>,
             In<U<64>>,
             In<U<96>>,
+            In<U<64>>,
             Rx<Meta>,
             Rx<FrameByte>,
             Rx<ArpEntry>,
@@ -417,6 +475,7 @@ impl
             Tx<FrameByte>,
             Tx<Sample>,
             Tx<U<2>>,
+            Out<U<64>>,
         ),
     > for NtpClient
 {
@@ -448,6 +507,7 @@ impl
             tx_latency4,
             tx_latency6,
             time,
+            rnd,
             meta,
             rep,
             arp_rsp,
@@ -478,12 +538,25 @@ impl
             In<U<64>>,
             In<U<64>>,
             In<U<96>>,
+            In<U<64>>,
             Rx<Meta>,
             Rx<FrameByte>,
             Rx<ArpEntry>,
             Rx<ArpEntry>,
         ),
-        (arp_lookup, arp_resolve, nd_lookup, nd_resolve, req4, pay4, req6, pay6, samples, miss): (
+        (
+            arp_lookup,
+            arp_resolve,
+            nd_lookup,
+            nd_resolve,
+            req4,
+            pay4,
+            req6,
+            pay6,
+            samples,
+            miss,
+            rx_stamp,
+        ): (
             Tx<U<32>>,
             Tx<U<32>>,
             Tx<U<128>>,
@@ -494,11 +567,13 @@ impl
             Tx<FrameByte>,
             Tx<Sample>,
             Tx<U<2>>,
+            Out<U<64>>,
         ),
     ) {
         loop {
             DefaultClock::rising().await;
             let _ = local_mac.get();
+            rx_stamp.set(self.rxts.get());
             let st = self.st.get();
             let cs = self.cs.get();
             let pos = self.pos.get();
@@ -538,10 +613,31 @@ impl
             let s_addr = mux(c1, mux(c0, a3, a2), mux(c0, a1, a0));
             let s_v6 = mux(c1, mux(c0, v3, v2), mux(c0, v1, v0));
             let s_en = mux(c1, mux(c0, e3, e2), mux(c0, e1, e0));
+            // Per-slot KoD state of slot ix.
+            let kx_s = mux(
+                c1,
+                mux(c0, self.kx3.get(), self.kx2.get()),
+                mux(c0, self.kx1.get(), self.kx0.get()),
+            );
+            let kz_s = mux(
+                c1,
+                mux(c0, self.kz3.get(), self.kz2.get()),
+                mux(c0, self.kz1.get(), self.kz0.get()),
+            );
+            let dd_s = mux(
+                c1,
+                mux(c0, self.dd3.get(), self.dd2.get()),
+                mux(c0, self.dd1.get(), self.dd0.get()),
+            );
+            let ix0 = Bit::from(ix == 0);
+            let ix1 = Bit::from(ix == 1);
+            let ix2 = Bit::from(ix == 2);
+            let ix3 = Bit::from(ix == 3);
 
             let fl = self.m_fl.read(ix);
             let tm = self.m_tm.read(ix);
             let t1s = self.m_t1.read(ix);
+            let orgs = self.m_org.read(ix);
             let f_out = fl.bit(0);
             let f_pend = fl.bit(1);
             let f_sent = fl.bit(2);
@@ -577,10 +673,18 @@ impl
             let since = now_t - m_last;
             // First poll: `ix * 16` ticks (ix * 2^-2 s) after the arming.
             let stagger = ix.zext::<32>() << 4u32;
+            // RATE back-off (F9): also `since >= 2^(kx + 6)` ticks, i.e. a
+            // set bit of `since` outside the zero mask `kz` (bits 16..31 are
+            // never in it); with kx = 0 (kz = 0) implied by the test above.
+            let due_k = Bit::from(since.slice::<16, 16>() != U::<16>::from(0u8))
+                | Bit::from(
+                    (since.slice::<0, 16>() & (kz_s ^ U::<16>::from(0xFFFFu16)))
+                        != U::<16>::from(0u8),
+                );
             let due = mux(
                 Bit::from(f_burst == U::<3>::from(0u8)),
                 f_arm & Bit::from(since >= stagger),
-                Bit::from(since >= (ival << 6u32)),
+                Bit::from(since >= (ival << 6u32)) & due_k,
             );
             let rt_ok = Bit::from(f_tries == U::<4>::from(0u8))
                 | Bit::from((now_t - m_rt) >= U::<32>::from(RETRY_TICKS));
@@ -657,13 +761,33 @@ impl
             let r_li = r_b0.slice::<6, 2>();
             let r_st = hdr.slice::<112, 8>();
             let r_prec = hdr.slice::<96, 8>();
+            // Origin must be the nonce sent: T1's seconds, `m_org` fraction (F3).
+            let r_org = self.org.get();
             let auth = f_out
                 & Bit::from(r_mode == 4)
                 & (Bit::from(r_vn == 3) | Bit::from(r_vn == 4))
-                & Bit::from(self.org.get() == t1s);
+                & Bit::from(r_org.slice::<32, 32>() == t1s.slice::<32, 32>())
+                & Bit::from(r_org.slice::<0, 32>() == orgs);
             let unusable = Bit::from(r_st == U::<8>::from(0u8))
                 | Bit::from(r_st >= U::<8>::from(16u8))
                 | Bit::from(r_li == 3);
+            // Kiss-o'-Death (F9): RATE backs off, DENY / RSTR kill the slot.
+            let r_rid = hdr.slice::<0, 32>();
+            let kod = Bit::from(r_st == U::<8>::from(0u8));
+            let k_rate = kod & Bit::from(r_rid == U::<32>::from(KOD_RATE));
+            let k_deny = kod
+                & (Bit::from(r_rid == U::<32>::from(KOD_DENY))
+                    | Bit::from(r_rid == U::<32>::from(KOD_RSTR)));
+            let w_auth_c = is_chk & auth;
+            let w_rate = w_auth_c & k_rate;
+            let w_deny = w_auth_c & k_deny;
+            let w_kod = w_rate | w_deny;
+            let pcl = poll_clamp(poll_log2.get());
+            let kxw = kx_s.zext::<8>();
+            let ecur = mux(kxw > pcl, kxw, pcl);
+            let bo = w_rate & Bit::from(ecur < U::<8>::from(KOD_POLL_MAX));
+            let enew = (ecur + U::<8>::from(1u8)).slice::<0, 4>();
+            let kz_new = kod_zmask(enew);
             let rxts = self.rxts.get();
             let t2 = self.t2.get();
             let t3 = self.t3.get();
@@ -770,6 +894,10 @@ impl
             }
             let t1p = self.t1p.get();
             let t1r = self.t1r.get();
+            // The Transmit Timestamp sent (Origin nonce, F3): T1's seconds,
+            // T1's fraction XOR 32 random bits sampled in cycle S.
+            let nonce_lo = t1p.slice::<0, 32>() ^ rnd.get().slice::<0, 32>();
+            let nonce = t1p.slice::<32, 32>().concat::<32, 64>(nonce_lo);
             let at40 = Bit::from(k == 40);
             let ts_b = mux(at40, t1p.slice::<56, 8>(), t1r.slice::<56, 8>());
             let pb = mux(
@@ -804,11 +932,14 @@ impl
             // ------------------------------------------- per-slot writes
             let burst_n = mux(in_burst, f_burst + U::<3>::from(1u8), f_burst);
             // fire: pend 1, tries 0, burst + 1, arm 0
+            // (a dead slot: pend stays 0, the poll is a miss at once)
             let fl_fire = (burst_n.zext::<11>() << 3u32)
                 | (fl & U::<11>::from(0b00000000101u16))
-                | U::<11>::from(0b10u8);
+                | mux(dd_s, U::<11>::from(0u8), U::<11>::from(0b10u8));
             // deadline / authentic reply: out 0
             let fl_noout = fl & U::<11>::from(0b11111111110u16);
+            // authentic RATE / DENY / RSTR: out 0 and the iburst ends (burst 4)
+            let fl_kod = (fl_noout & U::<11>::from(0b11111000111u16)) | U::<11>::from(0b100000u8);
             // lookup failed: tries + 1, or abandon (pend 0, tries 0)
             let fl_fail = mux(
                 give_up,
@@ -833,7 +964,11 @@ impl
                     mux(
                         w_arm,
                         fl | U::<11>::from(0b10000000000u16),
-                        mux(fail, fl_fail, mux(w_sent, fl_sent, fl_noout)),
+                        mux(
+                            fail,
+                            fl_fail,
+                            mux(w_sent, fl_sent, mux(w_kod, fl_kod, fl_noout)),
+                        ),
                     ),
                 ),
             );
@@ -847,10 +982,10 @@ impl
 
             // ------------------------------------------- next state
             let sc_next = mux(
-                sc_dis | sc_fire,
+                sc_dis | (sc_fire & !dd_s),
                 U::<4>::from(S_SCAN),
                 mux(
-                    sc_dl,
+                    sc_dl | sc_fire,
                     U::<4>::from(S_MISS),
                     mux(sc_lkp, U::<4>::from(S_LKP), U::<4>::from(S_SCAN)),
                 ),
@@ -907,12 +1042,26 @@ impl
                     k: U::<6>::from(0u8),
                 },
                 send_p ? k: k + U::<6>::from(1u8),
-                w_t40 ? t1r: t1p << 8u32,
+                w_t40 ? t1r: nonce << 8u32,
                 send_p & Bit::from(k > 40) ? t1r: t1r << 8u32,
                 w_sent ? st: U::<4>::from(S_SCAN),
                 fl_we ? m_fl.at(ix): fl_wd,
                 tm_we ? m_tm.at(ix): tm_wd,
                 w_t40 ? m_t1.at(ix): t1p,
+                w_t40 ? m_org.at(ix): nonce_lo,
+                // Per-slot KoD state: cleared when the slot is disabled.
+                w_dis & ix0 ? { kx0: U::<4>::from(0u8), kz0: U::<16>::from(0u8), dd0: Bit::Zero },
+                w_dis & ix1 ? { kx1: U::<4>::from(0u8), kz1: U::<16>::from(0u8), dd1: Bit::Zero },
+                w_dis & ix2 ? { kx2: U::<4>::from(0u8), kz2: U::<16>::from(0u8), dd2: Bit::Zero },
+                w_dis & ix3 ? { kx3: U::<4>::from(0u8), kz3: U::<16>::from(0u8), dd3: Bit::Zero },
+                bo & ix0 ? { kx0: enew, kz0: kz_new },
+                bo & ix1 ? { kx1: enew, kz1: kz_new },
+                bo & ix2 ? { kx2: enew, kz2: kz_new },
+                bo & ix3 ? { kx3: enew, kz3: kz_new },
+                w_deny & ix0 ? dd0: Bit::One,
+                w_deny & ix1 ? dd1: Bit::One,
+                w_deny & ix2 ? dd2: Bit::One,
+                w_deny & ix3 ? dd3: Bit::One,
             });
         }
     }

@@ -361,6 +361,13 @@ pub struct Selection {
     pub mr3: Reg<U<4>>,
     /// Allow = 0 succeeded (decided in FIN0).
     pub s0: Reg<Bit>,
+    /// Start-up majority (F4): the truechimers of allow = 0 / allow = 1
+    /// number at least `n_en / 2 + 1` (registered every cycle; read in
+    /// FIN1, its inputs are constant from the end of INTER).
+    pub g0: Reg<Bit>,
+    pub g1: Reg<Bit>,
+    /// A valid selection has been made since reset (F4).
+    pub ever: Reg<Bit>,
     /// Survivors.
     pub sv0: Reg<Bit>,
     pub sv1: Reg<Bit>,
@@ -406,8 +413,12 @@ pub struct Selection {
 }
 
 #[lower]
-impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
-    async fn run(&mut self, (stats, now): (Rx<PeerStat>, In<U<64>>), selected: Tx<Selected>) {
+impl Unit<(Rx<PeerStat>, In<U<64>>, In<U<3>>), Tx<Selected>> for Selection {
+    async fn run(
+        &mut self,
+        (stats, now, n_en): (Rx<PeerStat>, In<U<64>>, In<U<3>>),
+        selected: Tx<Selected>,
+    ) {
         loop {
             DefaultClock::rising().await;
             let st = self.st.get();
@@ -655,8 +666,23 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
             let nsv2 = el2 & Bit::from(mr2 > rlo) & Bit::from(mr2 < rhi);
             let nsv3 = el3 & Bit::from(mr3 > rlo) & Bit::from(mr3 < rhi);
             let all4 = nsv0 & nsv1 & nsv2 & nsv3;
-            let fin_fail = s_fin1 & !success;
-            let fin_ok = s_fin1 & success;
+            // Start-up majority (F4): truechimer counts for both allows,
+            // registered (g0, g1) and used in FIN1 until the first valid
+            // selection (`ever`).
+            let maj = (n_en.get() >> 1u32) + U::<3>::from(1u8);
+            let t00 = el0 & Bit::from(mr0 > lr0) & Bit::from(mr0 < hr0);
+            let t01 = el1 & Bit::from(mr1 > lr0) & Bit::from(mr1 < hr0);
+            let t02 = el2 & Bit::from(mr2 > lr0) & Bit::from(mr2 < hr0);
+            let t03 = el3 & Bit::from(mr3 > lr0) & Bit::from(mr3 < hr0);
+            let t10 = el0 & Bit::from(mr0 > lr1) & Bit::from(mr0 < hr1);
+            let t11 = el1 & Bit::from(mr1 > lr1) & Bit::from(mr1 < hr1);
+            let t12 = el2 & Bit::from(mr2 > lr1) & Bit::from(mr2 < hr1);
+            let t13 = el3 & Bit::from(mr3 > lr1) & Bit::from(mr3 < hr1);
+            let n_t0 = (t00.zext::<3>() + t01.zext::<3>()) + (t02.zext::<3>() + t03.zext::<3>());
+            let n_t1 = (t10.zext::<3>() + t11.zext::<3>()) + (t12.zext::<3>() + t13.zext::<3>());
+            let gate = self.ever.get() | mux(s0, self.g0.get(), self.g1.get());
+            let fin_fail = s_fin1 & !(success & gate);
+            let fin_ok = s_fin1 & success & gate;
 
             // ------------------------------------------------ clustering
             let cp = self.cp.get();
@@ -946,6 +972,8 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
             with!(self <= {
                 // Multiplier pipeline, every cycle.
                 rdx: rdx_n,
+                g0: Bit::from(n_t0 >= maj),
+                g1: Bit::from(n_t1 >= maj),
                 ma: opa,
                 mb: opb,
                 mp: prod,
@@ -1035,6 +1063,7 @@ impl Unit<(Rx<PeerStat>, In<U<64>>), Tx<Selected>> for Selection {
                 s_fin0 ? { s0: ok_a0, st: U::<5>::from(FIN1) },
                 fin_fail ? { ok: Bit::Zero, prev_v: Bit::Zero, st: U::<5>::from(OUT) },
                 fin_ok ? {
+                    ever: Bit::One,
                     ok: Bit::One,
                     sv0: nsv0,
                     sv1: nsv1,

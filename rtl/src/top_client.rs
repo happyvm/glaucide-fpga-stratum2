@@ -15,6 +15,8 @@
 //! ├── cmerge   MetaArb    mode-4 replies of both families -> client
 //! ├── client   NtpClient  requests -> uarb4 / uarb6 source 1
 //! │                       samples, miss -> sync (ClientSync<C>)
+//! │                       rnd <- entropy; rx_stamp -> entropy
+//! ├── entropy  Entropy    seed = ENTROPY_SEED, time, client.rx_stamp -> client.rnd
 //! │                       ARP lookup/resolve <-> arp; ND lookup -> nbr, resolve -> icmp6
 //! ├── nbr      NbrCache   learn <- icmp6.learn, lookup/rsp <-> client, flush = 0
 //! ├── arp      Arp        resolve, lookup, lookup_rsp <-> client
@@ -53,6 +55,12 @@
 //! | `client.nd_resolve` | `icmp6.resolve` | `U<128>` |
 //! | `icmp6.learn` | `nbr.learn` | `NdLearn` |
 //! | `client.samples`, `.miss` | `sync.samples`, `.miss` | `Sample`, `U<2>` |
+//!
+//! Wires of the entropy unit (security finding F3, `entropy.rs`):
+//! `entropy.rnd` -> `client.rnd` (sampled when a request's Transmit
+//! Timestamp is built), `client.rx_stamp` (receive timestamp of the last
+//! upstream reply taken) and `time` -> `entropy`, `seed` tied to
+//! [`ENTROPY_SEED`].
 //!
 //! ## One answer per lookup
 //!
@@ -118,6 +126,7 @@
 use crate::arp::{Arp, ArpEntry};
 use crate::clock::{DisciplinedClock, INCR};
 use crate::config::{Config, ConfigSet};
+use crate::entropy::Entropy;
 use crate::eth_rx::{EthMeta, EthRx};
 use crate::eth_tx::{EthHdr, EthTx};
 use crate::fcs_check::FcsCheck;
@@ -157,6 +166,13 @@ pub const SERVER_ARB_ADJ: u64 = ps_to_ntp(ARB_STAGE_PS);
 pub const CLIENT_TX_LATENCY_V4: u64 = TX_LATENCY_V4;
 /// `tx_latency6` of the client: the route's IPv6 constant.
 pub const CLIENT_TX_LATENCY_V6: u64 = TX_LATENCY_V6;
+/// Seed of the entropy unit (`entropy.rs`). A public placeholder: **the
+/// user must set a per-device secret value** before building a bitstream for
+/// a public server (`ConfigSet` has no seed constant yet). With this default
+/// the client's Origin nonces are only as unpredictable as the network
+/// jitter mixed in since reset (`entropy.rs`, « No true random number
+/// generator »).
+pub const ENTROPY_SEED: u64 = 0x6E74_705F_7365_6564;
 
 // ---------------------------------------------------------------------
 // Clock sources
@@ -265,6 +281,7 @@ pub struct ArtyCoreClient<R: Clock, T: Clock, C: ConfigSet, K: ClockSource> {
     pub demux6: NtpDemux,
     pub cmerge: MetaArb,
     pub client: NtpClient,
+    pub entropy: Entropy,
     pub nbr: NbrCache,
     pub server: NtpServer,
     pub route: NtpReplyRoute,
@@ -305,6 +322,7 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource> Default for ArtyCoreClien
             demux6: Default::default(),
             cmerge: Default::default(),
             client: Default::default(),
+            entropy: Default::default(),
             nbr: Default::default(),
             server: Default::default(),
             route: Default::default(),
@@ -405,6 +423,10 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>
         let (step_en_o, step_en) = signal::<Bit, DefaultClock>();
         let (route_lat_o, route_lat) = signal::<U<64>, DefaultClock>();
         let (tx_latency_o, tx_latency) = signal::<U<64>, DefaultClock>();
+        // Entropy wires (F3).
+        let (rnd_o, rnd) = signal::<U<64>, DefaultClock>();
+        let (rx_stamp_o, rx_stamp) = signal::<U<64>, DefaultClock>();
+        let time_f = time.clone();
 
         // Receive path.
         let (rxf_tx, rxf_rx) = chan::<FrameByte, DefaultClock>();
@@ -645,7 +667,13 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>
                             join2(
                                 self.route
                                     .run((rm_rx, rp_rx), (q4_tx, y4_tx, q6_tx, y6_tx, route_lat_o)),
-                                self.lat.run(route_lat, tx_latency_o),
+                                join2(
+                                    self.lat.run(route_lat, tx_latency_o),
+                                    self.entropy.run(
+                                        (tie(U::<64>::new(ENTROPY_SEED as u128)), time_f, rx_stamp),
+                                        rnd_o,
+                                    ),
+                                ),
                             ),
                         ),
                         join2(
@@ -676,6 +704,7 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>
                                     tie(U::<64>::new(CLIENT_TX_LATENCY_V4 as u128)),
                                     tie(U::<64>::new(CLIENT_TX_LATENCY_V6 as u128)),
                                     time_e,
+                                    rnd,
                                     cm_rx,
                                     cp_rx,
                                     lr_rx,
@@ -683,7 +712,7 @@ impl<R: Clock, T: Clock, C: ConfigSet, K: ClockSource>
                                 ),
                                 (
                                     lk_tx, res_tx, ndlk_tx, ndres_tx, cq4_tx, cy4_tx, cq6_tx,
-                                    cy6_tx, smp_tx, miss_tx,
+                                    cy6_tx, smp_tx, miss_tx, rx_stamp_o,
                                 ),
                             ),
                             join2(
