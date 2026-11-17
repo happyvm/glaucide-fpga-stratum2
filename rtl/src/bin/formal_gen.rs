@@ -10,6 +10,7 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("formal_smoke") => print!("{}", Digit::verilog("formal_smoke")),
         Some("frame_crc") => print!("{}", FrameCrc::verilog("frame_crc")),
+        Some("csum") => print!("{}", ntp_fpga::csum::Csum::verilog("csum")),
         Some("mii_rx") => print!("{}", MiiRx::verilog("mii_rx")),
         Some("mii_tx") => print!("{}", MiiTx::verilog("mii_tx")),
         Some("eth_rx") => print!("{}", EthRx::verilog("eth_rx")),

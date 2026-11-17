@@ -3,6 +3,7 @@
 pub mod clock;
 pub mod clocks;
 pub mod crc32;
+pub mod csum;
 pub mod eth_rx;
 pub mod eth_tx;
 pub mod fcs_check;
