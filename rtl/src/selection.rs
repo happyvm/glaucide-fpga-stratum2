@@ -1037,6 +1037,7 @@ impl Unit<(Rx<PeerStat>, In<U<64>>, In<U<3>>), Tx<Selected>> for Selection {
             check!(!(post & self.ok.get() & svp3) | elp3, "a survivor 3 is eligible");
             check!(!self.ok.get() | self.ever.get(), "a valid selection implies ever");
             let post2 = s_cmbi | s_divw | s_cmbm | s_fphi | s_divn | s_divj | s_sqrt | s_out;
+            check!(!(post & self.ok.get() & self.m_ne.get()) | (svp0 | svp1 | svp2 | svp3), "a valid selection that started with a survivor still has one (clustering drops at most one of four)");
             check!(!(post2 & self.ok.get() & self.m_ne.get()) | pickb(sp, svp0, svp1, svp2, svp3), "the system peer is a survivor (given that the intersection left one)");
             check!(!(post2 & self.ok.get() & self.m_ne.get()) | pickb(sp, elp0, elp1, elp2, elp3), "the system peer is eligible (given that the intersection left a survivor)");
             check!(!(out_go & ok & self.m_ne.get()) | Bit::from(pick33(sp, rd0, rd1, rd2, rd3) < MAXDIST_Q32), "valid: root_dist < MAXDIST (given a survivor)");
