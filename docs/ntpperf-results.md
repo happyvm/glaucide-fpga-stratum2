@@ -270,17 +270,29 @@ de `ntp_server.rs`, journalisée par le pont et recalculée en Python : identiqu
 rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
 1000       100  18.58%   0.00%  81.42%   0.00%   +10020  +10020  +10020      0
 10000     1000  18.95%   0.00%  81.05%   0.00%   +10020  +10020  +10020      0
-LC_ROWS
+(--long)
+30000     3000  56.49%   0.00%  43.51%   0.00%   +10020  +10020  +10020      0
+80000     8000  76.63%   0.00%  23.37%   0.00%   +10020  +10020  +10020      0
 ```
 
 | Débit | Sources | Cases occupées | Sources partageant une case | Perte ntpperf | Espérance exacte (hachage du design) | Une case par source | Hachage aléatoire uniforme |
 |---|---|---|---|---|---|---|---|
 | 1 000 | 100 | 100 | 0 | 18,58 % | 18,73 % ± 0,34 | 18,73 % | — |
 | 10 000 | 1 000 | 1 000 | 0 | 18,95 % | 18,75 % ± 0,11 | 18,75 % | 27,3 % |
-LC_TABLE
+| 30 000 (`--long`) | 3 000 | 1 498 | 2 818 | **56,49 %** | 56,30 % ± 0,11 | 18,75 % | 40,7 % |
+| 80 000 (`--long`) | 8 000 | 1 826 | 7 818 | **76,63 %** | 76,63 % ± 0,08 | (18,75 %, impossible : 8 000 > 4 096) | 60,8 % |
 
-- Jusqu'à 1 000 sources, la perte mesurée par ntpperf est celle de la formule, à l'écart statistique de la fuite
-  près (1,8 σ à 10 000 req/s : 8 106 réponses pour 8 126 ± 11 attendues).
+- **La perte mesurée par ntpperf est celle que prévoit le modèle du limiteur, à tous les débits** : la formule
+  18,75 % tant que chaque source a sa case (100 et 1 000 sources), et l'espérance exacte calculée avec les cases
+  réelles quand des sources les partagent (30 000 et 80 000 req/s : 56,49 % pour 56,30 ± 0,11 % ; 76,63 % pour
+  76,63 ± 0,08 %). Contrôle direct dans `requests.csv` : **toutes** les requêtes sous la limite de leur case et de
+  leur fenêtre ont une réponse (29 000 sur 29 000 pour c-1k, c-10k, lc-30k), et au-delà la fuite vaut 1 187 / 20 217
+  = 5,87 % ± 0,17 pour 6,25 % attendus (−2,2 σ ; le générateur seul, rejoué en Python sur 4·10⁶ cycles, donne
+  6,247 %, −0,25 σ : pas de biais propre du générateur ; l'écart vient vraisemblablement de l'échantillonnage
+  périodique, à confirmer sur une plus longue série — sans conséquence, la fuite n'est qu'une atténuation).
+- À 80 000 req/s, 8 000 sources ne peuvent pas avoir chacune leur case (4 096) : le limiteur plafonne alors le
+  volume total servi à ≈ 4 096 × 8 + N/16 réponses/s ; avec les cases réelles (1 826 occupées) le plafond tombe à
+  18 700 réponses/s.
 - **Les sources consécutives de ntpperf ne se répartissent pas comme des clés aléatoires** : le hachage
   multiplicatif `(m·k + b) >> 52` sur des clés consécutives est une suite de Weyl (k·m/2⁶⁴ mod 1) dont la
   répartition dépend du développement en fraction continue de m/2⁶⁴ (`RATE_SECRET`). Jusqu'à 1 000 sources : aucune
@@ -311,7 +323,8 @@ ntpperf_bridge ... --rate-limit 8 --kod ... -- ntpperf NET -B -t 1.0 -o 1e-12 -H
                |          responses            |     TX timestamp offset (ns)
 rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
 1000       100   0.00%   0.00% 100.00%   0.00%  -237268110785876256 +339910485709810496 +3955530061237428224 887712134519796864
-LD_ROWS
+ntpperf_bridge ... --rate-limit 8 --kod ... -- ntpperf NET -B -t 1.0 -r 10000      (--long)
+10000     1000   0.00%   0.00% 100.00%   0.00%       +0   +8133  +10020   3917
 ```
 
 - **ntpperf compte un KoD comme une réponse valide en mode de base**, ni perdue ni « invalid » : sa validation
@@ -327,7 +340,21 @@ LD_ROWS
 - Avec le KoD, **chaque requête valide reçoit une réponse** de même taille : le limiteur ne réduit plus le volume
   réfléchi (déjà noté par `docs/security.md`, recommandation R4).
 
-### 3.5 e. IPv6
+### 3.5 Requêtes en mode entrelacé (`-I`)
+
+```
+ntpperf_bridge ... --rate-limit 0 ... -- ntpperf NET -I -t 0.2 -r 1000
+               |          responses            |        response time (ns)
+rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
+1000       100   0.00%   0.00% 100.00%   0.00%
+```
+
+Le design ne connaît que le mode de base : il répond à chaque requête « entrelacée » de ntpperf (Receive ≠ 0) par
+une réponse de base valide (Origin = Transmit de la requête), comptée `basic` ; ntpperf n'imprime d'écart que pour
+les réponses entrelacées, d'où les colonnes vides. Comportement attendu, identique à celui observé avec chrony
+`xleave` (`docs/chrony-interop.md`).
+
+### 3.6 e. IPv6
 
 **Non couvert par ntpperf** : il ne fabrique que des requêtes IPv4 (`sender.c` : en-tête IPv4 codé en dur, option
 `-s` IPv4 seulement) ; le chemin IPv6 du design (`udp6_rx`, `udp6_tx`, limiteur indexé par /64) n'est pas exercé
@@ -346,7 +373,8 @@ arithmétique (un bloc d'adresses consécutives : les clients de ntpperf, un ré
 un /20 de centre de données) forment une suite de Weyl dont la répartition dépend de la fraction continue de
 m/2⁶⁴. Reproduction : `run.sh --long lc-30k lc-80k` (tableau 3.3), ou en Python (`analyse.py`, `rl_index`) :
 - secret de `Test` : 3 000 sources consécutives n'occupent que 1 498 cases (2 818 partagent une case ; une fonction
-  aléatoire en occuperait 2 127), 16 384 sources 2 374 cases ; mesuré à 30 000 req/s : LC30 ;
+  aléatoire en occuperait 2 127), 16 384 sources 2 374 cases ; mesuré à 30 000 req/s : **56,49 % de perte au lieu des 18,75 %** d'une case par source (40,7 % avec une fonction
+  aléatoire) ; à 80 000 req/s, 76,63 % au lieu de 60,8 % ;
 - sur 300 secrets tirés au hasard, 4 096 sources consécutives occupent de **120** à 4 045 cases (10 % des secrets :
   moins de 1 572 ; médiane 3 012 ; fonction aléatoire : 2 589). Le secret de `Board` est bon (3 351 ; 16 384
   sources sur les 4 096 cases).
@@ -386,8 +414,7 @@ coût d'un point à 0,5 s virtuelle (5 minutes de simulation au-delà de 45 000 
 
 ## 5. Ce qui n'est pas couvert
 
-- **IPv6** (ntpperf est IPv4 seulement), le mode entrelacé (`-I` : le design ne le gère pas, il répondrait en mode
-  de base), PTP (`-D`, `-N`), NTS (`-S`, ntpperf compilé sans gnutls ; le design ne fait pas NTS).
+- **IPv6** (ntpperf est IPv4 seulement), PTP (`-D`, `-N`), NTS (`-S`, ntpperf compilé sans gnutls ; le design ne fait pas NTS).
 - La carte avec client (`ArtyBoardWithClient`, cœur `ArtyCoreClient`) : seul le serveur seul (`ArtyCore`, celui
   d'`ArtyBoard`) est chargé ; sa synchronisation est `FixedSync` (strate 2), pas le servo.
 - Plusieurs processus d'émission (`-p`), la distribution exponentielle des départs (`-e`) : les requêtes restent

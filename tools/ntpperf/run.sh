@@ -33,6 +33,7 @@
 #   c-10k      --rate-limit 8 | -B -t 1.0 -r 10000   1 000 sources
 #   d-kod-1k   --rate-limit 8 --kod | -B -t 1.0 -r 1000
 #   d-kod-o-1k --rate-limit 8 --kod | -B -t 1.0 -o 1e-12 -H -r 1000
+#   x-xleave-1k no limiter | -I -t 0.2 -r 1000       interleaved-mode requests
 # --long adds:
 #   la-full    no limiter | -B -r 1000-200000 -x 1.5   ntpperf's default sweep
 #   lb-full    no limiter | -B -o 1e-12 -H -r 1000-200000 -x 1.5
@@ -85,6 +86,7 @@ c-1k|--rate-limit 8|-B -t 1.0 -r 1000|3
 c-10k|--rate-limit 8|-B -t 1.0 -r 10000|29
 d-kod-1k|--rate-limit 8 --kod|-B -t 1.0 -r 1000|3
 d-kod-o-1k|--rate-limit 8 --kod|-B -t 1.0 -o 1e-12 -H -r 1000|3
+x-xleave-1k|--rate-limit 0|-I -t 0.2 -r 1000|1
 EOF
     if [ "$LONG" = 1 ]; then
         cat <<EOF
