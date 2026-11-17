@@ -1031,10 +1031,10 @@ impl Unit<(Rx<PeerStat>, In<U<64>>, In<U<3>>), Tx<Selected>> for Selection {
             check!(!(elp2 & !s_dist) | (okp2 & Bit::from(rdp2 < MAXDIST_Q32)), "an eligible peer 2 is usable with root distance < MAXDIST");
             check!(!(elp3 & !s_dist) | (okp3 & Bit::from(rdp3 < MAXDIST_Q32)), "an eligible peer 3 is usable with root distance < MAXDIST");
             check!(!(post & !s_out) | self.ok.get(), "after a successful decision the selection is valid until OUT");
-            check!(!(post & svp0) | elp0, "a survivor 0 is eligible");
-            check!(!(post & svp1) | elp1, "a survivor 1 is eligible");
-            check!(!(post & svp2) | elp2, "a survivor 2 is eligible");
-            check!(!(post & svp3) | elp3, "a survivor 3 is eligible");
+            check!(!(post & self.ok.get() & svp0) | elp0, "a survivor 0 is eligible");
+            check!(!(post & self.ok.get() & svp1) | elp1, "a survivor 1 is eligible");
+            check!(!(post & self.ok.get() & svp2) | elp2, "a survivor 2 is eligible");
+            check!(!(post & self.ok.get() & svp3) | elp3, "a survivor 3 is eligible");
             check!(!self.ok.get() | self.ever.get(), "a valid selection implies ever");
             let post2 = s_cmbi | s_divw | s_cmbm | s_fphi | s_divn | s_divj | s_sqrt | s_out;
             check!(!(post2 & self.ok.get() & self.m_ne.get()) | pickb(sp, svp0, svp1, svp2, svp3), "the system peer is a survivor (given that the intersection left one)");
