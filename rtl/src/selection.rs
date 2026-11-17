@@ -1036,6 +1036,17 @@ impl Unit<(Rx<PeerStat>, In<U<64>>, In<U<3>>), Tx<Selected>> for Selection {
             check!(!(post & self.ok.get() & svp2) | elp2, "a survivor 2 is eligible");
             check!(!(post & self.ok.get() & svp3) | elp3, "a survivor 3 is eligible");
             check!(!self.ok.get() | self.ever.get(), "a valid selection implies ever");
+            // System-peer search: the best index found so far is a survivor, and every
+            // survivor already scanned has set `bv`.
+            let bi_r = self.bi.get();
+            check!(!((s_sys | s_sys2) & bv) | pickb(bi_r, svp0, svp1, svp2, svp3), "the best peer found so far is a survivor");
+            check!(!(s_sys2 & svp0) | bv, "all survivors scanned: bv set (0)");
+            check!(!(s_sys2 & svp1) | bv, "all survivors scanned: bv set (1)");
+            check!(!(s_sys2 & svp2) | bv, "all survivors scanned: bv set (2)");
+            check!(!(s_sys2 & svp3) | bv, "all survivors scanned: bv set (3)");
+            check!(!(s_sys & Bit::from(ia > 0) & svp0) | bv, "survivor 0 scanned: bv set");
+            check!(!(s_sys & Bit::from(ia > 1) & svp1) | bv, "survivor 1 scanned: bv set");
+            check!(!(s_sys & Bit::from(ia > 2) & svp2) | bv, "survivor 2 scanned: bv set");
             let post2 = s_cmbi | s_divw | s_cmbm | s_fphi | s_divn | s_divj | s_sqrt | s_out;
             check!(!(post & self.ok.get() & self.m_ne.get()) | (svp0 | svp1 | svp2 | svp3), "a valid selection that started with a survivor still has one (clustering drops at most one of four)");
             check!(!(post2 & self.ok.get() & self.m_ne.get()) | pickb(sp, svp0, svp1, svp2, svp3), "the system peer is a survivor (given that the intersection left one)");
