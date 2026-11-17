@@ -54,3 +54,22 @@ Toutes les broches utilisent `IOSTANDARD LVCMOS33`, comme le maître. Le maître
 5. **Délais de piste et latence d'horloge** du PCB : non modélisés.
 6. **`eth_mdc` / `eth_mdio`** (interface de gestion, lente, bidirectionnelle) : pas de contrainte de timing pour l'instant. À traiter avec la FSM MDIO (faux chemins ou règle dédiée).
 7. **`IOB TRUE`** : effectif uniquement si le top-level enregistre les ports concernés.
+
+## Note du top (T1.11) : contraintes complémentaires
+
+Le fichier de broches n'est pas modifié. Les contraintes qui dépendent des noms d'instances de
+l'enveloppe `rtl/hdl/arty_top_board.v` sont dans `tools/vivado/top_timing.xdc` (lu après celui-ci par
+`tools/vivado/build.tcl`) :
+
+- **MMCM** (`u_mmcm`, `MMCME2_BASE`) : `clk_100` → VCO 1 GHz → `CLKOUT0` 100 MHz (`clk_sys`),
+  `CLKOUT1` 25 MHz. Vivado dérive lui-même ces deux horloges générées ; aucune `create_generated_clock`
+  n'est nécessaire sur les sorties du MMCM.
+- **`eth_ref_clk`** (TODO 3) : 25 MHz transmis par un `ODDR` (`u_ref_oddr`) ;
+  `create_generated_clock -name eth_ref_clk_fwd -source [get_pins u_ref_oddr/C] -divide_by 1
+  [get_ports eth_ref_clk]`. Aucune donnée n'est synchronisée sur cette horloge.
+- **Groupes asynchrones** : le `set_clock_groups` ci-dessus ne nomme que `clk_100`, sans ses horloges
+  générées ; `top_timing.xdc` en ajoute un avec `-include_generated_clocks` pour `clk_100`,
+  `eth_rx_clk` et `eth_tx_clk` (les horloges MII passent par un BUFG et un `BUFGCE`).
+- **MDC / MDIO / `eth_rstn`** (TODO 6) : faux chemins (registres de `phy_init`, MDC à 1 MHz).
+- **`IOB TRUE` sur les entrées MII** (TODO 7) : sans effet, `mii_rx` n'a pas de bascule directement
+  sur ces broches ; les sorties `eth_txd`/`eth_tx_en` sont des registres de `mii_tx`.
