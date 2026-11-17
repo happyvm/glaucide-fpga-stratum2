@@ -312,8 +312,8 @@ extern "C" {
     fn setsockopt(fd: i32, level: i32, name: i32, val: *const u8, len: u32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn syscall(n: i64, ...) -> i64;
-    fn kill(pid: i32, sig: i32) -> i32;
     fn getpid() -> i32;
+    fn close(fd: i32) -> i32;
 }
 const AF_UNIX: i32 = 1;
 const SOCK_SEQPACKET: i32 = 5;
@@ -748,6 +748,8 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
         o.cmd
     );
     let mut child = spawn(o, sv[1]);
+    // SAFETY: ntpperf has its copy; ours is not used.
+    unsafe { close(sv[1]) };
 
     // Bench state.
     let mut reqs: Vec<Req> = vec![];
@@ -1173,8 +1175,6 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
         }
         f.flush().unwrap();
     }
-    // SAFETY: kill(0) only probes; nothing to clean up otherwise.
-    let _ = unsafe { kill(child.id() as i32, 0) };
     drop(sim);
     if exit_code == 0 && !child_status.success() {
         exit_code = 1;

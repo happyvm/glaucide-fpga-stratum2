@@ -286,7 +286,7 @@ rate   clients |  lost invalid   basic  xleave |    min    mean     max stddev
   18,75 % tant que chaque source a sa case (100 et 1 000 sources), et l'espérance exacte calculée avec les cases
   réelles quand des sources les partagent (30 000 et 80 000 req/s : 56,49 % pour 56,30 ± 0,11 % ; 76,63 % pour
   76,63 ± 0,08 %). Contrôle direct dans `requests.csv` : **toutes** les requêtes sous la limite de leur case et de
-  leur fenêtre ont une réponse (29 000 sur 29 000 pour c-1k, c-10k, lc-30k), et au-delà la fuite vaut 1 187 / 20 217
+  leur fenêtre ont une réponse (28 986 sur 28 986 pour c-1k, c-10k, lc-30k), et au-delà la fuite vaut 1 187 / 20 217
   = 5,87 % ± 0,17 pour 6,25 % attendus (−2,2 σ ; le générateur seul, rejoué en Python sur 4·10⁶ cycles, donne
   6,247 %, −0,25 σ : pas de biais propre du générateur ; l'écart vient vraisemblablement de l'échantillonnage
   périodique, à confirmer sur une plus longue série — sans conséquence, la fuite n'est qu'une atténuation).
