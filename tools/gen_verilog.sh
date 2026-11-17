@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p out
-for m in ntp_clock frame_counter; do
+for m in ntp_clock frame_counter mii_tx; do
   cargo run -q -p ntp_fpga --bin gen_all -- "$m" > "out/$m.v"
 done
 ls out/*.v
