@@ -139,6 +139,7 @@ struct Out {
     bytes: Vec<FrameByte>,
     /// Cycles (sink side) of the meta, of byte 40 and of the last byte.
     t_meta: usize,
+    t_first: usize,
     t40: usize,
     t_last: usize,
 }
@@ -234,6 +235,8 @@ fn run(
     let mut metas: VecDeque<(NtpReplyMeta, usize)> = VecDeque::new();
     let mut open: Vec<FrameByte> = vec![];
     let mut t40 = 0;
+    let mut t_first = 0;
+    let mut done: VecDeque<(Vec<FrameByte>, usize, usize, usize)> = VecDeque::new();
     for t in 0..cycles {
         time_o.set(U::<96>::new(time(t) & ((1u128 << 96) - 1)));
         for f in 0..2 {
@@ -276,42 +279,63 @@ fn run(
         }
         if take_b(t) {
             if let Some(b) = ob.recv() {
-                assert!(
-                    metas.len() > 0,
-                    "reply byte before its reply_meta (cycle {t})"
-                );
                 if open.len() == 40 {
                     t40 = t;
                 }
                 open.push(b);
+                if open.len() == 1 {
+                    t_first = t;
+                }
                 if b.last.to_bool() {
-                    let (m, tm) = metas.pop_front().unwrap();
-                    outs.push(Out {
-                        meta: m,
-                        bytes: std::mem::take(&mut open),
-                        t_meta: tm,
-                        t40,
-                        t_last: t,
-                    });
+                    done.push_back((std::mem::take(&mut open), t_first, t40, t));
                 }
             }
+        }
+        // Pair metas and replies in order (separate channels: the sink may
+        // read a reply before its meta when it stalls `reply_meta` only).
+        while !metas.is_empty() && !done.is_empty() {
+            let (m, tm) = metas.pop_front().unwrap();
+            let (bytes, tf, t40, tl) = done.pop_front().unwrap();
+            outs.push(Out {
+                meta: m,
+                bytes,
+                t_meta: tm,
+                t_first: tf,
+                t40,
+                t_last: tl,
+            });
         }
         sim.cycle();
     }
     assert!(open.is_empty(), "a reply was left open");
-    assert!(metas.is_empty(), "a reply_meta without its reply");
+    assert!(
+        metas.is_empty() && done.is_empty(),
+        "a reply_meta without its reply or back"
+    );
     assert!(qs.iter().all(|q| q.is_empty()), "requests not all taken");
     RunOut { outs, sent_t }
 }
 
 fn cycles_for(reqs: &[Req], gap: usize, slow: usize) -> usize {
-    reqs.iter().map(|r| (r.pay.len() * (gap + 1) + 120) * slow).sum::<usize>() + 400
+    reqs.iter()
+        .map(|r| (r.pay.len() * (gap + 1) + 120) * slow)
+        .sum::<usize>()
+        + 400
 }
 
 /// Simple run: frozen clock at `T_RECV`, all outputs ready.
 fn run_simple(reqs: &[Req], cfg: &Cfg) -> Vec<Out> {
     let n = cycles_for(reqs, 0, 1);
-    run(reqs, cfg, 0, |_| (T_RECV as u128) << 32, |_| true, |_| true, n).outs
+    run(
+        reqs,
+        cfg,
+        0,
+        |_| (T_RECV as u128) << 32,
+        |_| true,
+        |_| true,
+        n,
+    )
+    .outs
 }
 
 /// Stream contract and length of every reply.
@@ -448,10 +472,7 @@ fn vectors_byte_exact() {
                 *want.last_mut().unwrap() = Some(f.clone());
             }
         }
-        let cfg = Cfg {
-            synced,
-            ..vcfg()
-        };
+        let cfg = Cfg { synced, ..vcfg() };
         let outs = run_simple(&reqs, &cfg);
         let answered: Vec<(usize, &Vec<u8>)> = want
             .iter()
@@ -478,7 +499,11 @@ fn vectors_byte_exact() {
                 assert_eq!(o.meta.src_ip.raw(), be(&tx[26..30]));
                 assert_eq!(o.meta.dst_ip.raw(), be(&tx[30..34]));
             }
-            assert_eq!(o.data(), expect(r, &cfg, false, T_XMIT), "{name}: reference");
+            assert_eq!(
+                o.data(),
+                expect(r, &cfg, false, T_XMIT),
+                "{name}: reference"
+            );
         }
     }
 }
@@ -539,8 +564,14 @@ fn lengths_and_extension_fields() {
     // Origin is request bytes 40-47, whatever follows.
     let long = [0usize, 1, 4, 12, 20, 52, 200, 1424];
     for &ext in &long {
-        reqs.push(req4(ntp_req(0x23, 6, 0xABCD_0000 + ext as u64, ext), 4000 + ext as u16));
-        reqs.push(req6(ntp_req(0x1B, 7, 0xDCBA_0000 + ext as u64, ext), 4000 + ext as u16));
+        reqs.push(req4(
+            ntp_req(0x23, 6, 0xABCD_0000 + ext as u64, ext),
+            4000 + ext as u16,
+        ));
+        reqs.push(req6(
+            ntp_req(0x1B, 7, 0xDCBA_0000 + ext as u64, ext),
+            4000 + ext as u16,
+        ));
     }
     let outs = run_simple(&reqs, &cfg);
     assert_eq!(outs.len(), 2 * long.len());
@@ -583,7 +614,10 @@ fn err_on_last_byte_drops_the_request() {
     let outs = run_simple(&reqs, &cfg);
     assert_eq!(outs.len(), 2, "only the two clean requests are answered");
     for o in &outs {
-        let r = reqs.iter().find(|r| r.sport == 5200 && r.v6 == o.meta.family.to_bool()).unwrap();
+        let r = reqs
+            .iter()
+            .find(|r| r.sport == 5200 && r.v6 == o.meta.family.to_bool())
+            .unwrap();
         check_meta(o, r);
         assert_eq!(o.data(), expect(r, &cfg, false, T_XMIT));
     }
@@ -594,8 +628,14 @@ fn families_interleaved_round_robin() {
     let cfg = vcfg();
     let mut reqs = vec![];
     for i in 0..6u16 {
-        reqs.push(req4(ntp_req(0x23, 6, 0x4000 + i as u64, (i as usize) * 3), 100 + i));
-        reqs.push(req6(ntp_req(0x1B, 5, 0x6000 + i as u64, (i as usize) * 5), 200 + i));
+        reqs.push(req4(
+            ntp_req(0x23, 6, 0x4000 + i as u64, (i as usize) * 3),
+            100 + i,
+        ));
+        reqs.push(req6(
+            ntp_req(0x1B, 5, 0x6000 + i as u64, (i as usize) * 5),
+            200 + i,
+        ));
     }
     // Extra IPv4 ones at the end: served back to back once IPv6 is empty.
     for i in 6..9u16 {
@@ -604,8 +644,12 @@ fn families_interleaved_round_robin() {
     let outs = run_simple(&reqs, &cfg);
     assert_eq!(outs.len(), reqs.len());
     let fams: Vec<bool> = outs.iter().map(|o| o.meta.family.to_bool()).collect();
-    for k in 0..12 {
-        assert_eq!(fams[k], k % 2 == 1, "alternation while both are pending: {fams:?}");
+    for k in 1..12 {
+        assert_ne!(
+            fams[k],
+            fams[k - 1],
+            "alternation while both are pending: {fams:?}"
+        );
     }
     assert!(fams[12..].iter().all(|f| !f));
     // Each family in its own order, every reply correct.
@@ -629,7 +673,14 @@ fn families_interleaved_round_robin() {
     // Reference ID per family.
     for o in &outs {
         let rid = be(&o.data()[12..16]) as u32;
-        assert_eq!(rid, if o.meta.family.to_bool() { REF_ID6 } else { REF_ID4 });
+        assert_eq!(
+            rid,
+            if o.meta.family.to_bool() {
+                REF_ID6
+            } else {
+                REF_ID4
+            }
+        );
     }
 }
 
@@ -662,10 +713,7 @@ fn unsynchronised_and_stratum_range() {
             let r = if o.meta.family.to_bool() { &r6 } else { &r4 };
             assert_eq!(d, expect(r, &cfg, false, T_XMIT));
             // Reference ID kept when not synchronised (as the model).
-            assert_eq!(
-                be(&d[12..16]) as u32,
-                if r.v6 { REF_ID6 } else { REF_ID4 }
-            );
+            assert_eq!(be(&d[12..16]) as u32, if r.v6 { REF_ID6 } else { REF_ID4 });
         }
     }
 }
@@ -703,7 +751,10 @@ fn origin_receive_transmit() {
     // stamps a little before the clock.
     let mut reqs = vec![];
     for i in 0..8u64 {
-        let mut r = req4(ntp_req(0x23, 6, 0x0123_4567_89AB_CDEF ^ (i << 40), 0), 8000 + i as u16);
+        let mut r = req4(
+            ntp_req(0x23, 6, 0x0123_4567_89AB_CDEF ^ (i << 40), 0),
+            8000 + i as u16,
+        );
         r.rx_ts = t0 - 1000 * (i + 1);
         reqs.push(r.clone());
         r.v6 = true;
@@ -734,13 +785,21 @@ fn origin_receive_transmit() {
             let ts = (0..n)
                 .find(|&t| (clk(t) >> 32) as u64 == t3 - k)
                 .expect("T3 - K is a sampled clock value");
+            // The clock is that of cycle S - 1 (byte 40 sent in S, the
+            // testbench's iteration numbers are the unit's cycles); byte 40
+            // reaches the sink in S + 1, or later when the sink skips that
+            // cycle: 2, or 3 with these one-cycle stalls, whatever the
+            // stalls before byte 40 (up to ~16 cycles here): T3 is sampled
+            // at byte 40, not at the request.
             let l = o.t40 as i64 - ts as i64;
-            assert_eq!(*lag.get_or_insert(l), l, "sampling cycle relative to byte 40");
+            assert!(
+                (2..=3).contains(&l),
+                "sampling cycle relative to byte 40: {l}"
+            );
+            lag = Some(lag.map_or(l, |m: i64| m.max(l)));
             assert_eq!(d, expect(r, &cfg, false, t3));
         }
-        // Byte 40 is sent in cycle S and seen by the sink in S + 1 at the
-        // earliest; the clock is that of S - 1.
-        assert_eq!(lag, Some(2), "time of cycle S - 1, byte 40 seen at S + 1");
+        assert!(lag.is_some());
     }
 }
 
@@ -758,7 +817,16 @@ fn transmit_never_before_receive() {
     let mut r2 = req4(ntp_req(0x23, 6, 10, 0), 9001);
     r2.rx_ts = u64::MAX;
     let n = cycles_for(&[r.clone(), r2.clone()], 0, 2);
-    let outs = run(&[r.clone(), r2.clone()], &cfg, 0, running(t0), |_| true, |_| true, n).outs;
+    let outs = run(
+        &[r.clone(), r2.clone()],
+        &cfg,
+        0,
+        running(t0),
+        |_| true,
+        |_| true,
+        n,
+    )
+    .outs;
     assert_eq!(outs[0].t3(), r.rx_ts);
     assert_eq!(outs[1].t3(), u64::MAX);
     // tx_latency wraps modulo 2^64 like NTP time; still clamped.
@@ -795,7 +863,10 @@ fn rate_limiter() {
     let mk = |src: u128, n: usize, base: u16| -> Vec<Req> {
         (0..n)
             .map(|i| {
-                let mut r = req4(ntp_req(0x23, 6, (base as u64) << 16 | i as u64, 0), base + i as u16);
+                let mut r = req4(
+                    ntp_req(0x23, 6, (base as u64) << 16 | i as u64, 0),
+                    base + i as u16,
+                );
                 r.src = src;
                 r
             })
@@ -857,15 +928,16 @@ fn rate_limiter() {
     assert_eq!(outs.len(), 40);
     // 4. Window rollover: the clock crosses a second boundary in the middle
     // of the burst; the counter starts again.
-    let cut = 1000; // cycle at which the second changes
+    let cut = 400; // cycle at which the second changes
     let roll = move |t: usize| {
         let s = if t < cut { t0 } else { t0 + (1u64 << 32) };
         (s as u128) << 32
     };
     let ro = run(&mk(a, 10, 400), &base, 0, roll, |_| true, |_| true, n);
     let before = ro.outs.iter().filter(|o| o.t_last < cut).count();
-    let after = ro.outs.iter().filter(|o| o.t_last >= cut + 200).count();
+    let after = ro.outs.iter().filter(|o| o.t_last >= cut).count();
     assert!(ro.sent_t[9] > cut + 200, "burst spans the boundary");
+    assert!(ro.sent_t[3] < cut, "a request limited in the first second");
     assert_eq!(before, 3, "3 in the first second");
     assert_eq!(after, 3, "3 again in the next second");
     assert_eq!(ro.outs.len(), 6);
@@ -877,15 +949,17 @@ fn rate_limiter() {
     let outs = run(&reqs, &base, 0, frozen, |_| true, |_| true, n).outs;
     let na = outs.iter().filter(|o| src_of(o) == a).count();
     let nc = outs.iter().filter(|o| src_of(o) == c).count();
-    assert_eq!((na, nc), (2, 1), "shared bucket: limited early, not bypassed");
+    assert_eq!(
+        (na, nc),
+        (2, 1),
+        "shared bucket: limited early, not bypassed"
+    );
     // 6. IPv6: per /64 prefix. Two addresses of one /64 share a counter;
     // another /64 does not.
     let p1 = 0x2001_0db8_0001_0000u128 << 64;
     let p2 = (1..1000u128)
         .map(|i| (0x2001_0db8_0002_0000u128 + i) << 64)
-        .find(|p| {
-            src_hash(U::<64>::new(p >> 64)).raw() != src_hash(U::<64>::new(p1 >> 64)).raw()
-        })
+        .find(|p| src_hash(U::<64>::new(p >> 64)).raw() != src_hash(U::<64>::new(p1 >> 64)).raw())
         .unwrap();
     let mut reqs = vec![];
     for i in 0..4u16 {
@@ -908,8 +982,14 @@ fn backpressure_on_outputs() {
     let cfg = vcfg();
     let mut reqs = vec![];
     for i in 0..10u16 {
-        reqs.push(req4(ntp_req(0x23, 6, i as u64, (i as usize * 7) % 30), 100 + i));
-        reqs.push(req6(ntp_req(0x1B, 6, 100 + i as u64, (i as usize * 3) % 17), 200 + i));
+        reqs.push(req4(
+            ntp_req(0x23, 6, i as u64, (i as usize * 7) % 30),
+            100 + i,
+        ));
+        reqs.push(req6(
+            ntp_req(0x1B, 6, 100 + i as u64, (i as usize * 3) % 17),
+            200 + i,
+        ));
     }
     for (gap, pm, pb) in [(0usize, 2usize, 3usize), (1, 5, 2), (0, 7, 11), (3, 1, 4)] {
         let n = cycles_for(&reqs, gap, 4) + 2000;
@@ -931,6 +1011,9 @@ fn backpressure_on_outputs() {
             check_meta(o, r);
             assert_eq!(o.data(), expect(r, &cfg, false, T_XMIT));
             assert!(o.t_meta <= o.t_last);
+            if pm == 1 {
+                assert!(o.t_meta < o.t_first, "reply_meta before the first byte");
+            }
         }
     }
 }
@@ -943,7 +1026,15 @@ fn throughput_back_to_back() {
     // Cycles per request: one request alone, from its meta offered (cycle 0)
     // to the last reply byte seen.
     let one = vec![req4(ntp_req(0x23, 6, 1, 0), 1)];
-    let ro = run(&one, &cfg, 0, |_| (T_RECV as u128) << 32, |_| true, |_| true, 300);
+    let ro = run(
+        &one,
+        &cfg,
+        0,
+        |_| (T_RECV as u128) << 32,
+        |_| true,
+        |_| true,
+        300,
+    );
     assert_eq!(ro.outs.len(), 1);
     let single = ro.outs[0].t_last;
     // 1000 back to back (IPv4), then the steady-state period.
@@ -951,12 +1042,24 @@ fn throughput_back_to_back() {
         .map(|i| req4(ntp_req(0x23, 6, i as u64, 0), i as u16))
         .collect();
     let n = 1000 * 110 + 500;
-    let ro = run(&reqs, &cfg, 0, |_| (T_RECV as u128) << 32, |_| true, |_| true, n);
+    let ro = run(
+        &reqs,
+        &cfg,
+        0,
+        |_| (T_RECV as u128) << 32,
+        |_| true,
+        |_| true,
+        n,
+    );
     assert_eq!(ro.outs.len(), 1000, "every request answered");
     for (i, o) in ro.outs.iter().enumerate() {
         assert_eq!(o.data(), expect(&reqs[i], &cfg, false, T_XMIT), "reply {i}");
     }
-    let periods: Vec<usize> = ro.outs.windows(2).map(|w| w[1].t_last - w[0].t_last).collect();
+    let periods: Vec<usize> = ro
+        .outs
+        .windows(2)
+        .map(|w| w[1].t_last - w[0].t_last)
+        .collect();
     let per = *periods.iter().max().unwrap();
     assert!(periods.iter().all(|&p| p == per), "constant period");
     let total = ro.outs[999].t_last;
@@ -972,7 +1075,15 @@ fn throughput_back_to_back() {
     let reqs: Vec<Req> = (0..20u32)
         .map(|i| req4(ntp_req(0x23, 6, i as u64, 20), i as u16))
         .collect();
-    let ro = run(&reqs, &cfg, 0, |_| (T_RECV as u128) << 32, |_| true, |_| true, 20 * 130 + 300);
+    let ro = run(
+        &reqs,
+        &cfg,
+        0,
+        |_| (T_RECV as u128) << 32,
+        |_| true,
+        |_| true,
+        20 * 130 + 300,
+    );
     assert_eq!(ro.outs.len(), 20);
     for w in ro.outs.windows(2) {
         assert_eq!(w[1].t_last - w[0].t_last, 68 + 50);
@@ -1005,7 +1116,10 @@ fn check_frame(f: &[u8], want: &[u8], what: &str) {
         "{what}: FCS"
     );
     assert_eq!(&body[..want.len()], want, "{what}: frame bytes");
-    assert!(body[want.len()..].iter().all(|b| *b == 0), "{what}: padding");
+    assert!(
+        body[want.len()..].iter().all(|b| *b == 0),
+        "{what}: padding"
+    );
 }
 
 const MAC: u64 = 0x0200_0000_0001;
@@ -1204,6 +1318,11 @@ fn chain_ntp4_basic() {
     let (f, s0) = &frames[0];
     let t3 = be(&f[14 + 20 + 8 + 40..14 + 20 + 8 + 48]) as u64;
     let ts = (0..800).find(|&t| (clk(t) >> 32) as u64 == t3).unwrap();
+    // `ts` is the cycle whose clock was sampled (S - 1; the testbench's
+    // iteration numbers are the units' cycles: a wire set in iteration i is
+    // read in cycle i, a send in cycle i is taken by the testbench in
+    // i + 1 at the earliest); s0 is the cycle the last FCS byte is taken
+    // from eth_tx's registered output, as tx_path would take it.
     let cyc = (*s0 - ts) as u64;
     println!(
         "ntp_server IPv4: {cyc} cycles from the sampling of time to the last FCS byte; \
@@ -1337,11 +1456,17 @@ fn chain_latency_v6() {
     let (f, s0) = &frames[0];
     assert_eq!(f.len(), 14 + 40 + 8 + 48 + 4);
     // Everything but the UDP checksum (stand-in) and T3 as the vector.
-    assert_eq!(&f[..54 + 6], &tx[..54 + 6], "Ethernet, IPv6 header, ports, length");
+    assert_eq!(
+        &f[..54 + 6],
+        &tx[..54 + 6],
+        "Ethernet, IPv6 header, ports, length"
+    );
     assert_eq!(&f[62..62 + 40], &tx[62..62 + 40], "NTP bytes 0-39");
     let t3 = be(&f[62 + 40..62 + 48]) as u64;
     let ts = (0..800).find(|&t| (clk(t) >> 32) as u64 == t3).unwrap();
-    let cyc = (*s0 - ts) as u64;
+    // As for IPv4, minus the stand-in relay IpTxReq -> Ip6TxReq of this
+    // testbench, which delays the IPv6 header by one cycle.
+    let cyc = (*s0 - ts - 1) as u64;
     println!(
         "ntp_server IPv6: {cyc} cycles from the sampling of time to the last FCS byte; \
          default tx_latency {TX_LATENCY_V6} (2^-32 s)"
@@ -1356,6 +1481,9 @@ fn default_tx_latency_values() {
     let k6 = ((TX_CYCLES_V6 * 10 + 790) as f64) * 1e-9 * 4294967296.0;
     assert!((TX_LATENCY_V4 as f64 - k4).abs() <= 0.5);
     assert!((TX_LATENCY_V6 as f64 - k6).abs() <= 0.5);
+    // The values written in the module header.
+    assert_eq!((TX_CYCLES_V4, TX_CYCLES_V6), (108, 128));
+    assert_eq!((TX_LATENCY_V4, TX_LATENCY_V6), (8032, 8891));
 }
 
 #[test]

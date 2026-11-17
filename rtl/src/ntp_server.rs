@@ -148,17 +148,22 @@
 //!    header cycle, `eth_tx`'s 14 header bytes and 4 FCS bytes, one byte per
 //!    cycle, plus the registered channels in between. Measured by the
 //!    chain test (`rtl/tests/ntp_server.rs`, `chain_ntp4_basic`):
-//!    [`TX_CYCLES_V4`] cycles for IPv4; the IPv6 frame has a 40-byte IP
-//!    header instead of 20, [`TX_CYCLES_V6`] cycles (measured through
-//!    `ipv6_tx` with `udp4_tx` standing in for the UDP layer, whose latency
-//!    structure T3.4 is expected to mirror);
+//!    [`TX_CYCLES_V4`] = 108 cycles for IPv4 (90-byte frame + 4 FCS);
+//!    the IPv6 frame has a 40-byte IP header instead of 20,
+//!    [`TX_CYCLES_V6`] = 128 cycles (`chain_latency_v6`, through `ipv6_tx`
+//!    with `udp4_tx` standing in for the UDP layer, whose latency structure
+//!    T3.4 is expected to mirror; the testbench's extra relay stage is
+//!    subtracted);
 //! 2. `tx_path`'s latency from s0 to the SFD strobe of `mii_tx` (the
 //!    `ClkTx` edge where the SFD's 0xD nibble goes out): 770 to 810 ns for
 //!    a frame that finds the transmitter idle (its header, « Latency
 //!    model »), taken at the middle, [`TX_PATH_LATENCY_PS`] = 790 ns.
 //!    This includes the 7 preamble bytes and the SFD (15 nibbles).
 //!
-//! Defaults: [`TX_LATENCY_V4`] and [`TX_LATENCY_V6`] (2^-32 s units). The
+//! Defaults: [`TX_LATENCY_V4`] = 108 × 10 ns + 790 ns = 1.870 µs = 8032
+//! units of 2^-32 s, and [`TX_LATENCY_V6`] = 128 × 10 ns + 790 ns = 2.070 µs
+//! = 8891 units (rounded to nearest; the uncertainty is ±20 ns from
+//! `tx_path`'s window, ±1 `clk_sys` cycle of channel phase). The
 //! reference instant (SFD 0xD nibble on the MII) is the same one the
 //! receive stamp of `rx_path` estimates, so the PHY latencies (DP83848J,
 //! fixed, to be measured on the board, T5.4) are excluded from both; that
@@ -252,7 +257,7 @@ pub const RL_ENTRIES: usize = 64;
 /// `clk_sys` cycles from the sampling of `time` (cycle S − 1) to the cycle
 /// `tx_path` accepts the last FCS byte, IPv4 reply on an idle path
 /// (measured by `chain_ntp4_basic`).
-pub const TX_CYCLES_V4: u64 = 112;
+pub const TX_CYCLES_V4: u64 = 108;
 /// Same for IPv6: 20 more header bytes (measured by `chain_latency_v6`).
 pub const TX_CYCLES_V6: u64 = TX_CYCLES_V4 + 20;
 /// `tx_path` latency from the last byte accepted to the SFD strobe,
@@ -437,7 +442,11 @@ impl
             let n_sport = mux(pick6, m6.sport, m4.sport);
             let n_esrc = mux(pick6, m6.eth_src, m4.eth_src);
             let n_rxts = mux(pick6, m6.rx_ts, m4.rx_ts);
-            let key = mux(pick6, n_src.slice::<64, 64>(), n_src.slice::<0, 32>().zext::<64>());
+            let key = mux(
+                pick6,
+                n_src.slice::<64, 64>(),
+                n_src.slice::<0, 32>().zext::<64>(),
+            );
             let n_hix = src_hash(key);
 
             // ---------------------------------------------------- RECV
@@ -479,11 +488,13 @@ impl
 
             // Reply image (cycle L).
             let s_in = stratum.get();
-            let sync =
-                synced.get() & Bit::from(s_in != U::<8>::from(0u8)) & Bit::from(s_in < U::<8>::from(16u8));
+            let sync = synced.get()
+                & Bit::from(s_in != U::<8>::from(0u8))
+                & Bit::from(s_in < U::<8>::from(16u8));
             let alarm = go_k | !sync;
             let li = mux(alarm, U::<2>::from(3u8), U::<2>::from(0u8));
-            let b0 = (li.zext::<8>() << 6u32) | (self.vn.get().zext::<8>() << 3u32) | U::<8>::from(4u8);
+            let b0 =
+                (li.zext::<8>() << 6u32) | (self.vn.get().zext::<8>() << 3u32) | U::<8>::from(4u8);
             let s_out = mux(go_k, U::<8>::from(0u8), mux(sync, s_in, U::<8>::from(16u8)));
             let rid = mux(
                 go_k,
