@@ -274,18 +274,6 @@ impl
             let ck_new = csum_fold(csum_add(ck_inv.zext::<32>(), U::<16>::from(0x0100u16)))
                 ^ U::<16>::from(0xFFFFu16);
 
-            // Echo request sent with byte 1.
-            if (take & echo_go).to_bool() {
-                req.send(Ip6TxReq {
-                    dst_mac: esrc,
-                    dst_ip: msrc,
-                    src_ip: mdst,
-                    next: U::<8>::from(NH_ICMPV6),
-                    len: mlen,
-                    hop: U::<8>::from(ECHO_HOP),
-                });
-            }
-
             // NS option parser.
             let in_tgt = Bit::from(pos >= 8) & Bit::from(pos < 24);
             let in_opt = Bit::from(pos >= 24);
@@ -322,14 +310,15 @@ impl
             let len_k = ((U::<16>::from(0x8800u16) + flag_hi).zext::<32>() << 16u32)
                 | U::<32>::from(0x0201u32);
             let req_go = is_req & req.ready();
-            if req_go.to_bool() {
+            // One request port: echo (with byte 1) or NA (state REQ).
+            if ((take & echo_go) | req_go).to_bool() {
                 req.send(Ip6TxReq {
                     dst_mac: esrc,
                     dst_ip: msrc,
-                    src_ip: tgt,
+                    src_ip: mux(is_req, tgt, mdst),
                     next: U::<8>::from(NH_ICMPV6),
-                    len: U::<16>::from(32u16),
-                    hop: U::<8>::from(NDP_HOP),
+                    len: mux(is_req, U::<16>::from(32u16), mlen),
+                    hop: mux(is_req, U::<8>::from(NDP_HOP), U::<8>::from(ECHO_HOP)),
                 });
             }
 
