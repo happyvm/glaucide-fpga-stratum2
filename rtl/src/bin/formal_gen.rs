@@ -2,8 +2,8 @@
 //! `formal_gen <unit>`: print the Verilog of a unit that carries
 //! `check!`/`assume!`/`cover!` statements (under `ifdef FORMAL`).
 use ntp_fpga::{
-    crc32::FrameCrc, eth_rx::EthRx, eth_tx::EthTx, fcs_check::FcsCheck, formal_smoke::Digit,
-    mii_rx::MiiRx, mii_tx::MiiTx, tx_arb::TxArb, tx_path::TxPathFormal,
+    clock::DisciplinedClock, crc32::FrameCrc, eth_rx::EthRx, eth_tx::EthTx, fcs_check::FcsCheck,
+    formal_smoke::Digit, mii_rx::MiiRx, mii_tx::MiiTx, tx_arb::TxArb, tx_path::TxPathFormal,
 };
 
 fn main() {
@@ -18,6 +18,7 @@ fn main() {
         Some("eth_tx") => print!("{}", EthTx::verilog("eth_tx")),
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
         Some("tx_arb") => print!("{}", TxArb::verilog("tx_arb")),
+        Some("disciplined_clock") => print!("{}", DisciplinedClock::verilog("disciplined_clock")),
         // 16-byte buffer instance: the proof does not need the real depth.
         Some("tx_path") => print!("{}", TxPathFormal::verilog("tx_path")),
         other => {
