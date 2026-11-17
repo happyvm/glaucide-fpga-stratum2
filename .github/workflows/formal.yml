@@ -1,0 +1,138 @@
+# Preuves formelles (F0.4) : une tâche par unité enregistrée dans
+# rtl/src/bin/formal_gen.rs. Lancé sur push vers main, à la demande et chaque nuit.
+#
+# prove : k-induction non bornée (z3). Bloquant : PASS seul est vert.
+#   FAIL, UNKNOWN, TIMEOUT ou erreur font échouer le job. UNKNOWN n'est pas une
+#   preuve (voir docs/formal.md).
+# cover : recherche bornée (40 pas) qui doit atteindre chaque cover!.
+#   Non bloquant : certains cover! sont plus profonds que 40 pas par construction.
+#   Un cover non atteint apparaît dans le résumé, sans bloquer la CI.
+name: Formal
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Nightly, 02:23 UTC.
+    - cron: "23 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    name: prove ${{ matrix.unit }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must match the arms of rtl/src/bin/formal_gen.rs.
+        unit: [formal_smoke, frame_crc, mii_rx, mii_tx, eth_rx, eth_tx, fcs_check, tx_arb, tx_path]
+    env:
+      UNIT: ${{ matrix.unit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch TxHDL
+        run: tools/setup.sh
+
+      - name: Install SymbiYosys tools
+        run: pip install yowasp-yosys z3-solver
+
+      # prove.sh exits non-zero on anything but PASS. pipefail keeps that exit
+      # code through tee, and timeout 1500 bounds the run.
+      - name: Prove
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "out/formal/$UNIT"
+          timeout 1500 tools/formal/prove.sh "$UNIT" prove 2>&1 | tee "out/formal/$UNIT/run.log"
+
+      - name: Step summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Proof \`$UNIT\` (prove, unbounded)"
+            echo
+            tools/formal/summary.sh "out/formal/$UNIT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs and counterexamples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formal-prove-${{ matrix.unit }}
+          path: |
+            out/formal/${{ matrix.unit }}/run.log
+            out/formal/${{ matrix.unit }}/${{ matrix.unit }}/logfile.txt
+            out/formal/${{ matrix.unit }}/${{ matrix.unit }}/**/*.vcd
+          if-no-files-found: ignore
+
+  cover:
+    name: cover ${{ matrix.unit }} (non blocking)
+    # Bounded search (40 steps). Some cover! points are deeper than that by
+    # design, so this job is informational and does not gate the workflow.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same units as prove, from rtl/src/bin/formal_gen.rs.
+        unit: [formal_smoke, frame_crc, mii_rx, mii_tx, eth_rx, eth_tx, fcs_check, tx_arb, tx_path]
+    env:
+      UNIT: ${{ matrix.unit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch TxHDL
+        run: tools/setup.sh
+
+      - name: Install SymbiYosys tools
+        run: pip install yowasp-yosys z3-solver
+
+      - name: Cover
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "out/formal/$UNIT"
+          timeout 900 tools/formal/prove.sh "$UNIT" cover 40 2>&1 | tee "out/formal/$UNIT/run.log"
+
+      - name: Step summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Cover \`$UNIT\` (bounded depth 40, non blocking)"
+            echo
+            tools/formal/summary.sh "out/formal/$UNIT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formal-cover-${{ matrix.unit }}
+          path: |
+            out/formal/${{ matrix.unit }}/run.log
+            out/formal/${{ matrix.unit }}/${{ matrix.unit }}/logfile.txt
+          if-no-files-found: ignore

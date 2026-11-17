@@ -18,6 +18,13 @@ tools/formal/prove.sh formal_smoke prove    # preuve formelle (pip install yowas
 
 Cargo sert à simuler et générer le Verilog rapidement. TxHDL amont utilise Bazel (9.2.0) ; la chaîne Bazel complète n'a pas pu être testée ici (dépendance `filmil/bazel-rules-bid` bloquée par le proxy du conteneur).
 
+## CI
+
+Deux workflows GitHub Actions dans `.github/workflows/` :
+
+- `ci.yml` (sur push et pull request) : `cargo build --workspace`, `cargo test -p ntp_fpga`, tests Python du modèle de référence (`python3 -m unittest discover tools/golden`), génération Verilog (artefact `verilog`). `rustfmt` et `clippy` sur `ntp_fpga` tournent dans des jobs séparés, non bloquants.
+- `formal.yml` (push sur `main`, déclenchement manuel, chaque nuit) : preuve non bornée (`prove`) de chaque unité enregistrée dans `rtl/src/bin/formal_gen.rs`. Tout résultat autre que PASS (FAIL, UNKNOWN, délai dépassé) fait échouer le job. Les `cover` bornés à 40 pas sont non bloquants. Le tableau PASS/FAIL/UNKNOWN par unité est dans le résumé du run (`tools/formal/summary.sh`).
+
 ## Arborescence
 
 | Dossier | Contenu |
