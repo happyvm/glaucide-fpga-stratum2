@@ -10,6 +10,7 @@ fn main() {
         Some("ntp_clock") => print!("{}", NtpClock::verilog("ntp_clock")),
         Some("frame_counter") => print!("{}", FrameCounter::verilog("frame_counter")),
         Some("frame_crc") => print!("{}", FrameCrc::verilog("frame_crc")),
+        Some("csum") => print!("{}", ntp_fpga::csum::Csum::verilog("csum")),
         Some("mii_rx") => print!("{}", MiiRx::verilog("mii_rx")),
         Some("mii_tx") => print!("{}", MiiTx::verilog("mii_tx")),
         Some("eth_rx") => print!("{}", EthRx::verilog("eth_rx")),
