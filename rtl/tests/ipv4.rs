@@ -27,10 +27,26 @@ fn ref_cksum(words: &[u16]) -> u16 {
 /// The 20-byte header ipv4_tx must send.
 fn ref_header(dst: u32, proto: u8, len: u16) -> Vec<u8> {
     let total = len.wrapping_add(20);
-    let mut h = vec![0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0x40, 0, 64, proto, 0, 0];
+    let mut h = vec![
+        0x45,
+        0,
+        (total >> 8) as u8,
+        total as u8,
+        0,
+        0,
+        0x40,
+        0,
+        64,
+        proto,
+        0,
+        0,
+    ];
     h.extend_from_slice(&LOCAL_IP.to_be_bytes());
     h.extend_from_slice(&dst.to_be_bytes());
-    let words: Vec<u16> = h.chunks(2).map(|c| ((c[0] as u16) << 8) | c[1] as u16).collect();
+    let words: Vec<u16> = h
+        .chunks(2)
+        .map(|c| ((c[0] as u16) << 8) | c[1] as u16)
+        .collect();
     let c = ref_cksum(&words);
     h[10] = (c >> 8) as u8;
     h[11] = c as u8;
@@ -108,12 +124,19 @@ fn run_tx(jobs: &[Job], gap: usize, take: impl Fn(usize) -> bool) -> Vec<TxFrame
                 hdrs.push((x.dst.raw() as u64, x.ethertype.raw() as u16));
             }
             if let Some(b) = o.recv() {
-                assert!(!hdrs.is_empty() && hdrs.len() > frames.len(), "payload byte before its hdr");
+                assert!(
+                    !hdrs.is_empty() && hdrs.len() > frames.len(),
+                    "payload byte before its hdr"
+                );
                 assert!(!b.err.to_bool() || b.last.to_bool(), "err without last");
                 open.push(b);
                 if b.last.to_bool() {
                     let (d, e) = hdrs[frames.len()];
-                    frames.push(TxFrame { dst_mac: d, ethertype: e, bytes: std::mem::take(&mut open) });
+                    frames.push(TxFrame {
+                        dst_mac: d,
+                        ethertype: e,
+                        bytes: std::mem::take(&mut open),
+                    });
                 }
             }
         }
@@ -145,13 +168,25 @@ fn tx_header_vectors_from_python_model() {
     let f = &run_tx(&[job(PEER_IP, 1, 40)], 0, |_| true)[0];
     assert_eq!(f.dst_mac, PEER_MAC);
     assert_eq!(f.ethertype, 0x0800);
-    assert_eq!(&f.data()[..20], &[0x45, 0, 0, 60, 0, 0, 0x40, 0, 0x40, 1, 0xb6, 0xbd, 0xc0, 0, 2, 1, 0xc0, 0, 2, 2]);
+    assert_eq!(
+        &f.data()[..20],
+        &[0x45, 0, 0, 60, 0, 0, 0x40, 0, 0x40, 1, 0xb6, 0xbd, 0xc0, 0, 2, 1, 0xc0, 0, 2, 2]
+    );
     assert!(!f.err());
 }
 
 #[test]
 fn tx_checksum_many_combinations() {
-    let dsts = [0, 1, 0xC000_0202, 0xFFFF_FFFF, 0x0A00_00FF, 0x7F00_0001, 0xFFFF_0000, 0x0000_FFFF];
+    let dsts = [
+        0,
+        1,
+        0xC000_0202,
+        0xFFFF_FFFF,
+        0x0A00_00FF,
+        0x7F00_0001,
+        0xFFFF_0000,
+        0x0000_FFFF,
+    ];
     let protos = [0u8, 1, 6, 17, 255];
     let lens = [1usize, 2, 8, 41, 255, 256, 1480];
     let mut jobs = vec![];
@@ -173,7 +208,14 @@ fn tx_checksum_many_combinations() {
     for (j, f) in jobs.iter().zip(&frames) {
         let d = f.data();
         assert_eq!(d.len(), 20 + j.len as usize);
-        assert_eq!(&d[..20], &ref_header(j.dst_ip, j.proto, j.len)[..], "{:x} {} {}", j.dst_ip, j.proto, j.len);
+        assert_eq!(
+            &d[..20],
+            &ref_header(j.dst_ip, j.proto, j.len)[..],
+            "{:x} {} {}",
+            j.dst_ip,
+            j.proto,
+            j.len
+        );
         assert_eq!(&d[20..], &j.payload[..]);
         assert!(!f.err());
         assert_eq!(f.dst_mac, j.dst_mac);
@@ -182,7 +224,9 @@ fn tx_checksum_many_combinations() {
 
 #[test]
 fn tx_backpressure_and_gaps() {
-    let jobs: Vec<Job> = (1..6).map(|i| job(PEER_IP + i, 17, 10 * i as usize)).collect();
+    let jobs: Vec<Job> = (1..6)
+        .map(|i| job(PEER_IP + i, 17, 10 * i as usize))
+        .collect();
     let frames = run_tx(&jobs, 3, |t| t % 5 != 0 && t % 7 != 1);
     assert_eq!(frames.len(), jobs.len());
     for (j, f) in jobs.iter().zip(&frames) {
@@ -209,7 +253,16 @@ fn tx_length_mismatch_and_upstream_abort() {
     zero.len = 0;
     // Good packet after each, to see the unit recover.
     let good = job(PEER_IP, 17, 16);
-    let jobs = vec![short, good.clone(), long, good.clone(), ab, good.clone(), zero, good.clone()];
+    let jobs = vec![
+        short,
+        good.clone(),
+        long,
+        good.clone(),
+        ab,
+        good.clone(),
+        zero,
+        good.clone(),
+    ];
     let frames = run_tx(&jobs, 0, |_| true);
     assert_eq!(frames.len(), 8);
     assert!(frames[0].err());
@@ -353,7 +406,10 @@ impl Pkt {
         h.extend_from_slice(&[self.ttl, self.proto, 0, 0]);
         h.extend_from_slice(&self.src.to_be_bytes());
         h.extend_from_slice(&self.dst.to_be_bytes());
-        let words: Vec<u16> = h.chunks(2).map(|c| ((c[0] as u16) << 8) | c[1] as u16).collect();
+        let words: Vec<u16> = h
+            .chunks(2)
+            .map(|c| ((c[0] as u16) << 8) | c[1] as u16)
+            .collect();
         let mut c = ref_cksum(&words);
         if self.bad_csum {
             c ^= 0x0100;
@@ -369,7 +425,12 @@ impl Pkt {
         while b.len() < 46 {
             b.push(0);
         }
-        RxFr { dst_mc: false, src_mac: PEER_MAC, bytes: b, err: false }
+        RxFr {
+            dst_mc: false,
+            src_mac: PEER_MAC,
+            bytes: b,
+            err: false,
+        }
     }
 }
 
@@ -415,7 +476,11 @@ fn rx_table() {
     p.flags = 0x4001;
     cases.push(("DF + offset", p.frame(), None));
     p.flags = 0x8000;
-    cases.push(("reserved bit only (model ignores it)", p.frame(), Some((0, p.data.clone()))));
+    cases.push((
+        "reserved bit only (model ignores it)",
+        p.frame(),
+        Some((0, p.data.clone())),
+    ));
     let mut p = Pkt::new(1, 12);
     p.ttl = 0;
     cases.push(("ttl 0", p.frame(), None));
@@ -426,7 +491,12 @@ fn rx_table() {
     cases.push(("wrong dst", p.frame(), None));
     p.dst = 0xFFFF_FFFF;
     cases.push(("dst broadcast", p.frame(), None));
-    for (n, s) in [("src 0.0.0.0", 0u32), ("src broadcast", 0xFFFF_FFFF), ("src multicast", 0xE000_0001), ("src multicast hi", 0xEFFF_FFFF)] {
+    for (n, s) in [
+        ("src 0.0.0.0", 0u32),
+        ("src broadcast", 0xFFFF_FFFF),
+        ("src multicast", 0xE000_0001),
+        ("src multicast hi", 0xEFFF_FFFF),
+    ] {
         let mut p = Pkt::new(1, 12);
         p.src = s;
         cases.push((n, p.frame(), None));
@@ -435,7 +505,11 @@ fn rx_table() {
     p.src = 0xF000_0001; // reserved class E, not rejected by the model
     cases.push(("src class E", p.frame(), Some((0, p.data.clone()))));
     p.src = 0xDFFF_FFFF;
-    cases.push(("src just below multicast", p.frame(), Some((0, p.data.clone()))));
+    cases.push((
+        "src just below multicast",
+        p.frame(),
+        Some((0, p.data.clone())),
+    ));
     let mut f = Pkt::new(1, 12).frame();
     f.dst_mc = true;
     cases.push(("group-addressed dst", f, None));
@@ -498,7 +572,10 @@ fn rx_meta_fields() {
     p.ttl = 33;
     p.src = 0xC633_6407;
     let o = run_rx(&[p.frame()], 0, |_, _| true);
-    assert_eq!(o.meta[0], vec![(0xC633_6407, LOCAL_IP, 1, 12, PEER_MAC, 33)]);
+    assert_eq!(
+        o.meta[0],
+        vec![(0xC633_6407, LOCAL_IP, 1, 12, PEER_MAC, 33)]
+    );
 }
 
 #[test]
@@ -511,11 +588,18 @@ fn rx_truncated_and_err() {
     assert_eq!(o.bytes[0].len(), 26);
     let l = o.bytes[0].last().unwrap();
     assert!(l.last.to_bool() && l.err.to_bool());
-    assert!(o.bytes[0][..25].iter().all(|b| !b.last.to_bool() && !b.err.to_bool()));
+    assert!(o.bytes[0][..25]
+        .iter()
+        .all(|b| !b.last.to_bool() && !b.err.to_bool()));
     // Frame ending inside the header: nothing.
     let b = Pkt::new(1, 8).build();
     for n in [1usize, 5, 19, 20] {
-        let f = RxFr { dst_mc: false, src_mac: PEER_MAC, bytes: b[..n].to_vec(), err: false };
+        let f = RxFr {
+            dst_mc: false,
+            src_mac: PEER_MAC,
+            bytes: b[..n].to_vec(),
+            err: false,
+        };
         let o = run_rx(&[f], 0, |_, _| true);
         assert!(o.meta[0].is_empty() && o.bytes[0].is_empty(), "len {n}");
     }
@@ -526,7 +610,9 @@ fn rx_truncated_and_err() {
     let o = run_rx(&[f], 0, |_, _| true);
     assert_eq!(o.bytes[1].len(), 8);
     assert!(o.bytes[1][7].last.to_bool() && o.bytes[1][7].err.to_bool());
-    assert!(o.bytes[1][..7].iter().all(|b| !b.last.to_bool() && !b.err.to_bool()));
+    assert!(o.bytes[1][..7]
+        .iter()
+        .all(|b| !b.last.to_bool() && !b.err.to_bool()));
     let mut f = Pkt::new(17, 26).frame(); // no padding
     f.err = true;
     let o = run_rx(&[f], 0, |_, _| true);
@@ -543,7 +629,9 @@ fn rx_truncated_and_err() {
 
 #[test]
 fn rx_backpressure_and_meta_before_payload() {
-    let frames: Vec<RxFr> = (0..6).map(|i| Pkt::new(if i % 2 == 0 { 1 } else { 17 }, 5 + 7 * i).frame()).collect();
+    let frames: Vec<RxFr> = (0..6)
+        .map(|i| Pkt::new(if i % 2 == 0 { 1 } else { 17 }, 5 + 7 * i).frame())
+        .collect();
     let o = run_rx(&frames, 0, |t, c| t % 3 == c || t % 11 == 0);
     assert_eq!(clean(&o, 0).len(), 3);
     assert_eq!(clean(&o, 1).len(), 3);

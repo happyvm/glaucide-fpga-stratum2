@@ -169,7 +169,8 @@ impl Unit<(Rx<IpTxReq>, Rx<FrameByte>, In<U<32>>), (Tx<EthHdr>, Tx<FrameByte>)> 
                 | (w_ttl.zext::<128>() << 48u32)
                 | (ck.zext::<128>() << 32u32)
                 | ip.zext::<128>();
-            let r_bad = Bit::from(r.len == U::<16>::from(0u16)) | Bit::from(r.len > U::<16>::from(0xFFEBu16));
+            let r_bad = Bit::from(r.len == U::<16>::from(0u16))
+                | Bit::from(r.len > U::<16>::from(0xFFEBu16));
 
             // Header bytes.
             let send_h = is_hdr & room;
