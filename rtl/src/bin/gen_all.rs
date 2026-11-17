@@ -18,6 +18,9 @@ fn main() {
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
         Some("tx_arb") => print!("{}", TxArb::verilog("tx_arb")),
         Some("tx_path") => print!("{}", TxPath::verilog("tx_path")),
+        Some("ipv4_rx") => print!("{}", ntp_fpga::ipv4_rx::Ipv4Rx::verilog("ipv4_rx")),
+        Some("ipv4_tx") => print!("{}", ntp_fpga::ipv4_tx::Ipv4Tx::verilog("ipv4_tx")),
+        Some("icmp_echo") => print!("{}", ntp_fpga::icmp_echo::IcmpEcho::verilog("icmp_echo")),
         other => {
             eprintln!("unknown module {other:?}");
             std::process::exit(1);

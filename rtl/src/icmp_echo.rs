@@ -123,7 +123,6 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<IpTxReq>, Tx<FrameByte>)> for IcmpEch
             let is_g = Bit::from(st == GATHER);
             let is_out = Bit::from(st == OUT);
             let is_pass = Bit::from(st == PASS);
-            let is_drop = Bit::from(st == DROP);
             let p0 = is_g & Bit::from(pos == 0);
             let p1 = is_g & Bit::from(pos == 1);
             let p2 = is_g & Bit::from(pos == 2);

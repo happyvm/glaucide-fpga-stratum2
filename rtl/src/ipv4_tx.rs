@@ -110,8 +110,10 @@ pub struct Ipv4Tx {
     pub len: Reg<U<16>>,
     /// The request is invalid (`len` 0 or too large): the header is aborted.
     pub bad: Reg<Bit>,
-    /// Header, shifted left by 8 after each byte sent; byte 0 in bits 159:152.
-    pub hreg: Reg<U<160>>,
+    /// Header bytes 0-15 and 16-19 (`ha` byte 0 in bits 127:120), shifted left
+    /// by 8 together after each byte sent (`hb`'s top byte moves into `ha`).
+    pub ha: Reg<U<128>>,
+    pub hb: Reg<U<32>>,
 }
 
 #[lower]
@@ -128,7 +130,8 @@ impl Unit<(Rx<IpTxReq>, Rx<FrameByte>, In<U<32>>), (Tx<EthHdr>, Tx<FrameByte>)> 
             let n = self.n.get();
             let len = self.len.get();
             let bad = self.bad.get();
-            let hreg = self.hreg.get();
+            let ha = self.ha.get();
+            let hb_r = self.hb.get();
             let is_idle = Bit::from(st == IDLE);
             let is_hdr = Bit::from(st == HDR);
             let is_pay = Bit::from(st == PAY);
@@ -160,19 +163,18 @@ impl Unit<(Rx<IpTxReq>, Rx<FrameByte>, In<U<32>>), (Tx<EthHdr>, Tx<FrameByte>)> 
             let s6 = csum_add(s5, r.dst_ip.slice::<16, 16>());
             let s7 = csum_add(s6, r.dst_ip.slice::<0, 16>());
             let ck = !csum_fold(s7);
-            let image = (w_ver.zext::<160>() << 144u32)
-                | (total.zext::<160>() << 128u32)
-                | (w_df.zext::<160>() << 96u32)
-                | (w_ttl.zext::<160>() << 80u32)
-                | (ck.zext::<160>() << 64u32)
-                | (ip.zext::<160>() << 32u32)
-                | r.dst_ip.zext::<160>();
+            let image_a = (w_ver.zext::<128>() << 112u32)
+                | (total.zext::<128>() << 96u32)
+                | (w_df.zext::<128>() << 64u32)
+                | (w_ttl.zext::<128>() << 48u32)
+                | (ck.zext::<128>() << 32u32)
+                | ip.zext::<128>();
             let r_bad = Bit::from(r.len == U::<16>::from(0u16)) | Bit::from(r.len > U::<16>::from(0xFFEBu16));
 
             // Header bytes.
             let send_h = is_hdr & room;
             let h_end = Bit::from(cnt == 19);
-            let hb = hreg.slice::<152, 8>();
+            let hb = ha.slice::<120, 8>();
 
             // Payload bytes.
             let pb = payload.head();
@@ -197,11 +199,13 @@ impl Unit<(Rx<IpTxReq>, Rx<FrameByte>, In<U<32>>), (Tx<EthHdr>, Tx<FrameByte>)> 
                     n: U::<16>::from(0u16),
                     len: r.len,
                     bad: r_bad,
-                    hreg: image,
+                    ha: image_a,
+                    hb: r.dst_ip,
                 },
                 send_h ? {
                     cnt: cnt + U::<5>::from(1u8),
-                    hreg: hreg << 8u32,
+                    ha: (ha << 8u32) | hb_r.slice::<24, 8>().zext::<128>(),
+                    hb: hb_r << 8u32,
                 },
                 send_h & h_end ? st: mux(bad, U::<2>::from(DRAIN), U::<2>::from(PAY)),
                 go ? n: n + U::<16>::from(1u16),
