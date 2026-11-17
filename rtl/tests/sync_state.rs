@@ -264,7 +264,26 @@ fn timeout_without_update() {
     b.push(x);
     let s = b.settle();
     assert!(s.synced);
-    assert_eq!(s.ref_ts, NOW + SYNC_TIMEOUT_Q32 + 1);
+    // F10: the published reference timestamp is rounded down to the second.
+    assert_eq!(s.ref_ts, NOW + SYNC_TIMEOUT_Q32);
+}
+
+#[test]
+fn ref_ts_is_rounded_down_to_a_whole_second() {
+    // F10: the fraction of the update time is never published, whatever it is.
+    for frac in [0u64, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678] {
+        let mut b = bench();
+        let t = NOW + 77 * (1u64 << 32) + frac;
+        b.set_time(t);
+        b.run(4);
+        let mut x = sel();
+        x.t4 = U::<64>::from(t);
+        b.push(x);
+        let s = b.settle();
+        assert!(s.synced, "frac {frac:#x}");
+        assert_eq!(s.ref_ts & 0xFFFF_FFFF, 0, "fraction leaked, frac {frac:#x}");
+        assert_eq!(s.ref_ts, t & !0xFFFF_FFFF, "frac {frac:#x}");
+    }
 }
 
 #[test]
