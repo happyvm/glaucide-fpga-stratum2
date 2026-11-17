@@ -150,6 +150,9 @@ pub struct Arp {
     /// Requester of the queued reply, captured at the decision.
     pub m_rs: Reg<U<48>>,
     pub m_rp: Reg<U<32>>,
+    /// Requester of the reply being sent, snapshot at its `hdr`.
+    pub m_fs: Reg<U<48>>,
+    pub m_fp: Reg<U<32>>,
     /// Last learned pair (since the last flush).
     pub m_have: Reg<Bit>,
     pub m_lip: Reg<U<32>>,
@@ -349,7 +352,7 @@ impl
             check!(!(take_p & last) | !(dec & !full), "a short payload is not a packet");
             // Fields: every byte equals the snapshot field at its index.
             check!(!t_pay | (Bit::from(tx_req) & Bit::from(m_op == 1) | !tx_req & Bit::from(m_op == 2)), "op is 1 in a request, 2 in a reply");
-            check!(!(t_pay & !tx_req) | (Bit::from(m_tha == self.m_rs.get()) & Bit::from(m_tpa == self.m_rp.get())), "reply in progress: tha and tpa are the requester's sha and spa (swap)");
+            check!(!(t_pay & !tx_req) | (Bit::from(m_tha == self.m_fs.get()) & Bit::from(m_tpa == self.m_fp.get())), "reply in progress: tha and tpa are the requester's sha and spa (swap)");
             check!(!(t_pay & tx_req) | (Bit::from(m_tha == 0u8) & Bit::from(m_tpa == req_ip)), "request in progress: tha is 0, tpa is the resolved address");
             check!(!take_h | Bit::from(l_op == mux(send_rep, U::<8>::from(2u8), U::<8>::from(1u8))), "hdr loads op 2 for a reply, 1 for a request");
             check!(!(send_rep) | (Bit::from(self.rep_dst.get() == self.m_rs.get()) & Bit::from(self.rep_ip.get() == self.m_rp.get())), "the queued reply is addressed to the requester");
@@ -405,6 +408,8 @@ impl
                     m_ip: ip,
                     m_tha: l_tha,
                     m_tpa: l_tpa,
+                    m_fs: self.m_rs.get(),
+                    m_fp: self.m_rp.get(),
                 },
                 send_rep ? rep_pend: Bit::Zero,
                 send_rq ? req_pend: Bit::Zero,
