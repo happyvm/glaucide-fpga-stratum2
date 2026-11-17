@@ -5,7 +5,7 @@ Serveur NTP **stratum 2**, **IPv4 + IPv6**, entièrement en logique FPGA, sur **
 - Langage : [TxHDL](https://github.com/filmil/hdl-txhdl) (HDL transactionnel embarqué en Rust, sortie Verilog), épinglé au commit de `tools/setup.sh`.
 - Le FPGA est client NTP de serveurs stratum 1 (amont) et sert ses clients avec des timestamps matériels au niveau MAC.
 
-Voir [docs/architecture.md](docs/architecture.md) , la [roadmap par tâches/agents](docs/roadmap.md) et les [preuves formelles](docs/formal.md).
+Voir [docs/architecture.md](docs/architecture.md), la [roadmap par tâches/agents](docs/roadmap.md) et les [preuves formelles](docs/formal.md).
 
 ## Démarrage
 
