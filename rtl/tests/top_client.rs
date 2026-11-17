@@ -103,6 +103,29 @@ impl ConfigSet for CliCfg4 {
     const RATE_LIMIT_PER_S: u16 = CliCfg::RATE_LIMIT_PER_S;
 }
 
+/// [`CliCfg`] with the IPv6 upstream only (slot 1).
+#[derive(Default)]
+struct CliCfg6;
+impl ConfigSet for CliCfg6 {
+    const LOCAL_MAC: u64 = CliCfg::LOCAL_MAC;
+    const LOCAL_IP4: u32 = CliCfg::LOCAL_IP4;
+    const GATEWAY_IP4: u32 = CliCfg::GATEWAY_IP4;
+    const NETMASK4: u32 = CliCfg::NETMASK4;
+    const GATEWAY_IP6: u128 = CliCfg::GATEWAY_IP6;
+    const LOCAL_GUA: u128 = CliCfg::LOCAL_GUA;
+    const GUA_ENABLED: bool = CliCfg::GUA_ENABLED;
+    const UPSTREAM: [(bool, u128, bool); 4] = [
+        (false, 0, false),
+        (true, UP6, true),
+        (false, 0, false),
+        (false, 0, false),
+    ];
+    const POLL_LOG2: u8 = CliCfg::POLL_LOG2;
+    const PRECISION_LOG2: i8 = CliCfg::PRECISION_LOG2;
+    const STRATUM_OFFSET: u8 = CliCfg::STRATUM_OFFSET;
+    const RATE_LIMIT_PER_S: u16 = CliCfg::RATE_LIMIT_PER_S;
+}
+
 const MAC: u64 = Test::LOCAL_MAC;
 const IP4: u32 = Test::LOCAL_IP4;
 const LL: u128 = eui64_link_local(Test::LOCAL_MAC);
@@ -504,6 +527,8 @@ struct Probes {
     t40: Reg<U<64>>,
     servo_stp: Reg<U<96>>,
     servo_st: Reg<U<3>>,
+    ua_st: Reg<U<1>>,
+    ua_gr: Reg<Bit>,
 }
 
 /// A clock source the tests can start and probe.
@@ -545,6 +570,8 @@ fn probes<R: Clock, T: Clock, C: ConfigSet, K: TestClock>(c: &CoreW<R, T, C, K>)
         t40: c.sync.selection.t40.clone(),
         servo_stp: c.sync.servo.stp.clone(),
         servo_st: c.sync.servo.st.clone(),
+        ua_st: c.uarb4.st.clone(),
+        ua_gr: c.uarb4.gr.clone(),
     }
 }
 
@@ -578,6 +605,8 @@ struct Pins<F: Future<Output = ()>> {
     times: TimeLog,
     /// Frames seen on `txd`, in order.
     log: Vec<TxFrame>,
+    /// `uarb4` (IDLE/PAY, granted source) at each change: (cycle, state).
+    ua: Vec<(u64, (u128, bool))>,
 }
 
 fn pins<C: ConfigSet + 'static, K: TestClock + 'static>() -> Pins<impl Future<Output = ()>> {
@@ -614,6 +643,7 @@ fn pins<C: ConfigSet + 'static, K: TestClock + 'static>() -> Pins<impl Future<Ou
         a: K::A,
         times: TimeLog::default(),
         log: vec![],
+        ua: vec![],
     }
 }
 
@@ -641,6 +671,10 @@ impl<F: Future<Output = ()>> Pins<F> {
         self.times.0.push((2 * self.n, acc, w));
         self.sim.cycle();
         self.n += 1;
+        let ua = (self.p.ua_st.get().raw(), self.p.ua_gr.get().to_bool());
+        if self.ua.last().map(|x| x.1) != Some(ua) {
+            self.ua.push((self.n, ua));
+        }
         if self.en.get().to_bool() {
             if self.nib.len() == 15 {
                 self.sfd_at = now() - self.t0 - 2;
@@ -890,33 +924,42 @@ fn want_unsync_reply(got: &TxFrame) -> Vec<u8> {
     w
 }
 
-/// (c): a server request is placed so that its reply is ready when the
-/// client sends its IPv4 request (both go through `uarb4` and `udp4_tx`):
-/// both frames come out byte-exact and back to back on the wire.
+/// Cycles at which `uarb4` granted a packet of source `src` (0 server,
+/// 1 client), and the cycles at which it was idle again.
+fn grants(ua: &[(u64, (u128, bool))], src: bool) -> Vec<(u64, u64)> {
+    let mut v = vec![];
+    for (i, &(n, (st, gr))) in ua.iter().enumerate() {
+        if st == 1 && gr == src {
+            let end = ua[i + 1..].iter().find(|x| x.1 .0 == 0).map(|x| x.0).unwrap_or(u64::MAX);
+            v.push((n, end));
+        }
+    }
+    v
+}
+
+/// (c): a server request is placed so that its reply reaches `uarb4` while
+/// the arbiter forwards the client's IPv4 request (aimed from a first,
+/// identical run): the arbiter grants the server's reply the cycle after the
+/// client's packet (whole packets, no interleaving), and both frames come
+/// out byte-exact.
 #[test]
 fn server_answers_while_client_polls() {
     let (q4, _) = exchanges("ntp4_basic.hex").remove(0);
-    // First run (deterministic): the cycle of the client's IPv4 request,
-    // then the server's latency on an idle path (request SFD to reply SFD).
+    // First run (deterministic): when uarb4 grants the client's request,
+    // then how long after its SFD a lone server request reaches uarb4.
     let mut b = pins::<CliCfg, WarpClock<A_PINS>>();
     let (r4, _, _) = startup(&mut b);
-    let req_sfd = r4.sfd_tick / 2;
+    let (cg, cend) = grants(&b.ua, true)[0];
     b.run(500);
     let s = b.send(&q4, 0) / 2;
-    let rep = loop {
-        let f = b.next(5000).expect("server reply");
-        if let Kind::Reply(..) = kind(&f.bytes) {
-            break f;
-        }
-        answer_resolution(&mut b, &f);
-    };
-    let lat = rep.sfd_tick / 2 - s;
-    println!("client request at cycle {req_sfd}, server latency {lat} cycles (SFD to SFD)");
+    b.run(1500);
+    let (sg, _) = *grants(&b.ua, false).last().expect("server reply through uarb4");
+    let ls = sg - s;
+    println!("client granted at cycle {cg} (until {cend}); a server request reaches uarb4 {ls} cycles after its SFD");
     drop(b);
-    // Second run: the same start-up, plus the server request aimed so that
-    // its reply would leave at the client request's cycle.
+    // Second run: the server request's SFD at cg + 10 - ls.
     let mut b = pins::<CliCfg, WarpClock<A_PINS>>();
-    let target = req_sfd - lat;
+    let target = cg + 10 - ls;
     let mut ns_seen = false;
     let (mut got_req, mut got_rep, mut sent_srv) = (None, None, false);
     while got_req.is_none() || got_rep.is_none() {
@@ -947,17 +990,18 @@ fn server_answers_while_client_polls() {
             k => panic!("unexpected {k:?}"),
         }
     }
-    let (q, r) = (got_req.unwrap(), got_rep.unwrap());
-    let (first, second) = if q.sfd_tick < r.sfd_tick { (&q, &r) } else { (&r, &q) };
-    let end = first.sfd_tick + 2 * 2 * first.bytes.len() as u64;
-    let gap = (second.sfd_tick - end) / 2;
-    println!(
-        "client request at cycle {}, server reply at cycle {}: the second starts {gap} cycles after the end of the first",
-        q.sfd_tick / 2,
-        r.sfd_tick / 2
+    let c = grants(&b.ua, true);
+    let sv = grants(&b.ua, false);
+    println!("uarb4 grants: client {c:?}, server {sv:?}");
+    assert_eq!(c[0], (cg, cend), "the client's packet as in the first run");
+    assert_eq!(sv.len(), 1);
+    assert!(
+        sv[0].0 == cend || sv[0].0 == cend + 1,
+        "the server's reply waited for the client's packet and was granted right after it"
     );
-    // Minimum gap on txd: 24 idle nibbles, then 15 preamble nibbles.
-    assert!(gap <= 24 + 15 + 2, "the two frames were queued together");
+    let (q, r) = (got_req.unwrap(), got_rep.unwrap());
+    println!("client request at cycle {}, server reply at cycle {}", q.sfd_tick / 2, r.sfd_tick / 2);
+    assert!(r.sfd_tick > q.sfd_tick, "the reply leaves after the request");
 }
 
 /// (d): the IPv4 upstream (the only one, [`CliCfg4`]) answers the four
@@ -1248,24 +1292,20 @@ clock!(Tx40g, 8, 2);
 clock!(Tx40h, 8, 4);
 
 /// Client T1 against the SFD instant at 25 MHz MII (warped clock, T1
-/// converted back to real time, see the module header). The NS is answered
-/// once the IPv4 request is out, so each request finds the transmit path
-/// idle (checked). Errors in ns, (IPv4, IPv6).
-fn t1_through_core<R: Clock, T: Clock>() -> (f64, f64) {
-    let (mut e4, mut e6) = (None, None);
+/// converted back to real time, see the module header), with one upstream
+/// only ([`CliCfg4`] or [`CliCfg6`]): its request finds the transmit path
+/// idle (checked). Error in ns.
+fn t1_through_core<C: ConfigSet, R: Clock, T: Clock>() -> f64 {
+    let mut e = None;
     let mut prev_end = 0u64;
-    clocks::<R, T, CliCfg, WarpClock<A_CLK>>(&[], 400_000, |f, sfd, times| {
+    clocks::<R, T, C, WarpClock<A_CLK>>(&[], 400_000, |f, sfd, times| {
         let f = &f[..f.len() - 4];
         let mut more = vec![];
         let idle = sfd > prev_end + (24 + 16 + 8) * T::PERIOD;
         prev_end = sfd + 2 * (f.len() as u64 + 4) * T::PERIOD;
         match kind(f) {
             Kind::ArpReq(ip) if ip == UP4 => more.push((arp_reply(UP4, UP4_MAC), 12)),
-            Kind::Ns(t) if t == UP6 => {
-                if e4.is_some() {
-                    more.push((na(UP6, UP6_MAC), 12))
-                }
-            }
+            Kind::Ns(t) if t == UP6 => more.push((na(UP6, UP6_MAC), 12)),
             Kind::Req(v6, t1) => {
                 let (k, want) = if v6 {
                     (CLIENT_TX_LATENCY_V6, want_req6(t1))
@@ -1274,21 +1314,16 @@ fn t1_through_core<R: Clock, T: Clock>() -> (f64, f64) {
                 };
                 assert_eq!(f, &want[..], "request bytes");
                 assert!(idle, "the request found the transmit path idle");
-                let e = diff_ns(times.unwarp(t1, k), ntp_at(sfd));
+                let x = diff_ns(times.unwarp(t1, k), ntp_at(sfd));
                 let fam = if v6 { "IPv6" } else { "IPv4" };
-                println!("{}/{} {fam}: T1 - tx SFD = {e:+.1} ns", R::NAME, T::NAME);
-                if v6 {
-                    e6 = Some(e)
-                } else {
-                    e4 = Some(e);
-                    more.push((na(UP6, UP6_MAC), 12));
-                }
+                println!("{}/{} {fam}: T1 - tx SFD = {x:+.1} ns", R::NAME, T::NAME);
+                e = Some(x);
             }
             k => panic!("unexpected {k:?}"),
         }
-        (more, e4.is_some() && e6.is_some())
+        (more, e.is_some())
     });
-    (e4.expect("IPv4 request"), e6.expect("IPv6 request"))
+    e.expect("a request")
 }
 
 /// The server's T3 against the SFD instant, by phase of the transmit MII
@@ -1303,19 +1338,20 @@ const T3_WINDOW: (f64, f64) = (-25.5, 10.5);
 #[test]
 fn client_t1_error_at_mii_granularity() {
     let mut all = vec![];
-    for (a, b) in [
-        t1_through_core::<Rx40a, Tx40a>(),
-        t1_through_core::<Rx40b, Tx40b>(),
-        t1_through_core::<Rx40c, Tx40c>(),
-        t1_through_core::<Rx40d, Tx40d>(),
-        t1_through_core::<Rx40e, Tx40e>(),
-        t1_through_core::<Rx40a, Tx40f>(),
-        t1_through_core::<Rx40b, Tx40g>(),
-        t1_through_core::<Rx40c, Tx40h>(),
-    ] {
-        all.push(a);
-        all.push(b);
+    macro_rules! both {
+        ($r:ty, $t:ty) => {
+            all.push(t1_through_core::<CliCfg4, $r, $t>());
+            all.push(t1_through_core::<CliCfg6, $r, $t>());
+        };
     }
+    both!(Rx40a, Tx40a);
+    both!(Rx40b, Tx40b);
+    both!(Rx40c, Tx40c);
+    both!(Rx40d, Tx40d);
+    both!(Rx40e, Tx40e);
+    both!(Rx40a, Tx40f);
+    both!(Rx40b, Tx40g);
+    both!(Rx40c, Tx40h);
     let lo = all.iter().cloned().fold(f64::MAX, f64::min);
     let hi = all.iter().cloned().fold(f64::MIN, f64::max);
     println!("25 MHz MII: client T1 error {lo:+.1}..{hi:+.1} ns");
