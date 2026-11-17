@@ -35,6 +35,7 @@ fn main() {
         Some("sync_state") => print!("{}", ntp_fpga::sync_state::SyncState::verilog("sync_state")),
         Some("selection") => print!("{}", ntp_fpga::selection::Selection::verilog("selection")),
         Some("servo") => print!("{}", ntp_fpga::servo::Servo::verilog("servo")),
+        Some("ntp_demux") => print!("{}", ntp_fpga::ntp_demux::NtpDemux::verilog("ntp_demux")),
         Some("ntp_clock") => print!("{}", NtpClock::verilog("ntp_clock")),
         Some("disciplined_clock") => print!("{}", DisciplinedClock::verilog("disciplined_clock")),
         Some("frame_counter") => print!("{}", FrameCounter::verilog("frame_counter")),

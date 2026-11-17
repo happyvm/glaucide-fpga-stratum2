@@ -28,6 +28,7 @@ fn main() {
         Some("sync_state") => print!("{}", ntp_fpga::sync_state::SyncState::verilog("sync_state")),
         Some("selection") => print!("{}", ntp_fpga::selection::Selection::verilog("selection")),
         Some("servo") => print!("{}", ntp_fpga::servo::Servo::verilog("servo")),
+        Some("ntp_demux") => print!("{}", ntp_fpga::ntp_demux::NtpDemux::verilog("ntp_demux")),
         Some("formal_smoke") => print!("{}", Digit::verilog("formal_smoke")),
         Some("crc_equiv") => print!("{}", ntp_fpga::crc_equiv::CrcEquiv::verilog("crc_equiv")),
         Some("frame_crc") => print!("{}", FrameCrc::verilog("frame_crc")),
