@@ -31,6 +31,20 @@ class RequestTest(unittest.TestCase):
         self.assertEqual((r[0] >> 3) & 7, 4)
         self.assertEqual(r[0] & 7, 3)
 
+    def test_nonce(self):
+        """F3: the Transmit Timestamp keeps T1's seconds, its fraction is T1's
+        XOR the entropy word's low 32 bits; rnd = 0 sends T1 itself."""
+        t1 = 0xEC000123_89ABCDEF
+        self.assertEqual(client.nonce(t1, 0), t1)
+        self.assertEqual(client.nonce(t1, 0xFFFFFFFF_00000000), t1)
+        self.assertEqual(client.nonce(t1, 0x0F0F0F0F), 0xEC000123_86A4C2E0)
+        r = client.build_request(6, 0xE8, t1, 0x5555_5555_FFFF_FFFF)
+        self.assertEqual(r[40:44], bytes.fromhex("ec000123"))
+        self.assertEqual(r[44:], (0x89ABCDEF ^ 0xFFFFFFFF).to_bytes(4, "big"))
+        # every fraction is reachable: the nonce's fraction is uniform when rnd is
+        fr = {client.nonce(t1, x) & client.M32 for x in range(0, 1 << 32, 1 << 24)}
+        self.assertEqual(len(fr), 256)
+
 
 class ArithTest(unittest.TestCase):
     def test_symmetric_path(self):
@@ -120,6 +134,37 @@ class AcceptTest(unittest.TestCase):
         idle = Request(A4, False, T1, outstanding=False)
         self.assertEqual(make_sample(0, idle, good(), t4), Reject(client.R_IDLE))
 
+    def test_origin_is_the_nonce(self):
+        """F3: with a random entropy word the reply must carry the nonce; the
+        clock reading T1 is no longer an acceptable Origin; the arithmetic uses
+        the real T1 (the sample is the one of rnd = 0)."""
+        t4 = T1 + SEC // 50
+        req = Request(A4, False, T1, rnd=0xDEADBEEF_12345678)
+        self.assertNotEqual(req.org, T1)
+        self.assertEqual(req.org >> 32, T1 >> 32)
+        self.assertEqual(make_sample(0, req, good(org=T1), t4), Reject(client.R_ORIGIN))
+        s = make_sample(0, req, good(org=req.org), t4)
+        self.assertEqual(s, make_sample(0, self.req4, good(org=T1), t4))
+        for bit in range(64):
+            self.assertEqual(make_sample(0, req, good(org=req.org ^ (1 << bit)), t4),
+                             Reject(client.R_ORIGIN), bit)
+
+    def test_kod_kinds(self):
+        """F9: an authentic KoD is a miss; RATE and DENY / RSTR are told apart."""
+        t4 = T1 + SEC // 50
+        for rid, reason in [(client.KOD_RATE, client.R_KOD_RATE),
+                            (client.KOD_DENY, client.R_KOD_DENY),
+                            (client.KOD_RSTR, client.R_KOD_DENY),
+                            (int.from_bytes(b"INIT", "big"), client.R_KOD),
+                            (0x47505300, client.R_KOD)]:
+            r = make_sample(0, self.req4, good(stratum=0, ref_id=rid, li=3), t4)
+            self.assertEqual(r, Reject(reason, True), hex(rid))
+            # with a wrong Origin it is nothing at all
+            r = make_sample(0, self.req4, good(stratum=0, ref_id=rid, org=T1 ^ 4), t4)
+            self.assertEqual(r, Reject(client.R_ORIGIN, False))
+        # "RATE" with a nonzero stratum is an ordinary reply
+        self.assertIsInstance(make_sample(0, self.req4, good(ref_id=client.KOD_RATE), t4), Sample)
+
     def test_spoofed_kod_is_not_a_miss(self):
         r = make_sample(0, self.req4, good(stratum=0, org=T1 ^ 1), T1)
         self.assertEqual(r, Reject(client.R_ORIGIN, False))
@@ -153,6 +198,32 @@ class AddressTest(unittest.TestCase):
         self.assertTrue(all(b - a >= Fraction(1, 4) for a, b in zip(starts, starts[1:])))
         self.assertEqual(client.poll_interval(2), 16)
         self.assertEqual(client.poll_interval(30), 1 << 17)
+
+    def test_kod_backoff(self):
+        """F9: each RATE doubles the interval in use, up to 2^10 s, never below
+        the configured poll."""
+        kx, seen = 0, []
+        for _ in range(7):
+            kx = client.kod_backoff(6, kx)
+            seen.append(client.slot_poll_log2(6, kx))
+        self.assertEqual(seen, [7, 8, 9, 10, 10, 10, 10])
+        self.assertEqual(client.kod_backoff(2, 0), 5)        # clamp 4, then 5
+        self.assertEqual(client.kod_backoff(10, 0), 0)       # already 2^10 s
+        self.assertEqual(client.kod_backoff(12, 0), 0)
+        self.assertEqual(client.slot_poll_log2(12, 0), 12)
+
+    def test_schedule_kod(self):
+        R, D = client.R_KOD_RATE, client.R_KOD_DENY
+        # RATE on the second iburst poll: iburst ends, then 2^7 s, then 2^8 s
+        sch = client.schedule_kod(6, [None, R, None, None, R], 6)
+        self.assertEqual([t for t, _ in sch], [0, 2, 2 + 128, 2 + 256, 2 + 384, 2 + 384 + 256])
+        self.assertTrue(all(sent for _, sent in sch))
+        # DENY on the first: no request ever after (the starts are misses)
+        sch = client.schedule_kod(6, [D], 4)
+        self.assertEqual(sch, [(0, True), (64, False), (128, False), (192, False)])
+        # other kiss codes change nothing
+        self.assertEqual([t for t, _ in client.schedule_kod(6, [client.R_KOD] * 6, 6)],
+                         client.schedule(6, 6))
 
 
 class VectorTest(unittest.TestCase):

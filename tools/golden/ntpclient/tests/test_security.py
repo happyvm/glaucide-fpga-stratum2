@@ -29,9 +29,9 @@ YEAR = 365 * 86400
 class Chain:
     """Filter, selection and servo, as wired in the stratum-2 top."""
 
-    def __init__(self):
+    def __init__(self, n_en=1):
         self.flt = F.ClockFilter()
-        self.sel = SEL.Selection()
+        self.sel = SEL.Selection(n_en)
         self.servo = SV.Servo()
         self.log = []
 
@@ -46,13 +46,14 @@ class Chain:
 
 class StartupStep(unittest.TestCase):
     def test_single_source_decides_the_startup_step(self):
-        """F4: after reset the first source to reach 4 samples (slot 0's
-        iburst, 6 s after start) is the only eligible peer, the selection
-        accepts a single peer, and the servo in NSET steps by any amount
-        (no PANICT check). Whoever controls slot 0's four iburst replies
-        (on-path, or off-path with the guessable Origin of F3) sets our
-        clock one year ahead; the honest slot 1 comes 0.25 s too late."""
-        c = Chain()
+        """F4, residual risk: with ONE enabled upstream slot (n_en = 1) the
+        single source is accepted (no majority is possible), and the servo
+        in NSET steps by any amount (no PANICT check). Whoever controls that
+        source's four iburst replies (on-path; off-path only by guessing the
+        32-bit Origin nonce of F3) sets our clock one year ahead. The fix of
+        F4 needs at least two enabled slots (docs/security.md: configure
+        three or more upstreams)."""
+        c = Chain(n_en=1)
         for k in range(4):
             s, out = c.sample(0, YEAR, T0 + k * 2 * S)
             if k < 3:
@@ -71,16 +72,34 @@ class StartupStep(unittest.TestCase):
         self.assertEqual(c.servo.steps, 1)
 
 
-    @unittest.skip("FINDING F4: a single source decides the start-up step (docs/security.md)")
     def test_startup_step_needs_a_majority(self):
-        """Desired behaviour behind F4: with two or more upstreams
-        configured, no step until a majority of them agree (RFC 5905
-        NSANE/MINCLOCK); a single source a year off must not move us."""
-        c = Chain()
+        """F4 fixed: with two or more upstreams configured, no step until a
+        majority of them agree (n_en // 2 + 1 truechimers before the first
+        selection); a single source a year off must not move us, and with
+        the honest source a year away there is no step at all. Once both
+        agree, the step happens (on their combined offset)."""
+        for n_en in (2, 3, 4):
+            c = Chain(n_en)
+            for k in range(4):
+                s, out = c.sample(0, YEAR, T0 + k * 2 * S)
+                self.assertEqual(s.valid, 0, n_en)
+                self.assertNotEqual(out["kind"], "step")
+            for k in range(4):
+                s, out = c.sample(1, 0.0, T0 + k * 2 * S + S // 4)
+                self.assertEqual(s.valid, 0, "a year apart: no majority")
+            self.assertEqual(c.servo.steps, 0, n_en)
+        # Two honest sources 5 s ahead (n_en = 2): the step comes with the
+        # fourth sample of the second one, not before.
+        c = Chain(2)
         for k in range(4):
-            s, out = c.sample(0, YEAR, T0 + k * 2 * S)
-            self.assertNotEqual(out["kind"], "step")
-        self.assertEqual(c.servo.steps, 0)
+            s, out = c.sample(0, 5.0, T0 + k * 2 * S)
+            self.assertEqual(s.valid, 0)
+        for k in range(4):
+            s, out = c.sample(1, 5.0, T0 + k * 2 * S + S // 4)
+        self.assertEqual(s.valid, 1)
+        self.assertEqual(out["kind"], "step")
+        self.assertEqual(c.servo.steps, 1)
+        self.assertLess(abs(SEL.s64(s.offset) - 5 * S), S // 1000)
 
 
 class RuntimeLimits(unittest.TestCase):
