@@ -210,7 +210,12 @@ def main():
         offset_mode = " -o " in cmd
         limited = "--rate-limit 8" in cmd
         kod = "--kod" in cmd
-        lines += [f"## {j}", "", f"`{cmd.split(' -- ')[-1].split('/')[-1] if cmd else ''}`  ", f"bridge: `{' '.join(cmd.split(' -- ')[0].split()[5:]) if cmd else ''}`; wall time {wall} s", ""]
+        nt = cmd.split(" -- ")[1].split()[1:] if " -- " in cmd else []
+        bo = cmd.split(" -- ")[0].split()[1:] if " -- " in cmd else []
+        bo = [x for k, x in enumerate(bo) if x not in ("--shim", "--shm", "--log")
+              and (k == 0 or bo[k - 1] not in ("--shim", "--shm", "--log"))]
+        lines += [f"## {j}", "", f"`ntpperf {' '.join(nt)}`  ",
+                  f"bridge: `{' '.join(bo)}`; wall time {wall} s", ""]
         if "cycles" in b:
             speed.append((j, b["cycles"], b["speed"], b["skipped"], b["virt"], b["wall"]))
             lines.append(f"simulated {b['cycles']:,} cycles at {b['speed']:,} cycles/s, skipped {b['skipped']:,}, "
@@ -253,7 +258,10 @@ def main():
                 tol = 100.0 * (4 * e["sd"] + 1) / e["n"] if e["n"] else 1
                 exp_s = f"{exp:.2f} % ± {100.0 * e['sd'] / e['n']:.2f} (exact, see below)"
                 if kod:
-                    ok = row["lost"] <= 0.5 and row["invalid"] == 0.0
+                    nk = sum(1 for r in m if r["stratum"] == "0")
+                    exp_s = (f"0 % (KoD instead of silence: {100.0 * nk / n:.2f} % of the counted replies "
+                             f"are KoD, {exp:.2f} % expected)")
+                    ok = row["lost"] <= 0.5 and row["invalid"] == 0.0 and abs(100.0 * nk / n - exp) <= tol
                     verdict.append(check(ok, f"{j} {row['rate']}: KoD run lost/invalid"))
                 else:
                     ok = abs(row["lost"] - exp) <= tol
