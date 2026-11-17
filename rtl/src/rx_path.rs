@@ -131,7 +131,11 @@
 //! # Formal
 //!
 //! `check!`/`assume!`/`cover!` in [`RxIngress`] and [`RxEgress`] are
-//! proved per unit (`tools/formal/prove.sh rx_ingress prove`, `rx_egress`):
+//! proved per unit (`tools/formal/prove.sh rx_ingress prove`, and
+//! `rx_egress prove 8`: its 16 x 64-bit stamp queue and 96-bit `time` make
+//! the base case slow beyond a few steps, while the induction closes in two
+//! steps, so depth 8 is enough; covers: `rx_ingress cover 30`,
+//! `rx_egress cover 40`, the queue-full cover needs 32 steps):
 //! state invariants, overflow and terminator, `err` only with `last`,
 //! frame length, commit only after its own SFD event, credits within the
 //! depth, pairing counters (stamps sent = frames started + the one waiting
