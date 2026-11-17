@@ -28,3 +28,5 @@ pub mod tx_arb;
 pub mod tx_path;
 pub mod udp4_rx;
 pub mod udp4_tx;
+pub mod udp6_rx;
+pub mod udp6_tx;
