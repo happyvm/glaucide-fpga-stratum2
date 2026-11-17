@@ -106,6 +106,7 @@ fn run(s: &Script, cycles: usize, take: impl Fn(usize) -> bool) -> Out {
                         src: U::<48>::from(sr_),
                         ethertype: U::<16>::from(0x0806u16),
                         multicast: Bit::from_bool((d >> 40) & 1 == 1),
+                        ts: U::<64>::from(0u64),
                     });
                     bi = 1;
                 }
