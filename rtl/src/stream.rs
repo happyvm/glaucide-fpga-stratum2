@@ -15,13 +15,18 @@
 //! 2. `err` is meaningful only together with `last`. `last & err` means
 //!    the frame is bad (RX: `rx_er`, bad FCS, overrun; TX: aborted) and the
 //!    consumer must discard it. `err` is 0 on every other byte.
-//! 3. A frame has at most [`MAX_FRAME`] bytes, at least 1.
+//! 3. A frame has at most [`MAX_FRAME`] bytes (1518 on the wire with FCS), at least 1.
 //! 4. Which bytes a frame carries depends on the point of the pipeline:
-//!    * between the MAC receiver and the Ethernet filter: destination MAC
-//!      through the last payload byte, **FCS stripped** (checked and removed
-//!      by the MAC; `err` reports a bad FCS);
-//!    * between the Ethernet builder and the MAC transmitter: same, no FCS
-//!      and no padding (the transmitter pads to 60 bytes and appends FCS).
+//!    * `mii_rx` output (domain `ClkRx`): everything after the SFD up to the
+//!      end of `rx_dv`, **FCS included**; `err` on `last` if `rx_er` was seen
+//!      or a nibble was left over. The FCS is checked and stripped by
+//!      `fcs_check` (T1.12): its output is destination MAC through last
+//!      payload byte, `err` set on `last` when the FCS is bad.
+//!    * Ethernet builder output (T1.6): destination MAC through last payload
+//!      byte. `eth_tx` (T1.6) pads to 60 bytes and appends the FCS, so the
+//!      stream entering `mii_tx` (domain `ClkTx`) is the **complete frame:
+//!      padded, FCS included**. `mii_tx` adds only preamble, SFD and the
+//!      inter-frame gap.
 //!    * between layers above Ethernet (IP, UDP, ...) the stream carries the
 //!      payload of that layer only, with the layer's header already parsed
 //!      into [`Meta`] (see below).

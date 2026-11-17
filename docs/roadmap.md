@@ -36,15 +36,16 @@ Le modèle est une recommandation, pas une contrainte. Si un agent bloque, il le
 
 | ID | Tâche | Modèle | Dépend de | Livrable | Critère d'acceptation |
 |---|---|---|---|---|---|
-| T1.1 | `mii_rx` : détection préambule/SFD, nibbles → octets, `rx_dv`/`rx_er` | Sonnet | T0.1 | `rtl/src/mii_rx.rs` | Trame de 64 et 1518 octets reçue à l'identique ; trame avec `rx_er` marquée en erreur |
-| T1.2 | `mii_tx` : préambule, SFD, octets → nibbles, IFG de 96 bits | Sonnet | T0.1 | `rtl/src/mii_tx.rs` | Sortie conforme octet par octet, IFG respecté entre deux trames |
-| T1.3 | CRC-32 Ethernet (génération et vérification, 8 bits/cycle) | Haiku | T0.1 | `rtl/src/crc32.rs` | Vecteur `123456789` → `0xCBF43926` ; FCS d'une trame connue |
+| T1.1 | `mii_rx` (domaine `ClkRx`) : préambule/SFD, nibbles → octets, `rx_dv`/`rx_er`, impulsion `sfd` ; sortie = trame brute FCS inclus | Sonnet | T0.1 | `rtl/src/mii_rx.rs` | Trame de 64 et 1518 octets reçue à l'identique ; trame avec `rx_er` marquée en erreur |
+| T1.2 | `mii_tx` (domaine `ClkTx`) : préambule, SFD, octets → nibbles, IFG de 96 bits, impulsion `sfd` ; entrée = trame complète (rembourrée, FCS inclus) | Sonnet | T0.1 | `rtl/src/mii_tx.rs` | Sortie conforme octet par octet, IFG respecté entre deux trames |
+| T1.3 | CRC-32 Ethernet (8 bits/cycle) : fonction `crc32_step` + unité `FrameCrc` | Haiku | T0.1 | `rtl/src/crc32.rs` | Vecteur `123456789` → `0xCBF43926` ; FCS d'une trame connue |
 | T1.4 | Timestamp au SFD + passage de domaine `clk_rx`/`clk_tx` → `clk_sys` | Opus | T0.1, T1.1, T1.2 | `rtl/src/ts_capture.rs` | Pas de métastabilité par construction (Gray/handshake), erreur de timestamp ≤ 1 cycle `clk_sys` + latence fixe documentée |
 | T1.5 | Filtre MAC et classification : unicast, broadcast, multicast IPv6 `33:33:ff:xx:xx:xx`, EtherType → ARP/IPv4/IPv6 | Sonnet | T0.1 | `rtl/src/eth_rx.rs` | Test table : chaque classe de trame routée vers la bonne sortie, trames étrangères jetées |
 | T1.6 | Constructeur de trame Ethernet + padding 60 octets + FCS | Sonnet | T0.1, T1.3 | `rtl/src/eth_tx.rs` | Trame courte rembourrée à 60 + FCS 4 |
 | T1.7 | Arbitre de sortie : sélectionne ARP/ICMP/UDP v4/v6 vers `eth_tx`, sans interruption de trame | Sonnet | T0.1 | `rtl/src/tx_arb.rs` | Deux demandes simultanées servies l'une après l'autre sans corruption |
 | T1.8 | Initialisation PHY : reset, MDIO (lecture ID, auto-négociation, état du lien) | Haiku | T0.1 | `rtl/src/mdio.rs` | Lecture du registre 2/3 simulée avec un PHY modèle |
 | T1.9 | ARP : réponse + requête (résolution), cache de quelques entrées | Sonnet | T1.5, T1.6, T1.7, T0.3 | `rtl/src/arp.rs` | Réponse ARP identique au vecteur de référence ; entrée mise en cache |
+| T1.12 | `fcs_check` : retire et vérifie le FCS d'un flux de trame brute (délai de 4 octets), `err` sur `last` si FCS faux | Sonnet | T1.1, T1.3 | `rtl/src/fcs_check.rs` | Trame valide : FCS retiré, pas d'erreur ; un bit modifié : `err` |
 | T1.10 | IPv4 : parsing, checksum header, rejet fragments/options ; ICMP echo | Sonnet | T1.5, T1.6, T0.3 | `rtl/src/ipv4.rs`, `rtl/src/icmp.rs` | Ping de référence → réponse identique octet par octet |
 | T1.11 | Top phase 1 + bitstream ping | Opus | T1.1–T1.10, T0.5 | `rtl/src/top.rs`, `rtl/src/bin/top_gen.rs` | Banc de test : ARP puis ping en boucle complète en simulation ; Verilog généré |
 
