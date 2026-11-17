@@ -25,7 +25,7 @@
 //! * type 135, code 0, `meta.hop == 255` (rule M1), `meta.len >= 24`, message
 //!   continues: neighbor solicitation to examine (below);
 //! * type 136 (NA), code 0, `meta.hop == 255`, `meta.len >= 24`, message
-//!   continues: neighbor advertisement to learn from (T3.6, below);
+//!   continues: neighbor advertisement to consider for learning (T3.6, below);
 //! * anything else (other types, RA/Redirect, code != 0, hop limit of an
 //!   NS != 255, too short, echo to the solicited-node group): **nothing is
 //!   sent**, no `req`, no payload byte; the message is swallowed up to its
@@ -104,7 +104,7 @@
 //! resolve; `learn` (`Tx<NdLearn>`, output, last): `NdLearn { ip, mac }`, a
 //! neighbor learnt from the wire, for `NbrCache`. Learning never produces an
 //! output frame by itself. Rules in `tools/golden/responder.py` (`solicit`,
-//! `learn`, rules N1-N5).
+//! `learn`, rules N1-N5, as amended by the finding F5: solicited-only).
 //!
 //! ## Solicitation (N1-N3)
 //!
@@ -135,24 +135,43 @@
 //! type, length); the checksum word itself is zero. The checksum is the
 //! complement of the fold, in `0..=0xFFFE`. The NS starts about 7 cycles after
 //! `resolve` is taken. Retransmission, timeouts and duplicate suppression are
-//! the caller's job (no state is kept per target).
+//! the caller's job (no state is kept per target). The unit does keep the
+//! address of its outstanding solicitation, `resolving`, for the learning
+//! rule below: `rs_go` sets `resolving` := target and `rs_wait`; the pair is
+//! cleared when the answer is learned and, as a safety, after
+//! `T::TIMEOUT` cycles ([`ARP_TIMEOUT_CYCLES`] = 2^26 on the board, the same
+//! style as `arp.rs`; the timer restarts at each solicitation). A solicitation
+//! of another target replaces `resolving` (the client has one next hop, a
+//! single resolution at a time).
 //!
-//! ## Learning (N4, N5): state CK1
+//! ## Learning (N4): state CK1, solicited-only (F5, F6)
 //!
 //! * NA: type 136, code 0, `hop == 255`, `len >= 24`, checksum good, input
 //!   `err` clear, options well formed (as for the NS: length 0 or overrun
 //!   rejects the message), target not multicast (first byte != 0xFF), at most
-//!   one Target LLA option (type 2) and then of length 1, else nothing is
-//!   learnt (S/O/R flags are ignored). `learn{ ip = target, mac = TLLA if
-//!   present, else meta.eth_src }`. No frame is sent. Whatever destination
-//!   `ipv6_rx` lets through is accepted (the unit does not look at it). Other
-//!   options, including a Source LLA, are skipped.
-//! * NS that the unit answers (rules M1-M6 above, i.e. after the NA decision
-//!   is positive) with a source other than `::` and a Source LLA option:
-//!   `learn{ ip = meta.src, mac = SLLA }` (the same value the NA is addressed
-//!   to). Not for DAD probes, not without the option (the Ethernet source is
-//!   not used for an NS). The `learn` is sent before the NA is built; if
-//!   `learn` has no room the unit waits in CK1 (the cache always drains).
+//!   one Target LLA option (type 2) and then of length 1, **and it answers our
+//!   outstanding solicitation**: `rs_wait` is set, target == `resolving`, the
+//!   S (solicited) flag is set (bit 0x40 of byte 4), and the IPv6 source
+//!   address equals the target (RFC 4861 section 7.1.2: a solicited NA is sent
+//!   from the target). Then `learn{ ip = target, mac = TLLA if present, else
+//!   meta.eth_src }` and `rs_wait` is cleared (one learn per solicitation).
+//!   Otherwise nothing is learnt: an unsolicited NA, an NA with S = 0, an NA
+//!   for another target, with a spoofed source, with hop limit != 255, or one
+//!   that arrives after the timeout. No frame is sent. Whatever destination
+//!   `ipv6_rx` lets through is accepted (the unit does not look at it). The O
+//!   and R flags are not examined (S = 1 and a matching target is what a
+//!   neighbor that answers our NS sends). Other options, including a Source
+//!   LLA, are skipped.
+//! * NS: **never learned from** (an NS creates no entry in our design, RFC
+//!   4861 section 7.2.3 would create a STALE one; we keep no STALE state). An
+//!   NS that the unit answers (rules M1-M6) is answered directly to the
+//!   source link-layer option if present (else the Ethernet source), exactly
+//!   as before.
+//!
+//! F6: with solicited-only learning a host of the link cannot flood the 4
+//! entries to evict the gateway; only the reply to our own solicitation
+//! inserts an entry (the residual risk is an attacker that answers before the
+//! genuine neighbor).
 //!
 //! # Integration
 //!
@@ -161,12 +180,14 @@
 //! one `req` is followed by exactly one frame on `out_payload`. The input
 //! meta is not needed before byte 0 (do not make its availability depend on
 //! this unit's payload progress).
+use crate::arp::ArpTiming;
 use crate::csum::{csum_add, csum_fold, csum_ok, pseudo_v6};
 use crate::ipv6_rx::Ip6Meta;
 use crate::ipv6_tx::Ip6TxReq;
 use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
+use std::marker::PhantomData;
 use txhdl::{lower, with, Trace};
 use txhdl::{Transaction as TransactionDerive, Value as ValueDerive};
 
@@ -200,8 +221,11 @@ const RS1: u8 = 10;
 const CK0: u8 = 11;
 const RS0: u8 = 12;
 
+/// The ICMPv6 unit of the board (pending-solicitation timeout 2^26 cycles).
+pub type Icmpv6 = Icmpv6With<crate::arp::Board>;
+
 #[derive(Trace, Default)]
-pub struct Icmpv6 {
+pub struct Icmpv6With<T: ArpTiming> {
     pub st: Reg<U<4>>,
     /// Bytes of the message taken so far.
     pub pos: Reg<U<16>>,
@@ -251,10 +275,21 @@ pub struct Icmpv6 {
     /// `mlen >= 8`, `mlen >= 24` (written with `mlen`).
     pub ml8: Reg<Bit>,
     pub ml24: Reg<Bit>,
+    /// Solicitation outstanding (F5): its target, and a timer of the same
+    /// style as `arp.rs`.
+    pub rs_wait: Reg<Bit>,
+    pub resolving: Reg<U<128>>,
+    pub rs_tmo: Reg<U<32>>,
+    /// Flag S of the NA being read (byte 4, bit 0x40).
+    pub na_s: Reg<Bit>,
+    /// Registered (CK0 -> CK1): target == `resolving` while waiting; source == target.
+    pub rsv_r: Reg<Bit>,
+    pub src_tgt_r: Reg<Bit>,
+    _t: PhantomData<T>,
 }
 
 #[lower]
-impl
+impl<T: ArpTiming>
     Unit<
         (
             Rx<Ip6Meta>,
@@ -266,7 +301,7 @@ impl
             Rx<U<128>>,
         ),
         (Tx<Ip6TxReq>, Tx<FrameByte>, Tx<NdLearn>),
-    > for Icmpv6
+    > for Icmpv6With<T>
 {
     async fn run(
         &mut self,
@@ -413,6 +448,9 @@ impl
                 | (tgt & U::<128>::from(0x00FF_FFFFu128));
             let to_tgt_n = Bit::from(mdst == tgt);
             let m3_n = to_tgt_n | Bit::from(mdst == sn_tgt);
+            // F5: the NA answers our outstanding solicitation.
+            let rsv_n = self.rs_wait.get() & Bit::from(tgt == self.resolving.get());
+            let src_tgt_n = Bit::from(msrc == tgt);
             let unspec_n = Bit::from(msrc == U::<128>::from(0u128));
             let own = self.own_r.get();
             let notmc = self.notmc_r.get();
@@ -438,19 +476,18 @@ impl
                 | (tgt & U::<128>::from(0x00FF_FFFFu128)).slice::<0, 48>();
             let len_ns = U::<32>::from(0x8700_0101u32);
             let len_sel = mux(gsol, len_ns, len_k);
-            // Learning (state CK1): NA target / NS source with their MAC.
-            let need_ns = ok_ns & !unspec & sseen;
-            let need_na = notmc & !sbad;
-            let lrn_want = is_ck1 & mux(isna, need_na, need_ns);
-            let lrn_go = lrn_want & learn.ready();
+            // Learning (state CK1): only an NA that answers our solicitation
+            // (F5): target == resolving, S = 1, source == target.
+            let need_na = notmc & !sbad & self.rsv_r.get() & self.na_s.get() & self.src_tgt_r.get();
+            let lrn_go = is_ck1 & isna & need_na & learn.ready();
             if lrn_go.to_bool() {
                 learn.send(NdLearn {
-                    ip: mux(isna, tgt, msrc),
-                    mac: mux(isna, mux(sseen, smac, esrc), smac),
+                    ip: tgt,
+                    mac: mux(sseen, smac, esrc),
                 });
             }
             let ns_ok = is_ck1 & !isna & ok_ns;
-            let ns_adv = ns_ok & (!need_ns | learn.ready());
+            let ns_adv = ns_ok;
             let na_done = is_ck1 & isna & (!need_na | learn.ready());
             let na_fail = is_ck1 & !isna & !ok_ns;
             let na_end = na_fail | na_done;
@@ -545,6 +582,13 @@ impl
                 notmc_r: notmc_n,
                 to_tgt_r: to_tgt_n,
                 m3_r: m3_n,
+                rsv_r: rsv_n,
+                src_tgt_r: src_tgt_n,
+                take & is_nsi & Bit::from(pos == 4) ? na_s: b.data.bit(6),
+                // Pending-solicitation timer (F5): counts while waiting.
+                self.rs_wait.get() ? rs_tmo: self.rs_tmo.get() + U::<32>::from(1u32),
+                self.rs_wait.get() & Bit::from(self.rs_tmo.get() == T::TIMEOUT - 1) ? rs_wait: Bit::Zero,
+                lrn_go ? rs_wait: Bit::Zero,
                 unspec_r: unspec_n,
                 rs_take ? {
                     tgt: rt,
@@ -561,6 +605,9 @@ impl
                     msrc: sn_tgt,
                     esrc: gen_mac,
                     smac: local_mac.get(),
+                    rs_wait: Bit::One,
+                    resolving: tgt,
+                    rs_tmo: U::<32>::from(0u32),
                 },
                 take & (is_g | is_pass | is_nsi) ? acc: next,
                 take & p0 ? {

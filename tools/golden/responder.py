@@ -263,11 +263,14 @@ def _ip6_frame(src_mac, dst_mac, src, dst, icmp_body, hop_limit) -> bytes:
 #   N2 (RFC 4861 section 7.2.2 / 7.2.3): source address = our link-local if T is link-local (fe80::/10),
 #      else our global address when we have one, else our link-local.
 #   N3: a resolution of one of our own addresses is not sent.
-#   N4 (RFC 4861 section 7.2.5): a valid NA (type 136, code 0, hop limit 255, length >= 24, good checksum,
-#      well-formed options, non-multicast target, at most one Target LLA option of length 1) teaches
-#      (target, TLLA or the Ethernet source). S/O flags are not required.
-#   N5 (RFC 4861 section 7.2.3): an NS that we answer (rules M1-M6) with a Source LLA option and a source
-#      other than :: teaches (source, SLLA).
+#   N4 (RFC 4861 sections 7.1.2 / 7.2.5, security finding F5): a valid NA (type 136, code 0, hop limit 255,
+#      length >= 24, good checksum, well-formed options, non-multicast target, at most one Target LLA option
+#      of length 1) teaches (target, TLLA or the Ethernet source) ONLY if it answers our outstanding
+#      solicitation: `resolving` (the target of our last NS, not yet answered or timed out) equals the NA's
+#      target, the S (solicited) flag is set and the IPv6 source equals the target. Unsolicited NAs, S = 0,
+#      other targets, spoofed sources, and NAs after the timeout (resolving = None) teach nothing.
+#   N5 (replaces the former "NS teaches its source"): an NS never teaches anything (RFC 4861 would create a
+#      STALE entry; we keep none). It is answered as before (M1-M6).
 def solicit(target: bytes, cfg: Config) -> Optional[bytes]:
     """NS frame to resolve `target`, or None (own address)."""
     if target in cfg.v6_addresses():
@@ -279,8 +282,11 @@ def solicit(target: bytes, cfg: Config) -> Optional[bytes]:
     return _ip6_frame(cfg.mac, ipv6.multicast_mac(dst), src, dst, ns.build(src, dst), 255)
 
 
-def learn(frame: bytes, cfg: Config):
-    """(ip, mac) the frame teaches, or None. Never produces output frames."""
+def learn(frame: bytes, cfg: Config, resolving: Optional[bytes] = None):
+    """(ip, mac) the frame teaches, or None. Never produces output frames.
+
+    `resolving` is the target of our outstanding solicitation (None: none, nothing is learnt).
+    """
     try:
         f = eth.EthFrame.parse(frame)
         if f.ethertype != eth.ETHERTYPE_IPV6:
@@ -298,16 +304,14 @@ def learn(frame: bytes, cfg: Config):
             na = icmpv6.NeighborAdvertisement.parse(p.src, p.dst, p.payload)
             if na.target[0] == 0xFF:
                 return None
+            # N4: must answer our solicitation (F5).
+            if resolving is None or na.target != resolving or not na.solicited or p.src != na.target:
+                return None
             tlla = [v for (ot, v) in na.options if ot == icmpv6.OPT_TLLA]
             if len(tlla) > 1 or (tlla and len(tlla[0]) != 6):
                 return None
             return na.target, (tlla[0] if tlla else f.src)
-        if p.payload[:1] == bytes([icmpv6.T_NS]) and p.src != bytes(16):
-            if not respond(frame, cfg):  # answered under M1-M6
-                return None
-            ns = icmpv6.NeighborSolicitation.parse(p.src, p.dst, p.payload)
-            slla = [v for (ot, v) in ns.options if ot == icmpv6.OPT_SLLA]
-            return (p.src, slla[0]) if slla else None
+        # N5: an NS never teaches anything.
     except ParseError:
         return None
     return None
