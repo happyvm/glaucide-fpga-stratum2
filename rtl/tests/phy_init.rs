@@ -420,3 +420,32 @@ fn ready_never_without_id_ok() {
     let (t, _) = bench(1, 1, 40_000, |_, _| {});
     assert!(t.iter().all(|p| !p.ready || p.idok));
 }
+
+/// The cover points of the unit are out of reach of the bounded search on
+/// the formal instance (a frame is 64 bit times), so they are asserted here,
+/// on the simulation instance, in one thread (the counters are per thread).
+#[test]
+fn cover_points_are_reached_in_simulation() {
+    let _ = bench(1, 1, 80_000, |c, phy| {
+        if c == 0 {
+            phy.id1 = 0x1234;
+        }
+        if !phy.frames.is_empty() {
+            phy.id1 = 0x2000;
+        }
+        if c == 40_000 {
+            phy.set_link(true);
+        }
+    });
+    for msg in [
+        "id_ok is reached",
+        "ready is reached",
+        "link_up is reached",
+        "an ID mismatch is retried",
+    ] {
+        assert!(
+            txhdl::formal::covered(msg) > 0,
+            "cover point never reached: {msg}"
+        );
+    }
+}

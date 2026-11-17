@@ -62,9 +62,10 @@
 //! The `check!`/`cover!` statements below follow the method of
 //! `docs/formal.md`: guarantees on the registers, no ghost state, no
 //! `assume!`. `mdio_i` and `phy_addr` are free, so the proof covers every
-//! possible PHY behaviour. The proof runs on [`Formal`]; the covers are
-//! reached in the simulation tests (`rtl/tests/phy_init.rs`) and in the
-//! bounded search described in the commit message.
+//! possible PHY behaviour. The proof runs on [`Formal`] (divider 4, delays of 2
+//! cycles). A frame lasts 64 bit times, so the covers are out of reach of a
+//! bounded search of depth 60 even on that instance: they are simulation-only
+//! and asserted in `rtl/tests/phy_init.rs` (`cover_points_are_reached_in_simulation`).
 use std::marker::PhantomData;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Out, Reg, Unit};
 use txhdl::types::{Bit, U};
