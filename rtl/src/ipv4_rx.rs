@@ -144,6 +144,7 @@ pub struct Ipv4Rx {
     pub m_mc: Reg<Bit>,
     pub m_cnt: Reg<U<16>>,
     pub m_lip: Reg<U<32>>,
+    pub m_lv: Reg<Bit>,
 }
 
 #[lower]
@@ -271,7 +272,7 @@ impl
             // ---- formal properties (orchestrator; docs/formal.md, rows "IPv4" and "Flux") ----
             assume!(!have | !b.err | last, "payload: err only together with last (stream contract 2)");
             assume!(!(have & Bit::from(pos >= 1517)) | last, "a frame has at most 1518 bytes (stream contract 3)");
-            assume!(Bit::from(local_ip.get() == self.m_lip.get()), "local_ip is constant (configuration wire)");
+            assume!(!self.m_lv.get() | Bit::from(local_ip.get() == self.m_lip.get()), "local_ip is constant (configuration wire)");
             let m_any = m_icmp | m_udp;
             let m_dec = take & dec_fwd;
             let p_any = p_icmp | p_udp;
@@ -335,6 +336,7 @@ impl
                 take & p6 ? m_b6: b.data,
                 take & p7 ? m_b7: b.data,
                 m_lip: local_ip.get(),
+                m_lv: Bit::One,
                 m_dec ? m_cnt: U::<16>::from(0u16),
                 p_any ? m_cnt: m_cnt + U::<16>::from(1u16),
                 take & in_src ? src: (src << 8u32) | b.data.zext::<32>(),
