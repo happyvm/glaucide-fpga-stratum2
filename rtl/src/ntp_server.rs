@@ -327,7 +327,7 @@
 use crate::stream::{FrameByte, Meta};
 use txhdl::comp::{mux, Clock, DefaultClock, In, Mem, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
+use txhdl::{assume, check, cover, lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
 
 /// UDP port of NTP.
 pub const NTP_PORT: u16 = 123;
@@ -530,6 +530,10 @@ pub struct NtpServer {
     /// see the header).
     #[distributed]
     pub rl: Mem<U<32>, 4096, DefaultClock>,
+    // Monitors (only read by check!/cover!; pruned in synthesis): the raw first byte of the
+    // request, and whether the request in progress was accepted (reply or KoD).
+    pub m_b0: Reg<U<8>>,
+    pub m_go: Reg<Bit>,
 }
 
 #[lower]
@@ -776,6 +780,48 @@ impl
             let ra_n = mux(at40, t3.zext::<128>() << 72u32, ra_sh);
             let rb_sh = (rb << 8u32) | rc.slice::<56, 8>().zext::<128>();
 
+            // ---- formal properties (orchestrator; docs/formal.md, row "NTP serveur") ----
+            assume!(!(have & is_recv) | !err | last, "payload: err only together with last (stream contract 2)");
+            let m_b0 = self.m_b0.get();
+            let m_go = self.m_go.get();
+            let ok0 = self.ok0.get();
+            let vn_r = self.vn.get();
+            // Which requests are answered (N1-N3, F8), restated from the raw first byte.
+            check!(!(done & go) | (Bit::from(pos >= 47) & !err & sp_ok), "answered only if at least 48 bytes, no err, source port not reserved (N1, F8)");
+            check!(!(done & go) | (Bit::from((m_b0 & 7u8) == 3u8) & (Bit::from(((m_b0 >> 3u32) & 7u8) == 3u8) | Bit::from(((m_b0 >> 3u32) & 7u8) == 4u8))), "answered only if mode 3 and version 3 or 4 (N2, N3)");
+            check!(!ok0 | (Bit::from((m_b0 & 7u8) == 3u8) & Bit::from(vn_r.zext::<8>() == ((m_b0 >> 3u32) & 7u8)) & (Bit::from(vn_r == 3u8) | Bit::from(vn_r == 4u8))), "ok0 reflects the raw first byte");
+            check!(!(done & go_k) | (!allowed & !leaked), "a KoD only when the request is limited and not leaked");
+            check!(!(done & go_n & go_k), "a request gets a normal reply or a KoD, not both");
+            check!(!(done & go_k) | kod_enable.get(), "a KoD only when enabled");
+            check!(!(done & go) | valid, "nothing is answered unless valid");
+            // Reply image (cycle L), RFC 5905 7.3 / RFC 8633.
+            check!(!(done & go) | Bit::from((n_ra.slice::<120, 8>() & 7u8) == 4u8), "the reply is mode 4 (server)");
+            check!(!(done & go) | Bit::from(n_ra.slice::<123, 3>() == vn_r), "the reply version is the request's (3 or 4)");
+            check!(!(done & go & sync & !go_k) | (Bit::from(n_ra.slice::<126, 2>() == 0u8) & Bit::from(s_out == s_in) & Bit::from(s_in >= 1) & Bit::from(s_in <= 15)), "synchronised: LI 0 and the configured stratum 1..15 (N4, N6)");
+            check!(!(done & go & !sync & !go_k) | (Bit::from(n_ra.slice::<126, 2>() == 3u8) & Bit::from(s_out == 16u8)), "not synchronised: LI 3 and stratum 16 (N4, N6)");
+            check!(!(done & go_k) | (Bit::from(n_ra.slice::<126, 2>() == 3u8) & Bit::from(s_out == 0u8) & Bit::from(rid == KOD_RATE) & Bit::from(n_rts == 0u64) & Bit::from(n_rc == org_now)), "KoD RATE: LI 3, stratum 0, RATE, no reference time, receive = origin");
+            check!(!(done & go) | Bit::from(n_rb.slice::<0, 64>() == org_now), "origin timestamp = the request's transmit timestamp (N9)");
+            check!(!(done & go) | Bit::from(n_ra.slice::<104, 8>() == self.poll.get()), "poll echoed (N7)");
+            check!(!(done & go & !go_k) | Bit::from(n_rc == self.m_rxts.get()), "receive timestamp = the frame's hardware receive stamp");
+            // Sequencing: one request at a time, one meta then exactly 48 bytes.
+            check!(!take_m | is_idle, "a request is taken only between requests");
+            check!(!(is_meta | is_out) | m_go, "a reply is sent only for an answered request");
+            check!(!is_out | Bit::from(k <= 47), "the reply has 48 bytes");
+            check!(!(send_o & o_last) | Bit::from(k == 47), "last on the 48th byte");
+            check!(!(send_o & Bit::from(k == 47)) | o_last, "the 48th byte carries last");
+            check!(!send_o | is_out, "reply bytes only in the OUT state");
+            check!(!send_m | is_meta, "the reply meta only in the META state");
+            // Transmit timestamp: never before the receive timestamp (RFC 5905: T3 >= T2).
+            check!(!(send_o & at40 & !kod) | (Bit::from(t3 >= self.m_rxts.get()) & (Bit::from(t3 == t3p) | Bit::from(t3 == self.m_rxts.get()))), "T3 >= T2, the sampled time or the receive stamp");
+            check!(!(send_o & at40 & kod) | Bit::from(t3 == org), "KoD: transmit = origin");
+            cover!(done & go_n, "a normal reply is built");
+            cover!(done & go_k, "a KoD is built");
+            cover!(done & !go & valid, "a limited request gets silence");
+            cover!(done & !valid & Bit::from(pos >= 47), "an invalid request is ignored");
+            cover!(send_o & o_last, "a reply is completed");
+            cover!(done & go_n & !sync, "an unsynchronised reply is built");
+            cover!(send_o & at40 & Bit::from(t3p < self.m_rxts.get()) & !kod, "the receive stamp clamps T3");
+
             with!(self <= {
                 t3p: now.slice::<32, 64>() + tx_latency.get(),
                 take_m ? {
@@ -806,6 +852,8 @@ impl
                     rng_w: rw_ + U::<64>::from(RNG_WEYL),
                 },
                 take & Bit::from(pos < 48) ? pos: pos + U::<6>::from(1u8),
+                take & Bit::from(pos == 0) ? m_b0: data,
+                done ? m_go: go,
                 take & Bit::from(pos == 0) ? {
                     ok0: hdr_ok,
                     vn: vn,
