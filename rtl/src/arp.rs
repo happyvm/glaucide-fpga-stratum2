@@ -54,8 +54,27 @@
 //!   that IP is learned or `flush`. At most one resolution is outstanding: a
 //!   `resolve` for another IP stays in its channel until then. A `resolve` for
 //!   the same IP while waiting is consumed and re-sends the request (the
-//!   retransmission is the client's job: there is no timer, so a lost reply
-//!   cannot deadlock the unit). The client polls `lookup` for the answer.
+//!   retransmission is the client's job). The client polls `lookup` for the
+//!   answer.
+//! * Pending timeout (T4.2c): a resolution gets `T::TIMEOUT` cycles
+//!   ([`ArpTiming`]; [`ARP_TIMEOUT_CYCLES`] = 2^26 cycles of `clk_sys`, about
+//!   0.67 s, on the board) from the cycle its `resolve` was consumed (the
+//!   timer restarts when a `resolve` of the same IP is consumed again, i.e. at
+//!   each client retransmission). If the address is not learned by then the
+//!   resolution is abandoned: `wait` and a still-queued request are cleared
+//!   (a request already on the wire is completed), so the next `resolve`, for
+//!   the same or another IP, is taken. Precisely, the resolution is consumed
+//!   at edge `E` and abandoned at edge `E + T::TIMEOUT` unless a reply is
+//!   learned or a `resolve` of the same IP is consumed in between; a
+//!   `resolve` of another IP waiting in its channel is consumed a cycle or
+//!   two later (after the frame on the wire, if any). A silent next hop
+//!   therefore delays another address by at most `T::TIMEOUT` cycles, and a
+//!   client that retries `resolve` more often than that keeps its own
+//!   resolution alive. After the abandon `lookup` of that IP answers
+//!   `found = 0` (it was never cached). A reply that arrives later is still
+//!   learned (cache update, as any packet for us) but matches no pending
+//!   request: it neither unblocks nor disturbs the resolution of another IP.
+//!   `flush` also resets the timer (it drops the resolution).
 //! * Output sharing: one frame at a time; a reply to a request has priority
 //!   over a pending resolve request; the choice is made when the output is
 //!   idle, frames are never interleaved.
@@ -81,6 +100,7 @@ use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
 use txhdl::{assume, check, cover, lower, with, Trace};
+use std::marker::PhantomData;
 use txhdl::{Transaction as TransactionDerive, Value as ValueDerive};
 
 /// EtherType of ARP.
@@ -96,8 +116,45 @@ pub struct ArpEntry {
     pub mac: U<48>,
 }
 
+/// Pending-resolution timeout of the board: 2^26 cycles of `clk_sys`
+/// (about 0.67 s at 100 MHz).
+pub const ARP_TIMEOUT_CYCLES: u64 = 1 << 26;
+
+/// The timing of the ARP unit, a trait so that tests and the proof use a
+/// short timeout (as `phy_init.rs` does with `PhyTiming`).
+pub trait ArpTiming: Default {
+    /// Cycles a resolution waits for its reply before being abandoned
+    /// (at least 2, at most 2^31).
+    const TIMEOUT: u64;
+}
+
+/// The real board: [`ARP_TIMEOUT_CYCLES`].
+#[derive(Default)]
+pub struct Board;
+impl ArpTiming for Board {
+    const TIMEOUT: u64 = ARP_TIMEOUT_CYCLES;
+}
+
+/// The testbench: a timeout of a few hundred cycles.
+#[derive(Default)]
+pub struct Sim;
+impl ArpTiming for Sim {
+    const TIMEOUT: u64 = 300;
+}
+
+/// The proof: a timeout of a few cycles.
+#[derive(Default)]
+pub struct Formal;
+impl ArpTiming for Formal {
+    const TIMEOUT: u64 = 4;
+}
+
+/// The ARP unit of the board (timeout [`ARP_TIMEOUT_CYCLES`]): the name all
+/// call sites use.
+pub type Arp = ArpWith<Board>;
+
 #[derive(Trace, Default)]
-pub struct Arp {
+pub struct ArpWith<T: ArpTiming> {
     // Reception.
     /// 0 = waiting for the meta of a frame, 1 = reading its payload.
     pub rx_st: Reg<U<1>>,
@@ -119,6 +176,9 @@ pub struct Arp {
     pub req_pend: Reg<Bit>,
     pub wait: Reg<Bit>,
     pub req_ip: Reg<U<32>>,
+    /// Cycles since the outstanding resolution was (re)started; only counts
+    /// while `wait`, abandoned when it reaches `T::TIMEOUT - 1`.
+    pub tmo: Reg<U<32>>,
     // Transmission.
     /// 0 = idle, 1 = sending the 28 payload bytes.
     pub tx_st: Reg<U<1>>,
@@ -157,10 +217,11 @@ pub struct Arp {
     pub m_have: Reg<Bit>,
     pub m_lip: Reg<U<32>>,
     pub m_lmac: Reg<U<48>>,
+    _t: PhantomData<T>,
 }
 
 #[lower]
-impl
+impl<T: ArpTiming>
     Unit<
         (
             Rx<EthMeta>,
@@ -172,7 +233,7 @@ impl
             In<Bit>,
         ),
         (Tx<EthHdr>, Tx<FrameByte>, Tx<ArpEntry>),
-    > for Arp
+    > for ArpWith<T>
 {
     async fn run(
         &mut self,
@@ -203,6 +264,7 @@ impl
             let req_pend = self.req_pend.get();
             let wait = self.wait.get();
             let req_ip = self.req_ip.get();
+            let tmo = self.tmo.get();
             let tx_st = self.tx_st.get();
             let tc = self.tx_cnt.get();
             let tx_req = self.tx_req.get();
@@ -297,6 +359,9 @@ impl
             let set_re = take_rs & !rs_hit & same & !inflight & !req_pend;
             // The awaited address was learned.
             let got = learn & wait & Bit::from(spa == req_ip);
+            // Pending timeout: abandon the resolution (a retransmission, which
+            // restarts the timer, wins over the expiry of the same cycle).
+            let expire = wait & Bit::from(tmo == T::TIMEOUT - 1) & !set_re;
 
             // ---------------------------------------------------- transmission
             let t_idle = Bit::from(tx_st == 0);
@@ -417,8 +482,10 @@ impl
                 pay_go ? tx_cnt: tc + 1,
                 t_end ? { tx_st: U::<1>::from(0u8), tx_cnt: U::<5>::from(0u8) },
                 // Resolution.
-                set_new ? { wait: Bit::One, req_pend: Bit::One, req_ip: rip },
-                set_re ? req_pend: Bit::One,
+                wait ? tmo: tmo + 1,
+                set_new ? { wait: Bit::One, req_pend: Bit::One, req_ip: rip, tmo: U::<32>::from(0u8) },
+                set_re ? { req_pend: Bit::One, tmo: U::<32>::from(0u8) },
+                expire ? { wait: Bit::Zero, req_pend: Bit::Zero },
                 got ? { wait: Bit::Zero, req_pend: Bit::Zero },
                 // Cache.
                 w0 ? { v0: Bit::One, ip0: spa, mac0: sha },

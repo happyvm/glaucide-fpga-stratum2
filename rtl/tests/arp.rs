@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Cycle-by-cycle tests of the ARP unit (T1.9): reference vector, cache,
 //! resolution, priority, backpressure.
-use ntp_fpga::arp::{Arp, ArpEntry};
+use ntp_fpga::arp::{Arp, ArpEntry, ArpTiming, ArpWith, Board, Sim};
 use ntp_fpga::eth_rx::EthMeta;
 use ntp_fpga::eth_tx::EthHdr;
 use ntp_fpga::stream::FrameByte;
@@ -70,6 +70,10 @@ struct Out {
 }
 
 fn run(s: &Script, cycles: usize, take: impl Fn(usize) -> bool) -> Out {
+    run_t::<Board>(s, cycles, take)
+}
+
+fn run_t<T: ArpTiming>(s: &Script, cycles: usize, take: impl Fn(usize) -> bool) -> Out {
     let (mac_o, mac) = signal::<U<48>, DefaultClock>();
     let (ip_o, ip) = signal::<U<32>, DefaultClock>();
     let (fl_o, fl) = signal::<Bit, DefaultClock>();
@@ -83,7 +87,7 @@ fn run(s: &Script, cycles: usize, take: impl Fn(usize) -> bool) -> Out {
     mac_o.set(U::<48>::from(MAC));
     ip_o.set(U::<32>::from(IP));
     fl_o.set(Bit::Zero);
-    let mut dut = Arp::default();
+    let mut dut = ArpWith::<T>::default();
     let mut sim = Running::new(dut.run((mr, pr, mac, ip, rr, lr, fl), (ht, ot, st)));
     let mut out = Out::default();
     let mut fi = 0usize; // current frame
@@ -418,4 +422,81 @@ fn reply_has_priority_over_pending_resolve() {
     };
     let o = run(&s, 900, |t| t >= 400);
     assert_eq!(strip(&o), vec![expected_reply(), expected_reply(), request_frame(0xC000_0240)]);
+}
+
+// ---- pending timeout (T4.2c); `Sim::TIMEOUT` = 300 cycles ----
+
+const SILENT: u32 = 0xC000_0240; // a next hop that never answers
+
+#[test]
+fn board_name_is_the_board_timing() {
+    // `Arp` is `ArpWith<Board>` and behaves as before inside the timeout.
+    let _ = Arp::default();
+    let s = Script { resolves: vec![(0, RIP), (1, SILENT)], ..Default::default() };
+    let o = run(&s, 2000, always);
+    assert_eq!(strip(&o), vec![request_frame(RIP)], "no timeout on the board within 2000 cycles");
+}
+
+#[test]
+fn pending_resolution_times_out_and_unblocks_the_next() {
+    // Silent next hop first, then another address: the second request goes
+    // out once the first resolution has been abandoned (about TIMEOUT later),
+    // and the second resolves normally.
+    let s = Script {
+        resolves: vec![(0, SILENT), (1, RIP)],
+        frames: vec![rxf(1000, reply_to_us())],
+        lookups: vec![(1200, RIP), (1210, SILENT)],
+        ..Default::default()
+    };
+    let o = run_t::<Sim>(&s, 1500, always);
+    assert_eq!(strip(&o), vec![request_frame(SILENT), request_frame(RIP)]);
+    let t1 = o.frames[1].3;
+    assert!(t1 >= 300 && t1 < 320, "second request just after the timeout, got {}", t1);
+    assert_eq!(o.rsp.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>(), vec![(true, REMOTE), (false, 0)]);
+}
+
+#[test]
+fn nothing_is_abandoned_before_the_timeout() {
+    let s = Script { resolves: vec![(0, SILENT), (1, RIP)], ..Default::default() };
+    let o = run_t::<Sim>(&s, 290, always);
+    assert_eq!(strip(&o), vec![request_frame(SILENT)]);
+}
+
+#[test]
+fn reply_after_the_timeout_is_learned_but_matches_no_pending_request() {
+    // SILENT times out; RIP is then resolved (pending). A late reply from
+    // SILENT arrives while RIP waits: it is learned (lookup hits) and does
+    // not complete RIP's resolution (a third address stays blocked
+    // until RIP's own timeout).
+    let late = eth(MAC, 0x0200_0000_0060, &arp(2, 0x0200_0000_0060, SILENT, MAC, IP));
+    let s = Script {
+        resolves: vec![(0, SILENT), (1, RIP), (450, 0xC000_0250)],
+        frames: vec![rxf(400, late)],
+        lookups: vec![(500, SILENT), (510, RIP)],
+        ..Default::default()
+    };
+    let o = run_t::<Sim>(&s, 1200, always);
+    assert_eq!(o.rsp.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>(), vec![(true, 0x0200_0000_0060), (false, 0)]);
+    // RIP's request at ~300, then RIP times out at ~600: the third address
+    // (offered at 450, after the late reply) goes out only then.
+    let f = strip(&o);
+    assert_eq!(f[..2], [request_frame(SILENT), request_frame(RIP)]);
+    assert_eq!(f[2], request_frame(0xC000_0250));
+    assert!(o.frames[2].3 >= 600 && o.frames[2].3 < 620, "got {}", o.frames[2].3);
+}
+
+#[test]
+fn retransmission_restarts_the_timer() {
+    // Retrying the same IP every 200 cycles keeps the resolution alive past
+    // the 300-cycle timeout: another address stays blocked.
+    let s = Script {
+        resolves: vec![(0, SILENT), (200, SILENT), (400, SILENT), (450, RIP)],
+        ..Default::default()
+    };
+    let o = run_t::<Sim>(&s, 650, always);
+    assert_eq!(strip(&o), vec![request_frame(SILENT); 3]);
+    let s = Script { resolves: vec![(0, SILENT), (200, SILENT), (400, SILENT), (450, RIP)], ..Default::default() };
+    let o = run_t::<Sim>(&s, 900, always);
+    assert_eq!(strip(&o).last().unwrap(), &request_frame(RIP));
+    assert!(o.frames[3].3 >= 700, "RIP only after the last restart + timeout");
 }
