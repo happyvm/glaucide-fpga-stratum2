@@ -45,6 +45,8 @@ Pour qu'une unité soit prouvable, il faut la déclarer dans `rtl/src/bin/formal
 
 - Toute propriété importante a un `cover!` du cas qu'elle protège (ex. : « une requête NTP valide est acceptée », « un paquet est jeté pour mauvais checksum »). `prove.sh … cover` doit atteindre tous les `cover!`.
 - Toute unité a un test de mutation : un fichier de mutations connues (par exemple inverser un bit de champ) doit faire **échouer** au moins une propriété. Procédure type : `bad.v` dans la validation de `formal_smoke`.
+- **Registre des hypothèses de configuration** (garant = module de configuration T4.1, qui doit les prouver par `check!` de même texte, vérifié par F0.3) :
+  - `local_mac` est une adresse unicast (bit de groupe à 0) — utilisé par `eth_rx` (T1.5).
 - Les `assume!` sont limités à : (a) la forme des flux d'entrée définis dans `stream.rs`, (b) les garanties d'un module amont prouvées, (c) l'environnement physique documenté. Tout autre `assume!` est refusé en revue.
 
 ## Catalogue des propriétés par couche
