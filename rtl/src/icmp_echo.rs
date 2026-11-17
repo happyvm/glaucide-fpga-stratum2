@@ -75,7 +75,7 @@ use crate::ipv4_tx::IpTxReq;
 use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{assume, check, cover, lower, with, Trace};
 
 pub const TYPE_ECHO_REQUEST: u8 = 8;
 pub const PROTO_ICMP: u8 = 1;
@@ -101,6 +101,10 @@ pub struct IcmpEcho {
     pub oc: Reg<U<2>>,
     /// The input ended before byte 4: the first four bytes end with `err`.
     pub abort: Reg<Bit>,
+    /// Monitor (check!/cover! only): a reply is outstanding (its `req` was sent, its last
+    /// byte not yet) and the number of reply bytes sent.
+    pub m_out: Reg<Bit>,
+    pub m_n: Reg<U<16>>,
 }
 
 #[lower]
@@ -187,7 +191,41 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<IpTxReq>, Tx<FrameByte>)> for IcmpEch
             let end_in = take & last & !(is_g & (Bit::from(pos == 2) | Bit::from(pos == 3)));
             let end_out = send_o & Bit::from(oc == 3) & abort;
             let end_all = end_in | end_out;
+            // ---- formal properties (orchestrator; docs/formal.md, row "ICMP echo") ----
+            assume!(!have | !b.err | last, "payload: err only together with last (stream contract 2)");
+            let m_out = self.m_out.get();
+            let m_n = self.m_n.get();
+            let sent = send_o | send_p;
+            let req_go = take & acc_go;
+            check!(!req_go | !m_out, "no request while a reply is outstanding (one frame per req)");
+            check!(!m_out | !is_g | Bit::from(pos == 2) | Bit::from(pos == 3), "a reply outstanding while gathering means bytes 2 or 3 are next");
+            check!(!sent | m_out, "a reply byte is only sent after its request");
+            check!(!is_out | m_out, "OUT only with a reply outstanding");
+            check!(!is_pass | m_out, "PASS only with a reply outstanding");
+            check!(!(req_go & !req.ready()), "a request is sent only when the channel is ready");
+            check!(!req_go | Bit::from(mlen >= 8), "an echo to answer has at least 8 bytes");
+            check!(!req_go | (Bit::from(hi == U::<8>::from(TYPE_ECHO_REQUEST)) & Bit::from(b.data == 0u8)), "only an echo request with code 0 is answered");
+            check!(!(send_o & Bit::from(oc == 0)) | Bit::from(data == 0u8), "reply type is 0 (echo reply)");
+            check!(!(send_o & Bit::from(oc == 1)) | Bit::from(data == 0u8), "reply code is 0");
+            check!(!(sent & err_o) | last_o, "err only together with last (stream contract 2)");
+            check!(!(sent & last_o) | m_out, "exactly one last per reply (it closes the outstanding reply)");
+            check!(!Bit::from(st == DROP) | !m_out, "a swallowed message has no reply");
+            check!(!(end_all & m_out) | (sent & last_o), "the message ends only after the reply's last byte");
+            check!(!is_g | Bit::from(pos < 2) | m_out, "past byte 1 of a message in the gather phase, the request was accepted");
+            check!(!(is_g & m_out) | Bit::from(m_n == 0), "nothing of the reply is sent while gathering");
+            check!(!(is_out & Bit::from(oc == 0)) | Bit::from(oreg.slice::<16, 16>() == 0u8), "held bytes 0 and 1 are zero at the start of the reply");
+            check!(!(is_out & Bit::from(oc == 1)) | Bit::from(oreg.slice::<24, 8>() == 0u8), "held byte 1 is zero after byte 0");
+            check!(!is_out | Bit::from(m_n.slice::<0, 2>() == oc), "the held bytes are counted by oc");
+            cover!(req_go, "an echo request is answered");
+            cover!(sent & last_o & !err_o, "a good reply is completed");
+            cover!(sent & last_o & err_o, "a reply is aborted by err");
+            cover!(take & p1 & !accept & !last, "a non-echo message is swallowed");
+            cover!(is_out & !out_payload.ready(), "back-pressure while the first bytes go out");
+
             with!(self <= {
+                req_go ? { m_out: Bit::One, m_n: U::<16>::from(0u16) },
+                sent ? m_n: m_n + U::<16>::from(1u16),
+                sent & last_o ? m_out: Bit::Zero,
                 take ? {
                     pos: pos + U::<16>::from(1u16),
                     hi: b.data,
