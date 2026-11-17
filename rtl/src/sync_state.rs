@@ -240,7 +240,8 @@ pub struct SyncState {
     pub x1_rid: Reg<U<32>>,
     pub x1_rts: Reg<U<64>>,
     pub x1_rdl: Reg<U<32>>,
-    pub x1_rds: Reg<U<32>>,
+    pub x1_age: Reg<U<64>>,
+    pub x1_dj: Reg<U<65>>,
     pub x2_ok: Reg<Bit>,
     pub x2_sst: Reg<U<8>>,
     pub x2_pst: Reg<U<8>>,
@@ -249,7 +250,9 @@ pub struct SyncState {
     pub x2_rid: Reg<U<32>>,
     pub x2_rts: Reg<U<64>>,
     pub x2_rdl: Reg<U<32>>,
-    pub x2_rds: Reg<U<32>>,
+    pub x2_plo: Reg<U<48>>,
+    pub x2_phi: Reg<U<48>>,
+    pub x2_dj: Reg<U<65>>,
     pub x3_ok: Reg<Bit>,
     pub x3_sst: Reg<U<8>>,
     pub x3_pst: Reg<U<8>>,
@@ -376,12 +379,15 @@ impl
             // root dispersion: source root dispersion + (disp + max(jitter, 2^precision)) + PHI * age.
             let m_floor = prec_table(precision.get());
             let m_j = mux(Bit::from(self.ms_jit.get() < m_floor), m_floor, self.ms_jit.get());
-            let m_dj = self.ms_disp.get().zext::<128>() + m_j.zext::<128>();
+            let m_dj = self.ms_disp.get().zext::<65>() + m_j.zext::<65>();
             let m_age = mux(Bit::from(now < ms_t4), U::<64>::from(0u8), now - ms_t4);
-            let e_rds = rds_ref(self.ms_rds.get(), m_dj, m_age.zext::<128>() * U::<128>::from(PHI_Q32));
-            // The same from the pipeline registers (induction: each stage holds its snapshot).
-            let f1_rds = rds_ref(self.p1_rds.get(), self.p1_dj.get().zext::<128>(), self.p1_age.get().zext::<128>() * U::<128>::from(PHI_Q32));
-            let f2_rds = rds_ref(self.p2_rds.get(), self.p2_dj.get().zext::<128>() + self.p2_phi.get().zext::<128>(), self.p2_plo.get().zext::<128>());
+            // PHI * age as PHI * age[63:32] * 2^32 + PHI * age[31:0] (PHI written out: 15 ppm in
+            // 2^-32) of the stage 1 age (checked equal to the expected age `x1_age`: the same operand
+            // as the design, or the solver would have to prove two multipliers equal), then the sum.
+            let x1_age = self.x1_age.get();
+            let e_phi = self.p1_age.get().slice::<32, 32>().zext::<48>() * U::<48>::from(64_425u32);
+            let e_plo = self.p1_age.get().slice::<0, 32>().zext::<48>() * U::<48>::from(64_425u32);
+            let e_rds = rds_ref(self.x2_srds.get(), self.x2_dj.get().zext::<128>() + self.x2_phi.get().zext::<128>(), self.x2_plo.get().zext::<128>());
             let o_stratum = mux(o_ok, self.o_st.get(), U::<8>::from(16u8));
             let o_leap = mux(o_ok, U::<2>::from(0u8), U::<2>::from(3u8));
             let x1_ok = self.x1_ok.get();
@@ -395,14 +401,14 @@ impl
             check!(!ms_v | (self.ms_ever.get() & Bit::from(ms_st >= 1) & Bit::from(ms_st <= 14)), "a usable source was popped and has stratum 1..=14");
             // Each pipeline stage holds the expected snapshot.
             check!(!(self.p1_ok.get() ^ x1_ok) & Bit::from(self.p1_st.get() == self.x1_pst.get()) & Bit::from(self.p1_rid.get() == self.x1_rid.get()) & Bit::from(self.p1_rdl.get() == self.x1_rdl.get()) & Bit::from((self.p1_upd.get() & fmask) == self.x1_rts.get()), "stage 1 holds ok, stratum + 1, our ref id, the root delay and the update time expected");
-            check!(Bit::from(self.p1_rds.get() == self.x1_srds.get()) & Bit::from(f1_rds == self.x1_rds.get()), "stage 1 holds the terms of the root dispersion expected");
+            check!(Bit::from(self.p1_rds.get() == self.x1_srds.get()) & Bit::from(self.p1_age.get() == x1_age) & Bit::from(self.p1_dj.get() == self.x1_dj.get()), "stage 1 holds the terms of the root dispersion expected: source root dispersion, age, disp + max(jitter, 2^precision)");
             check!(!(self.p2_ok.get() ^ x2_ok) & Bit::from(self.p2_st.get() == self.x2_pst.get()) & Bit::from(self.p2_rid.get() == self.x2_rid.get()) & Bit::from(self.p2_rdl.get() == self.x2_rdl.get()) & Bit::from((self.p2_upd.get() & fmask) == self.x2_rts.get()), "stage 2 holds ok, stratum + 1, our ref id, the root delay and the update time expected");
-            check!(Bit::from(self.p2_rds.get() == self.x2_srds.get()) & Bit::from(f2_rds == self.x2_rds.get()), "stage 2 holds the terms of the root dispersion expected");
+            check!(Bit::from(self.p2_rds.get() == self.x2_srds.get()) & Bit::from(self.p2_plo.get() == self.x2_plo.get()) & Bit::from(self.p2_phi.get() == self.x2_phi.get()) & Bit::from(self.p2_dj.get() == self.x2_dj.get()), "stage 2 holds the terms of the root dispersion expected: PHI * age in two parts");
             check!(!x1_ok | (self.ms_ever.get() & Bit::from(self.x1_sst.get() >= 1) & Bit::from(self.x1_sst.get() <= 14) & Bit::from(self.x1_pst.get() == self.x1_sst.get() + U::<8>::from(1u8))), "stage 1 ok: a usable source of stratum 1..=14, to publish with one more");
             check!(!x2_ok | (self.ms_ever.get() & Bit::from(self.x2_sst.get() >= 1) & Bit::from(self.x2_sst.get() <= 14) & Bit::from(self.x2_pst.get() == self.x2_sst.get() + U::<8>::from(1u8))), "stage 2 ok: a usable source of stratum 1..=14, to publish with one more");
             check!(!x3_ok | (self.ms_ever.get() & Bit::from(self.x3_sst.get() >= 1) & Bit::from(self.x3_sst.get() <= 14) & Bit::from(self.x3_pst.get() == self.x3_sst.get() + U::<8>::from(1u8))), "stage 3 ok: a usable source of stratum 1..=14, to publish with one more");
-            check!(Bit::from(self.x1_rdl.get() >= self.x1_srdl.get()) & Bit::from(self.x1_rds.get() >= self.x1_srds.get()), "stage 1: the roots expected are never below those of the source");
-            check!(Bit::from(self.x2_rdl.get() >= self.x2_srdl.get()) & Bit::from(self.x2_rds.get() >= self.x2_srds.get()), "stage 2: the roots expected are never below those of the source");
+            check!(Bit::from(self.x1_rdl.get() >= self.x1_srdl.get()), "stage 1: the root delay expected is never below that of the source");
+            check!(Bit::from(self.x2_rdl.get() >= self.x2_srdl.get()), "stage 2: the root delay expected is never below that of the source");
             check!(Bit::from(self.x3_rdl.get() >= self.x3_srdl.get()) & Bit::from(self.x3_rds.get() >= self.x3_srds.get()), "stage 3: the roots expected are never below those of the source");
             // The outputs (RFC 5905 §7.3).
             check!(Bit::from(self.o_st.get() == self.x3_pst.get()), "the output stage holds the stratum expected");
@@ -485,7 +491,8 @@ impl
                     x1_rid: e_rid,
                     x1_rts: e_rts,
                     x1_rdl: e_rdl,
-                    x1_rds: e_rds,
+                    x1_age: m_age,
+                    x1_dj: m_dj,
                     x2_ok: x1_ok,
                     x2_sst: self.x1_sst.get(),
                     x2_pst: self.x1_pst.get(),
@@ -494,7 +501,9 @@ impl
                     x2_rid: self.x1_rid.get(),
                     x2_rts: self.x1_rts.get(),
                     x2_rdl: self.x1_rdl.get(),
-                    x2_rds: self.x1_rds.get(),
+                    x2_plo: e_plo,
+                    x2_phi: e_phi,
+                    x2_dj: self.x1_dj.get(),
                     x3_ok: x2_ok,
                     x3_sst: self.x2_sst.get(),
                     x3_pst: self.x2_pst.get(),
@@ -503,7 +512,7 @@ impl
                     x3_rid: self.x2_rid.get(),
                     x3_rts: self.x2_rts.get(),
                     x3_rdl: self.x2_rdl.get(),
-                    x3_rds: self.x2_rds.get(),
+                    x3_rds: e_rds,
                 },
             });
 

@@ -203,7 +203,7 @@ use crate::clock::MAXTRIM as MAXTRIM_U128;
 use crate::ntp_types::Selected;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Out, Reg, Rx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{check, cover, lower, with, Trace};
 
 /// States (RFC 5905 A.5.5.6 numbering, plus PANIC).
 pub const NSET: u8 = 0;
@@ -367,6 +367,18 @@ pub fn clamp_trim(x: U<32>) -> U<32> {
     )
 }
 
+/// Signed `a <= b` of two's complement words, from the sign bits (formal only).
+#[lower]
+fn sle32(a: U<32>, b: U<32>) -> Bit {
+    (a.bit(31) & !b.bit(31)) | (!(a.bit(31) ^ b.bit(31)) & Bit::from(a <= b))
+}
+
+/// `|x| <= MAXTRIM` for a two's complement word (formal only).
+#[lower]
+fn in_trim(x: U<32>) -> Bit {
+    mux(x.bit(31), Bit::from(x >= U::<32>::from(0u32.wrapping_sub(MAXTRIM))), Bit::from(x <= U::<32>::from(MAXTRIM)))
+}
+
 #[derive(Default, Trace)]
 pub struct Servo {
     /// Discipline state (NSET, SPIK, FREQ, SYNC, PANIC).
@@ -402,6 +414,28 @@ pub struct Servo {
     /// The slew has expired / the last update is stale (one cycle lag).
     pub sx: Reg<Bit>,
     pub x8: Reg<Bit>,
+    // Monitors (only read by check!/cover!; pruned in synthesis): the previous
+    // cycle (event popped, its raw offset and its size classes, the registers
+    // before it), cycles since the last valid event, a step was commanded.
+    pub m_ev: Reg<Bit>,
+    pub m_th: Reg<U<64>>,
+    pub m_big: Reg<Bit>,
+    pub m_huge: Reg<Bit>,
+    pub m_quiet: Reg<Bit>,
+    pub m_st: Reg<U<3>>,
+    pub m_ph: Reg<U<3>>,
+    pub m_freq: Reg<U<32>>,
+    pub m_tr: Reg<U<32>>,
+    pub m_tl: Reg<U<48>>,
+    pub m_pl: Reg<U<4>>,
+    pub m_muv: Reg<Bit>,
+    pub m_slw: Reg<Bit>,
+    pub m_fc: Reg<U<3>>,
+    pub m_stp: Reg<U<96>>,
+    pub m_sm: Reg<U<32>>,
+    pub m_sg: Reg<Bit>,
+    pub m_cyc: Reg<U<7>>,
+    pub m_done: Reg<Bit>,
 }
 
 #[lower]
@@ -572,6 +606,72 @@ impl
             let in_fin2 = Bit::from(ph == FIN2);
             let trn = clamp_trim(freq + s);
 
+            // ---- formal properties (orchestrator; docs/formal.md, row "Servo") ----
+            // The event of this cycle restated from the raw head of `sel`.
+            let r_ev = Bit::from(ph == 0) & Bit::from(sel.peek().is_some()) & h.valid;
+            let r_abs = mux(th.bit(63), U::<64>::from(0u8) - th, th);
+            let r_big = Bit::from(r_abs >= U::<64>::from(STEPT_Q + 1));
+            let r_huge = Bit::from(r_abs >= U::<64>::from(PANICT_Q + 1));
+            let m_ev = self.m_ev.get();
+            let m_big = self.m_big.get();
+            let m_huge = self.m_huge.get();
+            let m_st = self.m_st.get();
+            let m_ph = self.m_ph.get();
+            let m_cyc = self.m_cyc.get();
+            let m_done = self.m_done.get();
+            let se = self.se.get();
+            let stp = self.stp.get();
+            let o_trim = mux(self.sx.get(), freq, tr);
+            let o_synced = fs & !self.x8.get();
+            let cyc = m_cyc.zext::<8>();
+            let cnt8 = cnt.zext::<8>();
+            let pl8 = pl.zext::<8>();
+            let busy = !is_idle;
+            let m_after = m_ev & !Bit::from(m_st == NSET);
+            // Bounds (trim within +-500 ppm, anti-windup).
+            check!(in_trim(o_trim), "trim is within [-MAXTRIM, MAXTRIM] (+-500 ppm)");
+            check!(in_trim(freq) & in_trim(tr), "the integrator and the slewed trim are within [-MAXTRIM, MAXTRIM]");
+            check!(Bit::from(self.sm.get() <= U::<32>::from(MAXTRIM)), "the slew magnitude is at most MAXTRIM");
+            check!(!Bit::from(m_ph == FIN) | mux(self.m_sg.get(), sle32(freq, self.m_freq.get()), sle32(self.m_freq.get(), freq)), "anti-windup: the integrator never moves against the offset");
+            check!(!Bit::from(m_ph == FIN) | Bit::from(freq == self.m_freq.get()) | mux(self.m_sg.get(), sle32(self.m_sm.get() - U::<32>::from(MAXTRIM), freq), sle32(freq, U::<32>::from(MAXTRIM) - self.m_sm.get())), "anti-windup: the integrator moves at most to MAXTRIM - slew");
+            check!(Bit::from(m_ph == FIN) | Bit::from(freq == self.m_freq.get()), "the integrator changes only at the end of a processed update");
+            // States.
+            check!(Bit::from(st <= PANIC) & !Bit::from(st == FSET) & Bit::from(ph <= FIN2), "state is NSET, SPIK, FREQ, SYNC or PANIC; the sequencer is in one of its 6 phases");
+            check!(m_ev | Bit::from(st == m_st), "the state changes only on a valid event");
+            check!(!(m_ev & Bit::from(m_st == NSET)) | Bit::from(st == FREQ), "NSET: the first valid event leads to FREQ");
+            check!(!(m_after & m_huge) | Bit::from(st == PANIC), "after start-up an offset above PANICT leads to PANIC");
+            check!(!(m_after & m_big & !m_huge) | Bit::from(st == SPIK), "after start-up an offset above STEPT leads to SPIK");
+            check!(!(m_after & !m_big) | Bit::from(st == SYNC) | Bit::from(st == FREQ) | (Bit::from(st == SPIK) & Bit::from(m_st == SYNC)), "a small offset leads to FREQ or SYNC, or to SPIK from SYNC (spike gate)");
+            check!(!Bit::from(st == PANIC) | Bit::from(m_st == PANIC) | (m_after & m_huge), "PANIC is entered only on an offset above PANICT");
+            check!(!o_synced | Bit::from(st == FREQ) | Bit::from(st == SYNC), "synced only in FREQ or SYNC");
+            // Step: only from NSET on an offset above STEPT, one cycle, at most once.
+            check!(!(se ^ (m_ev & Bit::from(m_st == NSET) & m_big)), "step_en exactly in the cycle after a valid event in NSET with |offset| > STEPT");
+            check!(!se | (Bit::from(stp.slice::<32, 64>() == self.m_th.get()) & Bit::from(stp.slice::<0, 32>() == 0)), "the step word is the offset of the event, in the accumulator format");
+            check!(se | Bit::from(stp == self.m_stp.get()), "the step word changes only with step_en");
+            check!(!(se & m_done), "at most one step after reset");
+            check!(!(se | m_done) | !nset, "after a step the state is never NSET again");
+            check!(!se | (is_idle & Bit::from(freq == self.m_freq.get())), "a step starts no computation and leaves the integrator");
+            check!(!(nset & !se) | (Bit::from(stp == 0) & Bit::from(freq == 0) & Bit::from(tr == 0) & is_idle & !m_done), "NSET: no step yet, trim 0");
+            // No change without a valid event.
+            check!(!self.m_quiet.get() | (Bit::from(st == m_st) & Bit::from(freq == self.m_freq.get()) & Bit::from(tr == self.m_tr.get()) & Bit::from(tl == self.m_tl.get()) & Bit::from(pl == self.m_pl.get()) & !(muv ^ self.m_muv.get()) & !(slw ^ self.m_slw.get()) & Bit::from(fc == self.m_fc.get()) & Bit::from(stp == self.m_stp.get()) & !se & is_idle), "idle without a valid event (none, or valid = 0): nothing changes (holdover)");
+            check!(!(busy & Bit::from(m_ph == IDLE)) | (m_ev & Bit::from(ph == MUL1)), "a computation starts only on a valid event");
+            check!(!(m_after & m_huge) | (is_idle & Bit::from(freq == self.m_freq.get()) & Bit::from(tr == self.m_tr.get())), "an offset above PANICT is never followed after start-up");
+            check!(!(m_after & m_big & (Bit::from(m_st == FREQ) | Bit::from(m_st == SYNC))) | (is_idle & Bit::from(freq == self.m_freq.get()) & Bit::from(tr == self.m_tr.get())), "FREQ/SYNC: an offset above STEPT is ignored");
+            // Timing of a processed update (header "Timing"): P + 50 + poll cycles.
+            check!(Bit::from(pl <= POLL_MAX) & (!busy | Bit::from(pl >= POLL_MIN)), "the poll of an update is clamped to 4..=10");
+            check!(!busy | (muv & !nset & !Bit::from(st == PANIC)), "a computation runs in SPIK, FREQ or SYNC only");
+            check!(!in_mul1 | (Bit::from(cnt < MUL1_CYCLES) & Bit::from(cyc == cnt8 + U::<8>::from(1u8))), "MUL1 is cycles P+1..P+30");
+            check!(!in_shr | (Bit::from(cnt8 < pl8) & Bit::from(cyc == cnt8 + U::<8>::from(31u8))), "SHR is cycles P+31..P+30+poll");
+            check!(!in_mul2 | (Bit::from(cnt < MUL2_CYCLES) & Bit::from(cyc == cnt8 + pl8 + U::<8>::from(31u8))), "MUL2 is cycles P+31+poll..P+47+poll");
+            check!(!in_fin | Bit::from(cyc == pl8 + U::<8>::from(48u8)), "FIN is cycle P+48+poll");
+            check!(!in_fin2 | Bit::from(cyc == pl8 + U::<8>::from(49u8)), "FIN2 is cycle P+49+poll");
+            check!(!busy | Bit::from(cyc <= 59), "an update is processed in at most 60 cycles");
+            cover!(se, "a step is commanded");
+            cover!(in_fin2, "an update is processed to its end");
+            cover!(Bit::from(st == PANIC), "PANIC is reached");
+            cover!(Bit::from(st == SPIK), "SPIK is reached");
+            cover!(m_ev & !m_big & Bit::from(m_st == NSET), "a first small offset is processed without a step");
+
             with!(self <= {
                 se: Bit::Zero,
                 sx: past_poll(el, pl),
@@ -635,12 +735,32 @@ impl
                     tr: trn,
                     ph: U::<3>::from(IDLE),
                 },
+                // Monitors.
+                m_ev: r_ev,
+                m_th: th,
+                m_big: r_big,
+                m_huge: r_huge,
+                m_quiet: is_idle & !r_ev,
+                m_st: st,
+                m_ph: ph,
+                m_freq: freq,
+                m_tr: tr,
+                m_tl: tl,
+                m_pl: pl,
+                m_muv: muv,
+                m_slw: slw,
+                m_fc: fc,
+                m_stp: stp,
+                m_sm: smv,
+                m_sg: sg_r,
+                m_cyc: mux(r_ev, U::<7>::from(1u8), mux(Bit::from(m_cyc == 127), m_cyc, m_cyc + U::<7>::from(1u8))),
+                se ? m_done: Bit::One,
             });
-            trim.set(mux(self.sx.get(), freq, tr));
-            step.set(self.stp.get());
-            step_en.set(self.se.get());
+            trim.set(o_trim);
+            step.set(stp);
+            step_en.set(se);
             state.set(st);
-            synced.set(fs & !self.x8.get());
+            synced.set(o_synced);
         }
     }
 }
