@@ -345,3 +345,12 @@ Ressources : les changements de T5.3 ne modifient pas la consommation de façon 
 (`tools/estimate_resources.py` sur les modules modifiés : `selection` −52 LUT / +219 bascules
 pour le pipeline du comparateur et `rdx`, les autres à ±70 LUT et ±20 bascules) ;
 `docs/resources.md` n'est pas mis à jour.
+
+## 8. Vérifications faites après les modifications
+
+`cargo test -p ntp_fpga` (tout, profil par défaut) vert ; `python3 -m unittest discover
+tools/golden` et `tools/golden/ntpclient` verts ; `python3 tools/formal/contracts.py` : PASS
+(seuls les numéros de ligne de `csum.rs` changent) ; `tools/gen_verilog.sh` sans erreur ;
+`top_gen` (serveur et `--with-client`) : Yosys `read_verilog` + `hierarchy -check -top
+arty_top_board` + `proc` + `check -assert` sans problème. Preuves formelles non relancées
+(l'orchestrateur les refait, voir § 6).
