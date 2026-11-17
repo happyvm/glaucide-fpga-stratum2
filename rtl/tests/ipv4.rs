@@ -502,15 +502,40 @@ fn rx_table() {
         p.src = s;
         cases.push((n, p.frame(), None));
     }
-    let mut p = Pkt::new(1, 12);
-    p.src = 0xF000_0001; // reserved class E, not rejected by the model
-    cases.push(("src class E", p.frame(), Some((0, p.data.clone()))));
-    p.src = 0xDFFF_FFFF;
-    cases.push((
-        "src just below multicast",
-        p.frame(),
-        Some((0, p.data.clone())),
-    ));
+    // F8 (rule I6): invalid source addresses are dropped for ICMP (proto 1,
+    // channel 0) and UDP (proto 17, channel 1) alike; valid ones pass.
+    for (proto, ch) in [(1u8, 0usize), (17, 1)] {
+        for (n, sa) in [
+            ("src 0.0.0.0/8 low", 0x0000_0001u32),
+            ("src 0.0.0.0/8 high", 0x00FF_FFFF),
+            ("src loopback", 0x7F00_0001),
+            ("src loopback low", 0x7F00_0000),
+            ("src loopback high", 0x7FFF_FFFE),
+            ("src our own address", LOCAL_IP),
+            ("src class E", 0xF000_0001),
+            ("src class E low", 0xF000_0000),
+            ("src class E high", 0xFFFF_FFFE),
+            ("src multicast low", 0xE000_0000),
+        ] {
+            let mut p = Pkt::new(proto, 12);
+            p.src = sa;
+            cases.push((n, p.frame(), None));
+        }
+        for (n, sa) in [
+            ("src 1.0.0.0", 0x0100_0000u32),
+            ("src just below loopback", 0x7EFF_FFFF),
+            ("src just above loopback", 0x8000_0000),
+            ("src link-local", 0xA9FE_0101),
+            ("src documentation", 0xC633_6407),
+            ("src private", 0x0A00_0001),
+            ("src our /24 neighbour", LOCAL_IP + 1),
+            ("src just below multicast", 0xDFFF_FFFF),
+        ] {
+            let mut p = Pkt::new(proto, 12);
+            p.src = sa;
+            cases.push((n, p.frame(), Some((ch, p.data.clone()))));
+        }
+    }
     let mut f = Pkt::new(1, 12).frame();
     f.dst_mc = true;
     cases.push(("group-addressed dst", f, None));

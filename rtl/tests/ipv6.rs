@@ -602,6 +602,13 @@ fn ref_rx(f: &RxFr, gua_valid: bool) -> Option<(usize, Vec<u8>)> {
     if next == 17 && !ours {
         return None;
     }
+    // G9: UDP is not answered to ::, ::1, ::ffff:0:0/96 or our own addresses.
+    if next == 17 {
+        let src = u128_at(b, 8);
+        if src == 0 || src == 1 || src >> 32 == 0xffff || src == LL || (gua_valid && src == GUA) {
+            return None;
+        }
+    }
     if plen == 0 {
         return None;
     }
@@ -756,9 +763,44 @@ fn rx_table() {
     let mut p = icmp(24).to(sn_of(SN_LOW), sn_mac(SN_LOW));
     p.src = 0;
     cases.push(("DAD: src :: to sn", p, Some(0), true));
+    // F8 (G9): UDP from invalid source addresses is dropped here; ICMPv6 is not
+    // affected (the DAD above, and echo from the same addresses, still pass).
+    for (n, s) in [
+        ("udp from ::", 0u128),
+        ("udp from ::1", 1),
+        ("udp from ::ffff:0:0 (mapped)", 0xffffu128 << 32),
+        ("udp from mapped 192.0.2.1", (0xffffu128 << 32) | 0xC000_0201),
+        ("udp from mapped top", (0xffffu128 << 32) | 0xFFFF_FFFF),
+        ("udp from our link-local", LL),
+        ("udp from our global", GUA),
+        ("udp from multicast", ALL_NODES),
+    ] {
+        let mut p = udp(24);
+        p.src = s;
+        cases.push((n, p, None, true));
+        if s != ALL_NODES {
+            let mut p = icmp(24);
+            p.src = s;
+            cases.push(("icmp from the same source passes", p, Some(0), true));
+        }
+    }
+    for (n, s) in [
+        ("udp from ::2", 2u128),
+        ("udp from ::fffe:0:0 (not mapped)", 0xfffeu128 << 32),
+        ("udp from 1::ffff:0:0", (1u128 << 96) | (0xffffu128 << 32)),
+        ("udp from fe80::2", PEER_LL),
+        ("udp from fe80::1 (not ours)", LL ^ 3),
+        ("udp from 2001:db8::2", PEER),
+        ("udp from global with other iid", GUA ^ 1),
+    ] {
+        let mut p = udp(24);
+        p.src = s;
+        cases.push((n, p, Some(1), true));
+    }
+    // With no valid global address, the global address is an ordinary source.
     let mut p = udp(24);
-    p.src = 0;
-    cases.push(("udp from :: to ll (passes this layer)", p, Some(1), true));
+    p.src = GUA;
+    cases.push(("udp from the global address, gua_valid 0", p, Some(1), false));
     // Hop limit.
     for (h, exp) in [
         (0u8, None),
