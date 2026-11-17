@@ -139,22 +139,19 @@ fn test_set_is_the_golden_model() {
     assert_eq!(Test::STRATUM_OFFSET, 1);
 }
 
-/// NOTE (deviation, to be decided by the owner): the golden model names
-/// the server's global address `2001:db8::1` (`SRV_GUA`), whereas the spec
-/// of T4.1 builds it as prefix + EUI-64 of the MAC, which gives
-/// `2001:db8::ff:fe00:1`. The unit follows the spec. The golden vectors
-/// `ping6`, `ntp6_basic` and `ndp_ns_na` use `2001:db8::1` and must be
-/// regenerated (or the rule changed) before the end-to-end tests agree.
+/// Decision (orchestrator): the global address is a static constant, not
+/// prefix + EUI-64. The Test set uses the golden model's `2001:db8::1`; both
+/// sets keep the low 24 bits of the global and link-local addresses equal.
 #[test]
-fn test_set_global_address_follows_eui64_not_golden_gua() {
-    assert_eq!(
-        eui64_global(Test::GUA_PREFIX, Test::LOCAL_MAC),
-        0x2001_0DB8_0000_0000_0000_00FF_FE00_0001 // 2001:db8::ff:fe00:1
-    );
-    assert_ne!(
-        eui64_global(Test::GUA_PREFIX, Test::LOCAL_MAC),
-        0x2001_0DB8_0000_0000_0000_0000_0000_0001 // golden 2001:db8::1
-    );
+fn global_address_is_static_and_shares_sn_low_with_link_local() {
+    assert_eq!(Test::LOCAL_GUA, 0x2001_0DB8_0000_0000_0000_0000_0000_0001); // 2001:db8::1
+    assert_eq!(Board::LOCAL_GUA, 0x2001_0DB8_0000_0001_0000_0000_0050_0001); // 2001:db8:0:1::50:1
+    for (gua, mac) in [(Test::LOCAL_GUA, Test::LOCAL_MAC), (Board::LOCAL_GUA, Board::LOCAL_MAC)] {
+        assert_eq!(
+            solicited_node_low24(gua),
+            solicited_node_low24(eui64_link_local(mac))
+        );
+    }
 }
 
 // ---------------------------------------------------------------- the unit
@@ -297,7 +294,7 @@ fn board_wires_carry_the_board_constants() {
                 0x02_4E_54_50_00_01,
                 0xC000_020A,
                 0xFE80_0000_0000_0000_004E_54FF_FE50_0001,
-                0x2001_0DB8_0000_0001_004E_54FF_FE50_0001,
+                0x2001_0DB8_0000_0001_0000_0000_0050_0001,
                 1,
                 0x50_0001,
                 0xC000_02FE,
@@ -334,7 +331,7 @@ fn test_wires_carry_the_golden_constants() {
                 0x02_00_00_00_00_01,
                 0xC000_0201,
                 0xFE80_0000_0000_0000_0000_00FF_FE00_0001,
-                0x2001_0DB8_0000_0000_0000_00FF_FE00_0001,
+                0x2001_0DB8_0000_0000_0000_0000_0000_0001,
                 1,
                 0x00_0001,
                 0xC000_02FE,

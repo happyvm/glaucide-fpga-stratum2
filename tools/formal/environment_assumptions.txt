@@ -11,6 +11,5 @@
 
 payload: err only together with last (stream contract 2) # stream contract, F0.5 (rtl/src/eth_tx.rs, rtl/src/tx_arb.rs)
 a frame has at most 1518 bytes (stream contract 3) # stream contract, F0.5 (rtl/src/fcs_check.rs)
-local_mac is a unicast address (group bit clear) # config assumption, guarantor T4.1, see docs/formal.md
 the step is nought, one or two # toolchain smoke-test unit (formal_smoke): input constraint of a toy unit, no link with the NTP design (reviewed)
 a stream has at most 1518 bytes (stream contract 3) # stream contract, F0.5 (rtl/src/csum.rs; same rule as fcs_check, wording to harmonise)

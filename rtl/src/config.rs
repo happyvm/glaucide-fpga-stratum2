@@ -18,7 +18,7 @@
 //! | `LOCAL_MAC` | `02:4e:54:50:00:01` | `02:00:00:00:00:01` |
 //! | `LOCAL_IP4` | `192.0.2.10` | `192.0.2.1` |
 //! | `GATEWAY_IP4`, `NETMASK4` | `192.0.2.254`, `255.255.255.0` | same |
-//! | `GUA_PREFIX`, `GUA_ENABLED` | `2001:db8:0:1::/64`, on | `2001:db8::/64`, on |
+//! | `LOCAL_GUA`, `GUA_ENABLED` | `2001:db8:0:1::50:1`, on | `2001:db8::1`, on |
 //! | `UPSTREAM` | `192.0.2.1`, `2001:db8::1`, on; two slots off | `192.0.2.99`, `2001:db8::99`, on; two slots off |
 //! | `POLL_LOG2` | 6 (64 s) | 6 |
 //! | `PRECISION_LOG2` | -24 | -24 |
@@ -58,7 +58,7 @@
 //! | `local_mac` | `U<48>` | `LOCAL_MAC` |
 //! | `local_ip4` | `U<32>` | `LOCAL_IP4` |
 //! | `local_ll` | `U<128>` | `eui64_link_local(LOCAL_MAC)` |
-//! | `local_gua` | `U<128>` | `eui64_global(GUA_PREFIX, LOCAL_MAC)`, valid or not |
+//! | `local_gua` | `U<128>` | `LOCAL_GUA`, valid or not |
 //! | `gua_valid` | `Bit` | `GUA_ENABLED`; `local_gua` is only in use when high |
 //! | `sn_low` | `U<24>` | `solicited_node_low24(local_ll)` |
 //! | `gateway` | `U<32>` | `GATEWAY_IP4` |
@@ -88,7 +88,7 @@
 use std::marker::PhantomData;
 use txhdl::comp::{Clock, DefaultClock, Out, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, Trace};
+use txhdl::{check, lower, Trace};
 
 /// The configuration of one build: every constant the design reads.
 pub trait ConfigSet {
@@ -100,8 +100,11 @@ pub trait ConfigSet {
     const GATEWAY_IP4: u32;
     /// IPv4 netmask (1 bits up to the network part).
     const NETMASK4: u32;
-    /// Global IPv6 /64 prefix, the upper 64 bits of the address.
-    const GUA_PREFIX: u64;
+    /// Global IPv6 address, static (a server keeps a fixed, memorable address;
+    /// no SLAAC in v1). Its low 24 bits MUST equal those of the link-local
+    /// address (`eui64_link_local(LOCAL_MAC)`): `ipv6_rx` has a single
+    /// `sn_low` for both solicited-node groups (checked at compile time).
+    const LOCAL_GUA: u128;
     /// Whether the global address is in use.
     const GUA_ENABLED: bool;
     /// Up to four upstream servers: (is IPv6, address, in use). An IPv4
@@ -125,7 +128,8 @@ impl ConfigSet for Board {
     const LOCAL_IP4: u32 = 0xC000_020A; // 192.0.2.10
     const GATEWAY_IP4: u32 = 0xC000_02FE; // 192.0.2.254
     const NETMASK4: u32 = 0xFFFF_FF00; // /24
-    const GUA_PREFIX: u64 = 0x2001_0DB8_0000_0001; // 2001:db8:0:1::/64
+    // 2001:db8:0:1::50:1 (low 24 bits 0x500001 = those of the link-local address)
+    const LOCAL_GUA: u128 = 0x2001_0DB8_0000_0001_0000_0000_0050_0001;
     const GUA_ENABLED: bool = true;
     const UPSTREAM: [(bool, u128, bool); 4] = [
         (false, 0xC000_0201, true),                              // 192.0.2.1
@@ -149,7 +153,8 @@ impl ConfigSet for Test {
     const LOCAL_IP4: u32 = 0xC000_0201; // 192.0.2.1
     const GATEWAY_IP4: u32 = 0xC000_02FE; // 192.0.2.254
     const NETMASK4: u32 = 0xFFFF_FF00; // /24
-    const GUA_PREFIX: u64 = 0x2001_0DB8_0000_0000; // 2001:db8::/64
+    // 2001:db8::1, the golden model's SRV_GUA (low 24 bits 0x000001)
+    const LOCAL_GUA: u128 = 0x2001_0DB8_0000_0000_0000_0000_0000_0001;
     const GUA_ENABLED: bool = true;
     const UPSTREAM: [(bool, u128, bool); 4] = [
         (false, 0xC000_0263, true),                              // 192.0.2.99
@@ -202,6 +207,10 @@ impl<C: ConfigSet> Checks<C> {
             "LOCAL_MAC must be a 48-bit unicast address"
         );
         assert!(
+            solicited_node_low24(C::LOCAL_GUA) == solicited_node_low24(eui64_link_local(C::LOCAL_MAC)),
+            "LOCAL_GUA and the link-local address must share their low 24 bits (one sn_low)"
+        );
+        assert!(
             C::POLL_LOG2 >= 4 && C::POLL_LOG2 <= 10,
             "POLL_LOG2 must be in 4..=10"
         );
@@ -222,7 +231,7 @@ impl<C: ConfigSet> Config<C> {
     /// The derived constants, computed once here so that the lowered body
     /// only names constants.
     const LL: u128 = eui64_link_local(C::LOCAL_MAC);
-    const GUA: u128 = eui64_global(C::GUA_PREFIX, C::LOCAL_MAC);
+    const GUA: u128 = C::LOCAL_GUA;
     const SN: u32 = solicited_node_low24(Self::LL);
 }
 
@@ -323,6 +332,17 @@ impl<C: ConfigSet>
     ) {
         loop {
             DefaultClock::rising().await;
+            // Guarantees (formal, written by the orchestrator): the texts are
+            // exactly those of the `assume!`s of the consumers, so that
+            // tools/formal/contracts.py pairs them.
+            check!(
+                !U::<48>::new(C::LOCAL_MAC as u128).bit(40),
+                "local_mac is a unicast address (group bit clear)"
+            );
+            check!(
+                U::<24>::new(Self::SN as u128) == U::<24>::new((Self::GUA & 0xFF_FFFF) as u128),
+                "sn_low is the low 24 bits of both of our IPv6 addresses"
+            );
             local_mac.set(U::<48>::new(C::LOCAL_MAC as u128));
             local_ip4.set(U::<32>::new(C::LOCAL_IP4 as u128));
             local_ll.set(U::<128>::new(Self::LL));
