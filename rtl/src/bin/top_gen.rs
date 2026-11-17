@@ -11,8 +11,10 @@
 //! The module tree goes through [`ntp_fpga::top::fix_rst_clash`] (a
 //! local `rst` wire of two units; see its documentation).
 //!
-//! `--with-client` writes the Phase B build (`ArtyBoardWithClient`, the
-//! client-side discipline wired, `docs/top-client-hooks.md`) instead.
+//! `--with-client` writes the stratum-2 build instead (`ArtyBoardWithClient`:
+//! the server and the NTP client wired, task T1.14,
+//! `docs/top-client-hooks.md`), with the same file names (one module tree
+//! `arty_top.v` plus the same wrapper).
 use ntp_fpga::top::{fix_rst_clash, ArtyBoard, ArtyBoardWithClient};
 use std::path::PathBuf;
 

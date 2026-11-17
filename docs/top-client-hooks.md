@@ -1,84 +1,113 @@
-# Top : points de raccordement du côté client (phase B de T1.11)
+# Câblage du client : état final (T1.14)
 
-Ce document liste ce qu'il reste à câbler dans `rtl/src/top.rs` quand les unités `ntp_client` (T4.2),
-`ntp_demux` (T4.2a) et le cache de voisins IPv6 seront fusionnées. Les noms de canaux sont ceux de
-`ArtyCore::run`.
+Le client NTP est câblé dans le top : `ArtyBoardWithClient` (`cargo run -p ntp_fpga --bin top_gen --
+--with-client`) est la carte de strate 2 complète. `ArtyBoard` (serveur seul, `Standalone`) est inchangée :
+sa netlist est identique octet pour octet à celle d'avant T1.14.
 
-## Déjà câblé
+## Sélection de la variante
 
-- **`ClientSync<C>`** (source de synchronisation, paramètre `S` du top) : `samples`/`miss`
-  → `ClockFilter` → `Selection` (`now` = `time >> 32`, registré) → `ForkSelected` →
-  { `Servo` → `trim`, `step`, `step_en` de `DisciplinedClock` ; `SyncState` → `synced`, `stratum`,
-  `ref_id` (= `ref_id6`), `ref_ts`, `root_delay`, `root_disp` de `ntp_server` }.
-  `servo.synced` alimente `sync_state.servo_synced`. `peer_ref0..3` = `refid_ipv4`/`refid_ipv6` des
-  emplacements `ConfigSet::UPSTREAM`, calculés à la synthèse (`top::peer_ref`).
-- Construction de carte correspondante : `ArtyBoardWithClient` (`cargo run -p ntp_fpga --bin top_gen --
-  --with-client`). Sans client, elle se comporte comme `ArtyBoard` (jamais synchronisée, trim nul).
+Le top est générique en son cœur : `ArtyTopOf<P, K>` (`rtl/src/top.rs`), `K: TopCore`.
 
-## À raccorder
+- `ArtyTop<C, S, P>` = `ArtyTopOf<P, ArtyCore<ClkRx, ClkTx, C, S>>` : le chemin serveur seul (tests de
+  `rtl/tests/top.rs`, `ArtyBoard`). `S` reste la source de synchronisation (`Standalone`, `FixedSync`,
+  `FixedUnsync`, `ClientSync` sans client).
+- `ArtyBoardWithClient` = `ArtyTopOf<Board, ArtyCoreClient<ClkRx, ClkTx, Board, DisciplinedClock>>`
+  (`rtl/src/top_client.rs`) : serveur + client, synchronisation `ClientSync<C>`.
 
-### 1. `ntp_client` (T4.2)
+Un cœur distinct plutôt qu'un marqueur sur `S` : le client coupe des canaux du chemin serveur
+(démultiplexeurs, arbitres), ce qui changerait la netlist et la latence calibrée du serveur seul.
 
-| Port du client (attendu) | Raccordement dans `ArtyCore` |
-|---|---|
-| sortie `Sample` | remplace `idle_samples` : canal `smp_tx` → `sync.samples` |
-| sortie « pas de réponse » (`U<2>`, pair) | remplace `idle_miss` : canal `miss_tx` → `sync.miss` |
-| `time` (`In<U<96>>`) | un clone de `time` (`DisciplinedClock.time`) |
-| configuration | signaux `_up0_addr`, `_up0_v6`, `_up0_en` … `_up3_*`, `poll_log2`, `_gateway`, `_netmask`, `_gateway6` (déjà sortis de `Config<C>`, aujourd'hui inutilisés) |
-| requêtes IPv4 (`UdpTxReq` + charge utile 48 octets) | vers `udp4_tx`, **via un arbitre 2 entrées** (voir 4) |
-| requêtes IPv6 (`Udp6TxReq` + charge utile) | vers `udp6_tx`, via un arbitre 2 entrées |
-| réponses reçues (`Meta` + charge utile) | sorties « client » de `ntp_demux` (voir 2) ; `Meta.rx_ts` donne T4 |
-| T1 (horodatage d'émission) | soit prédit comme le T3 du serveur (constante K, `ntp_reply_route.rs`), soit pris sur `tx_path.stamps` (canal `st_rx`, aujourd'hui vidé par `drain_stamps`) : **attention**, `tx_path` produit un horodatage par trame émise, toutes sources confondues ; un client qui l'utilise doit savoir quelle trame est la sienne (par ex. une étiquette qui suit la trame, ou n'émettre que quand le chemin est vide). `tx_path` bloque l'émission si ce canal n'est pas vidé. |
+## Ce qui est câblé
 
-Port source du client : **123**. Les réponses des serveurs amont (mode 4) arrivent alors sur le port
-123, que `udp4_rx`/`udp6_rx` acceptent déjà ; c'est `ntp_demux` qui les sépare des requêtes clientes.
-Un autre port source demanderait de modifier le filtre de port de `udp4_rx`/`udp6_rx`.
-
-### 2. `ntp_demux` (T4.2a), devant `ntp_server`
-
-Couper les canaux entre les UDP RX et le serveur :
-
-- IPv4 : `n4m_tx`/`n4p_tx` (sorties `ntp_meta`/`ntp` de `udp4_rx`) → **demux** → `server.meta4`/`req4`
-  (mode 3) et entrée réponses IPv4 du client (mode 4) ;
-- IPv6 : `n6m_tx`/`n6p_tx` (`udp6_rx`) → demux → `server.meta6`/`req6` et réponses IPv6 du client.
-
-Le serveur prend `meta4`/`meta6` indépendamment de la charge utile et lit la charge utile sans jamais la
-bloquer : le demux doit respecter le même contrat (un `Meta` avant ou avec le premier octet, la charge
-utile complète ensuite). Chaque liaison par `chan()` (registrée).
-
-### 3. Résolution d'adresses
-
-- **IPv4 (ARP, existant)** : `arp.resolve` (`Rx<U<32>>`, aujourd'hui `idle_resolve` → canal `res_tx`) et
-  `arp.lookup` (`Rx<U<32>>`, `idle_lookup` → `lk_tx`) viennent du client ; `arp.lookup_rsp`
-  (`ArpEntry`, canal `lr_rx`, aujourd'hui `drain_lookup`) va au client. Amont hors sous-réseau
-  (`netmask`) : résoudre `gateway`. Les requêtes ARP partent déjà par la source 0 de `tx_arb`.
-- **IPv6 (cache de voisins)** : le client demande l'adresse MAC d'un amont (ou de `gateway6` hors lien).
-  Le cache doit :
-  - émettre des NS : par un constructeur IPv6. `IpArb6` a ses deux entrées prises (`icmp6`, `udp6_tx`) :
-    soit l'étendre à 3 entrées, soit donner au cache son propre `ipv6_tx` sur la **source 3 de
-    `tx_arb`** (aujourd'hui `idle_h3`/`idle_p3`, canaux `h3_tx`/`p3_tx`) ;
-  - recevoir les NA : `icmpv6` les avale (il ne répond qu'aux échos et aux NS). Il faut un démultiplexeur
-    sur la sortie ICMPv6 de `ipv6_rx` (canaux `i6m_tx`/`i6p_tx`) : type 136 vers le cache, le reste vers
-    `icmp6`.
-
-### 4. Arbitres d'émission UDP
-
-`udp4_tx` et `udp6_tx` n'ont qu'une paire d'entrée, occupée par `route` (réponses du serveur, canaux
-`q4`/`y4`, `q6`/`y6`). Ajouter devant chacun un arbitre 2 entrées (copie de `IpArb4`/`IpArb6` de
-`rtl/src/ip_arb.rs` pour `UdpTxReq`/`Udp6TxReq`) : source 0 = `route`, source 1 = client. La latence K
-du T3 (`ntp_reply_route.rs`) suppose un chemin libre ; une requête cliente devant une réponse la décale
-d'une trame (rare : une requête par amont et par intervalle de poll).
-
-### 5. Sources de `tx_arb`
-
-| Source | Phase A | Proposition phase B |
+| De | Vers | Type |
 |---|---|---|
-| 0 | ARP (réponses et requêtes) | inchangé |
-| 1 | `ipv4_tx` (`IpArb4` : ICMP, UDP) | inchangé (le client passe par `udp4_tx`) |
-| 2 | `ipv6_tx` (`IpArb6` : ICMPv6, UDP) | inchangé |
-| 3 | inactive | NS du cache de voisins (son `ipv6_tx`) |
+| `udp4_rx`, `udp6_rx` (paire NTP) | `demux4`, `demux6` (`NtpDemux`) | `Meta`, `FrameByte` |
+| sorties `srv` des démux | `server.meta4/req4`, `.meta6/req6` | `Meta`, `FrameByte` |
+| sorties `cli` des démux | `cmerge` (`MetaArb`, sources 0 = v4, 1 = v6) → `client.meta`, `.rep` | `Meta`, `FrameByte` |
+| `route` (réponses serveur) | `uarb4` / `uarb6` source 0 | `UdpTxReq` / `Udp6TxReq`, `FrameByte` |
+| `client.req4/pay4`, `.req6/pay6` | `uarb4` / `uarb6` source 1 | idem |
+| `uarb4` / `uarb6` (`UdpArb4`/`UdpArb6`, `rtl/src/udp_arb.rs`) | `udp4_tx` / `udp6_tx` | idem |
+| `client.arp_lookup`, `.arp_resolve` | `arp.lookup`, `.resolve` | `U<32>` |
+| `arp.lookup_rsp` | `client.arp_rsp` | `ArpEntry` |
+| `client.nd_lookup` / `nbr.rsp` | `nbr.lookup` / `client.nd_rsp` (`NbrCache`, `flush` = 0) | `U<128>` / `ArpEntry` |
+| `client.nd_resolve` | `icmp6.resolve` (émission des NS) | `U<128>` |
+| `icmp6.learn` | `nbr.learn` (appris des NA et des NS) | `NdLearn` |
+| `client.samples`, `.miss` | `sync.samples`, `.miss` (`ClientSync`) | `Sample`, `U<2>` |
+| configuration | tous les fils du client (`up0..3`, adresses, masque, passerelles, `poll_log2`, `precision`) | fils |
+| `clock.time` | client (`time`) | fil |
+| constantes | `client.tx_latency4/6` = `TX_LATENCY_V4/V6` de `ntp_reply_route.rs` | fils |
+| `route.tx_latency` + 10 ns (`lat`, `LatAdj`) | `server.tx_latency` | fil |
 
-### 6. `ConfigSet`
+Chaque liaison entre deux unités est un `chan()` registré ; `tx_arb` source 3 et `tx_path.stamps` restent
+sur des unités `Idle` / `Drain`. Synchronisation (inchangée) : `ClientSync` donne `synced`, `stratum`,
+`ref_id` = `ref_id6`, `ref_ts`, `root_delay`, `root_disp` du serveur et `trim`/`step` de l'horloge ;
+`peer_ref0..3` = `top::peer_ref` (`refid_ipv4` ou MD5 de l'adresse IPv6 de l'emplacement). Le serveur met
+`ref_id` dans les réponses IPv4 et `ref_id6` dans les IPv6 : les deux valent l'identifiant du pair système,
+quelle que soit la famille de la requête (RFC 5905), vérifié en simulation pour un pair IPv4.
 
-Les emplacements amont (`UPSTREAM[0..4]`) et `POLL_LOG2` sont déjà des sorties de `Config<C>`.
-`STRATUM_OFFSET` n'est lu par personne : `SyncState` annonce `stratum + 1` en dur. À trancher.
+## Fonctionnement des canaux
+
+- **Une réponse par recherche** : `arp` et `nbr` répondent à chaque `lookup` dans le cycle où ils le
+  prennent (ils ne le prennent que si leur canal de réponse a de la place) ; un `chan` ne perd rien ; le
+  client n'a qu'une recherche en cours (état `LWT`) et lit la réponse de la famille demandée.
+- **Requêtes et réponses sur le fil** : ARP, une réponse à une requête reçue passe avant une requête de
+  résolution en attente (décision quand la sortie est libre) ; NS, `icmp6` ne prend un `resolve` qu'entre
+  deux messages et un `resolve` en attente retient le message reçu suivant ; UDP, `uarb4`/`uarb6`
+  alternent des datagrammes entiers (tourniquet, jamais d'entrelacement) ; `tx_arb` est un tourniquet.
+- **Latences d'émission** : l'arbitre ajoute un étage de canal au chemin du serveur (`route → uarb →
+  udp*_tx`), compensé par `SERVER_ARB_ADJ` (+10 ns) ; le chemin du client (`client → uarb → udp*_tx`) a
+  autant d'étages que le chemin calibré (`server → route → udp*_tx`), il reprend les constantes K telles
+  quelles. Mesuré à 25 MHz sur les huit phases de `clk_tx` (pas de 5 ns) : T1 du client et T3 du
+  serveur dans **-25..+10 ns**, la même fenêtre que le top serveur seul sur ces huit phases (les cinq
+  phases de `rtl/tests/top.rs` n'en voient que -10..+10 ns).
+
+## Vérification (`rtl/tests/top_client.rs`)
+
+Au niveau système (broches MII, cycle exact) : au démarrage, requête ARP et NS (vers le groupe
+solicited-node) octet pour octet ; après la réponse ARP / la NA, requêtes NTP IPv4 et IPv6 octet pour
+octet (modèle `client.py::build_request`, ports 123 → 123, sommes de contrôle, MAC apprise, source
+lien-local pour l'amont `fe80::99`) ; T1 converti en temps réel contre le SFD ; une réponse falsifiée
+(Origin faux) n'atteint pas le filtre, la bonne y arrive (offset et délai exacts à partir de T1..T4) ;
+une réponse du serveur qui rencontre la requête du client dans `uarb4` attend la fin du paquet du client
+(paquets entiers), les deux trames sont exactes ; synchronisation de bout en bout : les quatre
+échantillons de l'iburst rendent le pair éligible, le servo **fait un pas** de l'horloge réelle (+100 s,
+exactement le pas commandé), puis le serveur répond en IPv4 et IPv6 avec LI 0, strate 3 et
+l'identifiant de 192.0.2.99.
+
+Ces tests utilisent `WarpClock<A>` (`top_client.rs`, **simulation seulement**, absent des cartes) : une
+seconde NTP dure 1e8 / A cycles (A = 1 000 ou 10 000) pour atteindre les délais du client (15,6 ms de
+réessai, iburst à 2 s, échéance 1..2 s). Le comportement au cycle près est inchangé ; les valeurs
+absolues des horodatages ne valent plus rien (les biais fixes en ns ne sont pas mis à l'échelle), d'où la
+conversion de T1 en temps réel par une sonde sur les registres de l'horloge.
+
+Au niveau des unités seulement : règles fines du client (échéances, abandon après 8 recherches,
+désactivation d'un emplacement, KoD, strate 16, arithmétique sur tous les vecteurs), du filtre, de la
+sélection, du servo (FREQ/SYNC, pointes, PANIC) et de l'état de synchronisation, du cache de voisins ;
+le fonctionnement sur des intervalles de poll réels (64 s) et la convergence du servo.
+
+## Ressources
+
+`top_gen -- --with-client` : 52 modules (45 pour `ArtyBoard`), une netlist + l'enveloppe, `files.f`
+inchangé. Yosys (`hierarchy -check`, `proc`, `check -assert`, `synth_xilinx` jusqu'à `map_luts`) :
+**29 255 bascules** (14 950 pour `ArtyBoard`), 332 `RAM64M`, 167 `RAM32M` (11). Environ 5 600 bascules
+pour `ClientSync`, 1 600 pour le client et le cache ; le reste est surtout dans les canaux registrés
+(deux mots par canal, `Meta` fait 401 bits, `Selected`/`PeerStat` ~500 bits).
+
+## Limites restantes
+
+1. **T1 suppose un chemin d'émission libre** (comme T3) : une requête qui attend derrière une autre trame
+   part plus tard que son T1 annonce (une trame de 90 octets : ~9 µs à 100 Mb/s). C'est le cas au
+   démarrage (les deux emplacements font leur iburst en même temps : la seconde requête suit la première)
+   et à chaque poll tant que les emplacements gardent le même calendrier ; cela biaise l'offset de
+   l'amont servi en second de la moitié de l'attente. Remèdes possibles : horodatage pris sur
+   `tx_path.stamps`, ou espacement des requêtes (modification du client).
+2. Même chose pour T3 du serveur derrière une requête du client (rare : une requête par amont et par
+   poll).
+3. **ARP : une seule résolution en cours** ; si un saut IPv4 ne répond jamais, `arp` l'attend jusqu'à un
+   `flush` (relié à 0) et la résolution d'une autre adresse IPv4 reste bloquée. Sans effet avec un seul
+   amont IPv4 ou une seule passerelle, gênant avec deux sauts IPv4 dont un muet.
+4. Pas de vieillissement dans les caches ARP et de voisins (`flush` à 0).
+5. `STRATUM_OFFSET` n'est toujours lu par personne (`SyncState` annonce `stratum + 1`).
+6. `poll_log2` du client et du servo vient de la configuration (pas d'adaptation).
+7. Le démultiplexeur NTP bloque en tête de file (une réponse cliente non prise retient les requêtes
+   serveur derrière elle ; le client prend ses réponses en quelques cycles).

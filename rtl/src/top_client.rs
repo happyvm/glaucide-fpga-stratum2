@@ -90,7 +90,9 @@
 //! arbiter forward a byte in the cycle they pop it), so the client's
 //! `tx_latency4/6` are the route's constants unchanged
 //! ([`CLIENT_TX_LATENCY_V4`], [`CLIENT_TX_LATENCY_V6`]). Both are measured
-//! by `rtl/tests/top_client.rs` against the SFD instant (25 MHz MII). As
+//! by `rtl/tests/top_client.rs` against the SFD instant (25 MHz MII, the
+//! eight 5 ns phases of `clk_tx`): client T1 and server T3 errors are in
+//! -25..+10 ns, the window of the server-only top over the same phases. As
 //! for the server, the constants assume an idle transmit path: a frame
 //! that queues behind another (server reply behind a client request or
 //! the reverse, ARP, NS, echo) leaves later than its timestamp says.
