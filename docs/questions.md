@@ -19,3 +19,16 @@
    de `clk_sys`. **Demande :** rendre `MiiRx<C: Clock>` et `MiiTx<C: Clock>` génériques (comme
    `RxPath<R, S>`, avec `pub type MiiRxPhy = MiiRx<ClkRx>`), ce qui permettrait des tests sur broches à
    25 MHz.
+3. **T4.2c : étalement du client, délai d'expiration d'ARP, `STRATUM_OFFSET` retiré.** (a) `NtpClient`
+   étale les créneaux : le créneau `i` démarre son iburst à `t0 + i/4 s` (la planification est
+   désormais en ticks de 2^-6 s, et non en secondes entières) ; deux requêtes ne sont plus jamais dues
+   ensemble, donc T1 (prédit pour un chemin d'émission libre) reste exact. **À confirmer :** le pas
+   de 1/4 s par créneau et le départ relatif à l'armement du créneau (pas de `t0` global). (b) `Arp`
+   abandonne une résolution sans réponse après `ARP_TIMEOUT_CYCLES` = 2^26 cycles (≈ 0,67 s) ; un
+   voisin muet retarde donc les autres adresses d'au plus ce délai. `Arp` reste le nom du type de la
+   carte (`ArpWith<Board>`) ; `Sim`/`Formal` pour les tests et la preuve. **À faire côté
+   orchestrateur :** les `check!` de `arp.rs` valent toujours, mais la preuve formelle doit couvrir
+   le compteur `tmo` et l'expiration (`ArpWith::<Formal>`, `formal_gen.rs` utilise encore `Arp`).
+   (c) `ConfigSet::STRATUM_OFFSET` et le fil `stratum_offset` de `Config` sont supprimés (le `+ 1` est
+   fixé par le protocole, voir l'en-tête de `sync_state.rs`) ; `docs/top-client-hooks.md` ligne 110
+   (point 5) est à retirer.

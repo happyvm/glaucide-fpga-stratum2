@@ -567,7 +567,7 @@ struct TxFrame {
 struct Probes {
     acc: Reg<U<96>>,
     warp: Option<Reg<U<96>>>,
-    m_fl: txhdl::comp::Mem<U<10>, 4>,
+    m_fl: txhdl::comp::Mem<U<11>, 4>,
     m_t1: txhdl::comp::Mem<U<64>, 4>,
     rid0: Reg<U<32>>,
     str0: Reg<U<8>>,
