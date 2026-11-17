@@ -1279,6 +1279,8 @@ fn dgram_of(f: &[u8]) -> (IpMeta, Vec<u8>) {
             len: U::<16>::from(seg.len() as u16),
             eth_src: U::<48>::from(be(&f[6..12]) as u64),
             ttl: U::<8>::from(f[22]),
+            // The chain test patches the receive stamp into `Meta` itself.
+            rx_ts: U::<64>::from(0u64),
         },
         seg,
     )
