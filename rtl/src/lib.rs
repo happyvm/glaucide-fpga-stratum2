@@ -19,6 +19,7 @@ pub mod ipv4_tx;
 pub mod ipv6_rx;
 pub mod ipv6_tx;
 pub mod mii_rx;
+pub mod ntp_demux;
 pub mod ntp_types;
 pub mod mii_tx;
 pub mod ntp_server;
