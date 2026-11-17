@@ -39,8 +39,8 @@ LEAK = 1 / 16
 WARMUP = 2
 
 MASK = (1 << 64) - 1
-TEST_SECRET = 0x1F2E_3D4C_5B6A_7988   # config::Test (the bridge's RATE_SECRET)
-BOARD_SECRET = 0xA5C3_9E27_4B1D_6F83  # config::Board
+TEST_SECRET = 0x770C_9A0D_583E_3A62   # config::Test (the bridge's RATE_SECRET; changed by the N1 fix)
+BOARD_SECRET = 0x376C_73AA_4CFD_2DDD  # config::Board
 NET = (172 << 24) | (18 << 16)        # ntpperf -s 172.18.0.0/16
 
 

@@ -152,13 +152,19 @@ def job(d, name):
                 open(os.path.join(bd_, "requests.csv"), newline="") as f2:
             ra, rb = list(csv.DictReader(f1)), list(csv.DictReader(f2))
         diff = [i for i in range(min(len(ra), len(rb))) if ra[i] != rb[i]]
-        same_cols = ("send_ns", "src_ip", "sport", "len", "bucket", "answered", "stratum", "resp_ns", "e2_ns", "e3_ns")
-        shifted = [i for i in diff if any(ra[i][k] != rb[i][k] for k in same_cols)]
+        same_cols = ("send_ns", "src_ip", "sport", "len", "bucket", "answered", "stratum")
+        changed = [i for i in diff if any(ra[i][k] != rb[i][k] for k in same_cols)]
+        # A request that waited behind a chronyd frame starts later on the wire (another MII phase): its
+        # stamp errors move within their usual +-0.2 ns quantisation, nothing else.
+        rng = (("resp_ns", 10019.8, 10020.2), ("e2_ns", -0.3, 0.1), ("e3_ns", 9.7, 10.1))
+        out = [i for i in diff if any(not lo <= float(ra[i][k]) <= hi for k, lo, hi in rng)]
+        shift = [int(ra[i]["wire_ns"]) - int(rb[i]["wire_ns"]) for i in diff]
         say(f"  ntpperf twin without chronyd: {len(ra)} / {len(rb)} requests, {len(ra) - len(diff)} log lines "
-            f"byte-identical, {len(diff)} differ (instants on the wire), {len(shifted)} differ in a send instant, "
-            f"source, answer or error column")
-        check(len(ra) == len(rb) and not shifted,
-              "ntpperf's request log without chronyd: same requests, same answers, same T3-T2 and stamp errors")
+            f"byte-identical, {len(diff)} differ (requests behind a chronyd frame, started on the wire "
+            f"{sorted(shift)} ns later; same send instant, source, answer)")
+        check(len(ra) == len(rb) and not changed and not out and all(x > 0 for x in shift),
+              "ntpperf's request log without chronyd: same requests and answers; only requests queued behind a "
+              "chronyd frame move on the wire, with T3-T2 and stamp errors still within +-0.2 ns of their usual values")
         for i in diff[:3]:
             say(f"         line {i}: wire {rb[i]['wire_ns']} -> {ra[i]['wire_ns']}, rx SFD {rb[i]['rx_sfd_ns']} -> "
                 f"{ra[i]['rx_sfd_ns']}")
@@ -177,12 +183,12 @@ def job(d, name):
     check(not bad, "no Invalid/Unacceptable/Rejected/error line in chronyd's log" + (f": {bad[:3]}" if bad else ""))
     ca.check_replies(d, True)
     nd = ca.ntpdata(d)
-    check(nd.get("Total TX") == nd.get("Total good RX") == nd.get("Total RX"),
-          f"chronyd's own counters: Total TX {nd.get('Total TX')}, RX {nd.get('Total RX')}, good RX "
-          f"{nd.get('Total good RX')}")
-    check(nd.get("NTP tests") == "111 111 1111" and nd.get("Leap status") == "Normal" and nd.get("Stratum") == "2",
-          f"chronyd's tests: NTP tests {nd.get('NTP tests')}, Leap status {nd.get('Leap status')}, "
-          f"Stratum {nd.get('Stratum')}")
+    check(nd.get("Total TX") == nd.get("Total RX") == nd.get("Total valid RX"),
+          f"chronyd's own counters: every reply received and valid (Total TX {nd.get('Total TX')}, RX "
+          f"{nd.get('Total RX')}, valid RX {nd.get('Total valid RX')})")
+    check(nd.get("Leap status") == "Normal" and nd.get("Stratum") == "2",
+          f"chronyd's last reply: Leap status {nd.get('Leap status')}, Stratum {nd.get('Stratum')}, "
+          f"NTP tests {nd.get('NTP tests')}")
     if not ex:
         return
     n = len(ex)
@@ -213,6 +219,13 @@ def job(d, name):
 
     ms = ca.measurements(d)
     check(len(ms) == n, f"{len(ms)} chrony samples (measurements.log) for {n} exchanges")
+    # chronyd's own noise rejection (test C, maxdelaydevratio: a delay far above the usual one is not
+    # used): it may refuse a sample, but only one whose request waited in the queue behind the load.
+    refused = [i for i in range(min(len(ms), n)) if ms[i]["tests"] != "111 111 1111"]
+    say(f"  samples refused by chronyd's own tests: {len(refused)} (polls {refused}); "
+        f"their request queue wait: {[qw[i] for i in refused]} ns; Total good RX {nd.get('Total good RX')} of {n}")
+    check(all(qw[i] > 40 for i in refused) and nd.get("Total good RX") == str(n - len(refused)),
+          "a sample refused by chronyd had a request that waited in the queue (the load's queueing), nothing else")
     k = min(len(ms), n)
     co = [ms[i]["offset"] * 1e9 for i in range(k)]
     cd = [ms[i]["delay"] * 1e9 for i in range(k)]

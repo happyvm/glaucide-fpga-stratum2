@@ -21,7 +21,12 @@ avec celui de `Test`, 3 000 clients consécutifs n'occupent que 1 498 cases et n
 lieu de 18,75 % (40,7 % avec un hachage aléatoire) ; correctif proposé (second tour de mélange). Avec le KoD,
 ntpperf compte les KoD comme des réponses valides (0 % perdu). IPv6 : non couvert (ntpperf est IPv4 seulement).
 Le couplage des temps est exact (chaque requête part à l'instant virtuel prévu par ntpperf) et **déterministe** ;
-le saut des cycles inactifs est validé bit à bit contre une simulation de chaque cycle.
+le saut des cycles inactifs est validé bit à bit contre une simulation de chaque cycle. **Scénario combiné** (3.7) :
+avec un chronyd qui interroge le même serveur, dans la même simulation, pendant la charge (de 2 000 à 105 000
+req/s), les chiffres de ntpperf ne changent pas (0,00 % de perte, T3 − T2 = 10 020 ns, σ 0 ; journal par requête
+identique octet pour octet à 2 000 req/s), chrony reste sur `^*` avec reach 377, aucune de ses 66 réponses n'est perdue
+ni retardée au-delà de l'attente de sa requête dans la file, et l'erreur d'horodatage du design vue par chrony reste
++4,0 ns pour chaque sondage.
 
 ## 1. Reproduire
 
@@ -30,6 +35,7 @@ tools/ntpperf/build.sh     # libpcap de remplacement, shim de temps, clone + mak
 tools/ntpperf/run.sh       # 13 tâches, 4 en parallèle, puis tools/ntpperf/analyse.py (code 1 si un contrôle échoue)
 tools/ntpperf/run.sh c-10k d-kod-1k     # seulement certaines tâches
 tools/ntpperf/run.sh --long             # + balayages complets de ntpperf, limiteur à 30 000 et 80 000 req/s, KoD à 10 000, validation du saut
+tools/mixed/run.sh [--base] [--long]    # scénario combiné : ntpperf + chronyd dans la même simulation (3.7), ≈ 16 min avec --base
 ```
 
 Durées mesurées (4 cœurs, `out/ntpperf/` et `target/` vidés au préalable) : `build.sh` **46 s** (clone de ntpperf,
@@ -47,7 +53,8 @@ Tâches par défaut : `a-sweep` (`-B -t 0.2 -r 1000-11390 -x 1.5`), `a-25k`, `a-
 -H] -r 1000`), `x-xleave-1k` (`-I -t 0.2 -r 1000`). Réseau commun : `-i sim0 -m 02:00:00:00:00:01 -d
 192.168.123.1 -s 172.18.0.0/16`.
 
-Fichiers ajoutés : `rtl/src/bin/ntpperf_bridge.rs` (le pont), `tools/ntpperf/pcap_shim/` (`pcap.h`, `pcap/pcap.h`,
+Scénario combiné (2.6, 3.7) : `tools/mixed/run.sh` et `tools/mixed/analyse.py` (options `--chrony-*` du même pont ;
+réutilisent `tools/chrony/` pour chronyd et le shim de temps de chronyd). Fichiers ajoutés : `rtl/src/bin/ntpperf_bridge.rs` (le pont), `tools/ntpperf/pcap_shim/` (`pcap.h`, `pcap/pcap.h`,
 `pcap.c` : la libpcap de remplacement ; `vtime.c` : le shim de temps ; `simlink.h` : le contrat avec le pont),
 `tools/ntpperf/build.sh`, `run.sh`, `analyse.py`, ce document. Aucun fichier existant n'est modifié (le binaire est
 découvert par Cargo dans `rtl/src/bin/`, pas de dépendance). ntpperf (GPL-2.0-or-later) est cloné dans
@@ -172,6 +179,42 @@ que soit le débit. D'où le choix de l'intervalle d'échantillonnage minimal de
 processus pour les débits élevés (exécutés en parallèle) et d'un balayage de ntpperf lui-même (`-r 1000-11390 -x
 1.5`, 7 points en une exécution) pour les faibles débits. Le balayage complet par défaut de ntpperf (`-r
 1000-200000 -x 1.5`, 14 points) prend **34 min** (2 018 s, 2,6·10⁸ cycles simulés, 4,4·10⁸ sautés, 6,98 s virtuelles) en un seul processus : il est dans `--long`.
+
+### 2.6 chronyd comme client de plus dans la même simulation (`--chrony-port`)
+
+Scénario combiné (`tools/mixed/run.sh`, résultats en 3.7) : **dans la même simulation** — la même instance du
+serveur, le même fil MII, le même temps virtuel — ntpperf génère la charge pendant qu'un **chronyd 4.9 réel**
+(`minpoll 0 maxpoll 0`, une requête par seconde environ) interroge le serveur comme un client de plus.
+Options du pont : `--chrony-port P` (socket UDP 127.0.0.1:P où chronyd interroge « le serveur »), `--chrony-shm F`
+(page de temps de chronyd, au format de `tools/chrony/vtime_shim.c`) et `--chrony-log CSV` ; sans elles le pont est
+exactement celui des sections précédentes. chronyd est lancé par `run.sh` sous `tools/chrony/vtime_shim.so`
+(`LD_PRELOAD`, `CHRONY_VTIME_SHM=F`), ntpperf par le pont sous son propre shim : **deux shims, deux pages
+partagées, un seul temps**.
+
+- **Participants du pas de temps.** Le pont fait avancer le temps seulement quand **tous** les processus de ntpperf
+  sont prêts (§2.3) **et** que chronyd est bloqué dans une attente (`W_WAITING`) sans reprendre une livraison en
+  cours ; la cible est la plus proche des échéances : celle de ntpperf (instant de la prochaine requête, quantum du
+  processus de mesure) et celle de chronyd (`W_DEADLINE`, le délai de son `select()`). Le temps publié (fin de
+  chaque avance, instant de chaque livraison à chronyd) est écrit dans **les deux pages**. Tant que chronyd calcule,
+  ou qu'un processus de ntpperf calcule, le temps est figé : les deux clients voient un hôte infiniment rapide.
+- **Requête de chronyd.** Un datagramme que chronyd a envoyé avant de se bloquer est lu sur la socket du pont ; il
+  l'a envoyé alors que le temps était figé, **le temps virtuel courant est donc son instant d'envoi T1**. Il devient
+  une trame Ethernet/IPv4/UDP (sommes correctes, port source = le vrai port de chronyd) de **192.168.123.2**
+  (02:00:00:00:00:03 : dans le sous-réseau du serveur, hors du réseau `-s 172.18.0.0/16` de ntpperf) vers le serveur,
+  qui entre dans **la même file d'émission** (FIFO, 64 Kio, rejet en queue, débit de ligne) que les requêtes de
+  ntpperf : elle attend derrière celles déjà en file, et la suivante attend derrière elle. Le journal `chrony.csv`
+  note `t1_ns` (envoi), `wire_ns` (début de la trame sur le fil : `wire_ns − t1_ns` est l'attente en file),
+  `rx_sfd_ns`, `tx_sfd_ns`, T2, T3, les erreurs e2/e3 et θ, δ calculés par le banc à partir de T1…T4.
+- **Réponses.** Chaque trame sur `txd` est démultiplexée par adresse IP destinataire : celles pour 192.168.123.2
+  repartent vers chronyd en UDP, depuis la socket du pont (donc avec l'adresse et le port que chronyd interroge), **à
+  l'instant virtuel où leur dernier quartet quitte les broches (T4)** ; la simulation s'arrête alors jusqu'à ce que
+  chronyd ait pris la livraison (même mécanisme que `chrony_bridge`), ce qui lui fait lire T4 exactement. Les autres
+  vont à ntpperf comme avant (jamais comptées « unmatched »).
+- **Fin de course.** Quand ntpperf se termine, chronyd dispose encore de 200 µs de temps virtuel pour recevoir ses
+  dernières réponses (aucune requête restée sans réponse du seul fait de l'arrêt).
+- **Ce que chronyd ne change pas du côté de ntpperf.** Les trames de chronyd sont environ 2 000 fois plus rares que
+  celles de ntpperf (à 2 000 req/s) et ne passent que par la file ; à 2 000 req/s le journal par requête de ntpperf est identique **octet
+  pour octet** avec et sans chronyd (3.7).
 
 ## 3. Résultats
 
@@ -417,6 +460,102 @@ les réponses entrelacées, d'où les colonnes vides. Comportement attendu, iden
 `-s` IPv4 seulement) ; le chemin IPv6 du design (`udp6_rx`, `udp6_tx`, limiteur indexé par /64) n'est pas exercé
 par ce test.
 
+### 3.7 f. Scénario combiné : chronyd interroge le serveur pendant la charge de ntpperf
+
+Méthode en 2.6. Commande : `tools/mixed/run.sh [--base] [--long]` (après `tools/chrony/build.sh` et
+`tools/ntpperf/build.sh`) ; ntpperf sans limiteur (`--rate-limit 0`), chronyd 4.9 avec `clockprecision 1e-9`, `-x`,
+une seule source `server 127.0.0.1 port P …`. Chaque tâche est une seule simulation ; `--base` lance en plus, pour
+chaque tâche, le même ntpperf **sans** chronyd (`<tâche>-base`) pour comparer. Vérifications :
+`tools/ntpperf/analyse.py` (perte, temps de réponse, vérité du banc, inchangées) puis `tools/mixed/analyse.py`
+(côté chronyd, comparaison avec la simulation sans chronyd), « all checks passed » pour les cinq tâches.
+
+| Tâche | ntpperf (charge) | chronyd (`server … `) | virtuel / simulé | durée réelle |
+|---|---|---|---|---|
+| `select` | `-B -t 12 -r 2000` (1,8 % de L) | `minpoll 0 maxpoll 0 iburst` | 12,30 s, 5,4·10⁷ cycles (1,18·10⁹ sautés) | 513 s |
+| `offset` | `-B -t 12 -r 2000` | `minpoll 0 maxpoll 0 noselect` | 12,30 s | 518 s |
+| `mid` | `-B -t 1 -r 20000` (18 % de L) | `minpoll -4 maxpoll -4 noselect` (16 sondages/s) | 1,30 s, 5,3·10⁷ cycles | 408 s |
+| `heavy` (`--long`) | `-B -t 1 -r 105000` (96 % de L) | `minpoll -3 maxpoll -3 noselect` (8/s) | 1,30 s, 1,2·10⁸ cycles | 1 130 s |
+| `sel-heavy` (`--long`) | `-B -t 1 -r 105000` | `minpoll -3 maxpoll -3 iburst` | 1,30 s | 1 120 s |
+
+(Durées réelles mesurées avec 4 simulations en parallèle sur 4 cœurs ; le coût d'une tâche est celui d'ntpperf seul,
+2 225 cycles simulés par requête à bas débit, ≈ 10⁸ cycles par seconde virtuelle près du débit de ligne, § 2.5 :
+c'est ce qui limite la charge possible pendant les 12 secondes virtuelles qu'il faut à chronyd pour atteindre
+`reach 377`. `run.sh --base` complet, 6 simulations : ≈ 16 min.)
+
+**Côté ntpperf : rien ne change.** Dans les cinq tâches : **0,00 % perdu, 0,00 % invalide**, aucune perte de la
+file, aucune trame erronée ou inattendue, **temps de réponse T3 − T2 = +10 020 ns, σ 0** (table de ntpperf), erreur
+de T3 contre le SFD émis +9,85 à +9,88 ns (σ 0,11 ; sans chronyd : +9,88), erreur de T2 −0,10 à −0,16 ns
+(sans chronyd : −0,14). Comparaison avec la **même charge sans chronyd** (`--base`) : à 2 000 req/s le journal par
+requête de ntpperf (`requests.csv` : instants d'émission, d'arrivée sur le fil, T2, T3, SFD émis, erreurs) est
+**identique octet pour octet** dans `select` (24 401 requêtes) et dans `offset` à une ligne près ; la table de
+ntpperf est identique dans les trois tâches comparées ; à 20 000 req/s, 23 996 des 24 001 lignes sont identiques et les 5 autres sont des requêtes **arrivées
+derrière une trame de chronyd** (début sur le fil 440 à 7 320 ns plus tard, T3 − T2 et erreurs de T2/T3 toujours
+dans leurs valeurs habituelles à ±0,2 ns près : l'horloge du design est lue à une autre phase). Les 126 009
+requêtes de `heavy` sont toutes répondues (pas de comparaison sans chronyd : 19 minutes de plus).
+
+**Côté chronyd : rien n'est perdu, rien n'est retardé au-delà de la file.**
+
+| Grandeur | `select` | `offset` | `mid` | `heavy` | `sel-heavy` |
+|---|---|---|---|---|---|
+| sondages / réponses (compteurs du pont) | 15 / 15 | 13 / 13 | 18 / 18 | 9 / 9 | 11 / 11 |
+| perdus, rejetés par la file, sans correspondance | 0 | 0 | 0 | 0 | 0 |
+| `Total TX` = `Total RX` = `valid RX` (chronyd) | 15 | 13 | 18 | 9 | 11 |
+| sondages dont la requête a attendu (> 40 ns) | 1 | 0 | 1 | 8 | 11 |
+| attente en file de la requête (min / moy / max, ns) | 5 / 554 / 7 985 | 5 / 23 / 25 | 5 / 257 / 4 225 | 25 / 4 583 / 8 705 | 225 / 4 350 / 8 805 |
+| **T4 − début de la requête sur le fil** (ns) | **18 215, constant** | 18 215 | 18 215 | 18 215 | 18 215 |
+| délai δ vu par chronyd (min…max, ns) | 8 200…16 180 | 8 200…8 220 | 8 200…12 420 | 8 220…16 900 | 8 420…17 000 |
+| δ − attente en file (ns) | 8 195 | 8 195 | 8 195 | 8 195 | 8 195…8 196 |
+| T3 − T2 des réponses de chronyd (ns) | 10 019,98 | 10 019,97 | 10 019,98 | 10 020,02 | 10 020,04 |
+| erreurs e2 / e3 des réponses de chronyd (ns) | −0,11 / +9,87 | −0,11 / +9,85 | −0,10 / +9,88 | −0,15 / +9,86 | −0,13 / +9,86 |
+
+- **Aucune réponse n'est retardée par la charge** : de la première nibble de la requête sur le fil au dernier
+  quartet de la réponse (T4), il s'écoule **18 215 ns pour chacun des 66 sondages**, de la charge nulle à 96 % du
+  débit de ligne (SFD à +600 ns, T3 − T2 = 10 010 ns SFD à SFD, 7 605 ns de réponse : 600 + 10 010 + 7 605). Le seul
+  retard est l'**attente de la requête dans la file de l'émetteur** (jusqu'à 8,8 µs à 96 % de charge : une
+  trame de 9,12 µs en cours d'émission, plus l'écart inter-trames) : **δ − attente = 8 195 ns, constant**, c'est-à-dire
+  que chronyd voit un délai de 8,2 µs (sans charge, § 5.3 de `docs/chrony-interop.md`) plus exactement le temps
+  que sa requête a attendu (δ monte à 17 µs dans `sel-heavy`), jamais plus. Le côté serveur n'a pas de file :
+  les réponses sont de la taille des requêtes (2.4, constat N2). Ce retard est celui du modèle de file d'un
+  commutateur/anneau de carte réseau ; il a lieu avant le design.
+- **L'offset de chronyd (`offset`, `mid`, `heavy` : `noselect`, offsets bruts) suit la vérité du banc**
+  (méthode du scénario `offset` de `docs/chrony-interop.md` § 5.3) : θ de chronyd = θ du banc à moins de 1 ns pour
+  chaque sondage (δ chronyd = δ banc à 0,2 ns) et **θ − θ_géom = +4,00 ns pour chacun des 40 sondages**
+  (θ_géom = ((SFD_rx − T1) + (SFD_tx − T4))/2 **avec** l'attente en file) : l'erreur d'horodatage du design vue par
+  chronyd, (e2 + e3)/2 = +4,9 ns tronquée à la nanoseconde par chronyd, ne dépend pas de la charge. Ce qui dépend
+  de la charge, c'est la géométrie : θ passe de −3 486 ns (sans attente) à +854 ns (attente de 8,7 µs, offset
+  de la requête ≈ attente/2) : σ de θ = 2,8 ns (`offset`, 2 000 req/s), 495 ns (`mid`), 1 461 ns (`heavy`). C'est
+  l'asymétrie d'un chemin aller qui attend (file) et d'un chemin retour qui n'attend pas, une propriété du réseau
+  simulé, pas un biais du design (cf. `chrony-interop.md` C9).
+- **chrony sélectionne toujours le serveur** (`select`, `sel-heavy`) : `^* localhost 2 0 377 0 −10ns[−10ns] +/− 31ms`
+  (`select`, charge 1,8 %) et `^* localhost 2 −3 377 0 +273ns[+908ns] +/− 31ms` (`sel-heavy`, 96 % de la charge,
+  11 sondages tous retardés de 0,2 à 8,8 µs) ; `Selected source 127.0.0.1` dans le journal, aucune ligne
+  `Invalid`/`Unacceptable`/`Rejected`, `Leap status Normal`, strate 2, reach 377 ; `tracking` : « System time 3,495 µs
+  fast » (3,486 µs sans charge, `fixed`), fréquence 0,000 ppm (0,679 ppm dans `sel-heavy` : ses mesures bougent de
+  ±4 µs d'un sondage à l'autre, il corrige son horloge virtuelle en conséquence). **chrony protège sa mesure du
+  retard de la file** : dans `select` un sondage dont la requête a attendu 7,985 µs (θ du banc +495 ns au lieu de
+  −3 485 ns, δ = 16,18 µs) est refusé par son propre test C (`NTP tests 111 111 1101`, `maxdelaydevratio` : un délai
+  très au-dessus de l'habituel) : `Total good RX 14` pour `Total RX 15`, la source reste `^*` ; de même un sondage sur
+  18 dans `mid`. À 96 % de charge, tous les délais varient et chronyd les accepte tous (0 refusé sur 20).
+  `analyse.py` exige qu'un échantillon refusé soit un échantillon dont la requête a attendu dans la file.
+
+Limites de ce scénario (honnêtement) :
+
+- Peu d'échantillons pour la file : chronyd sonde environ une fois par seconde (comme demandé), 12 s virtuelles
+  maximum à ce coût. À 2 000 req/s (`select`, `offset`) le fil n'est occupé que 1,8 % du temps : un sondage sur 28
+  seulement a attendu. Les tâches `mid` (16 sondages/s, `-r 20000`) et `heavy` (8/s, 96 % de charge, 19 minutes)
+  augmentent la densité des sondages, pas la durée : ce sont 66 sondages au total.
+- Charge sans limiteur (`--rate-limit 0`) ; avec le limiteur par défaut (8/s par source), le sondage unique de
+  chronyd (≤ 1/s) serait toujours répondu sauf collision de case avec des sources de ntpperf : non testé.
+- `FixedSync` (strate 2, champs de référence « golden ») : pas de servo du design ; une seule paire de phases MII ;
+  IPv4 seulement ; une seule instance de chronyd ; chronyd n'envoie que des requêtes de 90 octets, comme ntpperf :
+  pas de trafic de tailles mêlées (ICMP, ARP, N2). Les erreurs de T2 et T3 ne varient que de ±0,2 ns (une seule
+  paire de phases MII), y compris pour les requêtes décalées par une trame de chronyd (`mid`).
+- chrony ajoute sa propre gigue d'intervalle de sondage (1,00 à 1,02 s) tirée au hasard : le nombre et les instants
+  des sondages d'une exécution à l'autre varient (13 contre 12 sondages dans `offset`), le déterminisme du banc
+  (ntpperf octet pour octet) ne s'étend pas aux instants de chronyd.
+- Chronyd est interrogé sur `127.0.0.1` et son temps vient du pont ; il n'a toujours que des horodatages « daemon »
+  (pas de noyau ni de matériel) : le banc mesure le design, pas la pile d'un hôte.
+
 ## 4. Constats
 
 Aucun défaut de débit, de latence ni d'horodatage : pas de perte imputable au design, pas de croissance de la
@@ -454,7 +593,7 @@ autre trame aurait un T3 trop tôt de ce temps d'attente (limite documentée de 
 cas est inatteignable : les requêtes de 90 octets arrivent au plus au débit de ligne et chaque réponse de 90 octets
 part avant que la suivante soit prête (vérifié : erreur de T3 +9,88 ns, σ 0,12, à 105 000 et 125 000 req/s). Il le
 deviendrait avec un trafic mêlé (écho ICMP de grande taille, ARP, NA émis juste avant une réponse NTP) : non testé
-ici.
+ici (le scénario combiné 3.7 mêle un client chronyd à ntpperf, mais ses requêtes ont la même taille : pas de tailles mêlées).
 
 **N3 — ntpperf compte les KoD comme des réponses valides (outil, pas design).** Strate 0 non vérifiée : avec
 `--kod`, 0 % perdu et 0 % « invalid », temps de réponse minimal 0 et écarts `-o` absurdes (10¹⁷ ns) ; pour mesurer
@@ -477,7 +616,9 @@ coût d'un point à 0,5 s virtuelle (5 minutes de simulation au-delà de 45 000 
 - Plusieurs processus d'émission (`-p`), la distribution exponentielle des départs (`-e`) : les requêtes restent
   sérialisées par le fil, le design ne verrait pas de rafale plus dense qu'au débit de ligne.
 - Le trafic mêlé (ICMP, ARP, IPv6 en même temps que la charge NTP), qui seul pourrait faire attendre une réponse
-  dans `tx_path` (N2).
+  dans `tx_path` (N2). Le scénario combiné (3.7) ajoute un client NTP réel (chronyd) à la charge, pas de trafic d'une
+  autre taille ni d'un autre protocole ; ses limites (peu de sondages, charge sans limiteur, une instance) sont
+  listées en 3.7.
 - Les latences du PHY et du câble, la gigue de l'oscillateur, d'autres phases MII (une seule paire simulée, comme
   dans `chrony_bridge`), le limiteur sur une durée longue (fenêtres glissant sur 65 536 s) et des clients au-delà
   de 16 384 (plafond de ntpperf).
