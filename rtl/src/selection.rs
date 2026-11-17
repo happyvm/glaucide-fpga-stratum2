@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | `stats` | `Rx<PeerStat>` | one per update of a peer, from the clock filter (T4.3) |
 //! | `now` | `In<U<64>>` | our NTP time, 32.32 (ageing of the samples) |
+//! | `n_en` | `In<U<3>>` | number of enabled upstream slots (a configuration constant, `top.rs` `n_enabled`); start-up majority, step 3b |
 //! | `selected` | `Tx<Selected>` | one per `PeerStat` taken, to the servo (T4.5) and the sync state (T4.6) |
 //!
 //! # Timing and flow
@@ -24,7 +25,8 @@
 //!   with `valid = 0` also replaces it) and `now` is sampled (`now_r`): the
 //!   whole event uses that one value of `now`. `now` is not read otherwise.
 //! * The unit then computes for a fixed number of cycles that depends only on
-//!   the number of survivors `n` (below), with no other input:
+//!   the number of survivors `n` (below; an event stopped by the start-up
+//!   majority of step 3b counts as `n` = 0), with no other input:
 //!   [`event_cycles`] gives the cycle (counted from T = 0) in which
 //!   `selected` is offered, at most [`MAX_EVENT_CYCLES`] = 545 cycles
 //!   (5.45 µs at 100 MHz).
@@ -32,8 +34,9 @@
 //!   `ready`); exactly one `Selected` per `PeerStat` taken, in order. The
 //!   next `PeerStat` is taken at the earliest in the cycle after the
 //!   `Selected` is sent (no overlap: a stalled consumer stalls `stats`).
-//! * After reset the 4 peers are empty (all zero: `valid` = 0, ineligible)
-//!   and there is no previous system peer.
+//! * After reset the 4 peers are empty (all zero: `valid` = 0, ineligible),
+//!   there is no previous system peer, and `ever` = 0 (no valid selection
+//!   yet, step 3b).
 //!
 //! # Arithmetic (all exact integers; Q32 = 2^-32 s)
 //!
@@ -69,6 +72,23 @@
 //!    eligible peers with edge(low) ≤ θ ≤ edge(high); there is at least one
 //!    on success, and any two are less than 2·MAXDIST = 3 s (< 2^34 Q32)
 //!    apart (a majority of the intervals contains [low, high]).
+//!
+//!    **3b. Start-up majority** (security finding F4; RFC 5905's NSANE /
+//!    MINCLOCK in spirit). While `ever` = 0 (no valid selection since
+//!    reset), success also needs at least `n_en / 2 + 1` truechimers (floor):
+//!    1 enabled slot: 1 (the single source decides: the **residual risk**,
+//!    nothing else is possible; configure three or more upstreams); 2: both,
+//!    i.e. their intersection; 3: 2; 4: 3 (`n_en` above 4 asks for more than
+//!    the 4 peers can give: never). Otherwise there is no selection (as for
+//!    a failed intersection: `valid = 0`, the previous system peer is
+//!    cleared). `ever` := 1 with the first valid selection and stays 1 until
+//!    reset: afterwards the usual rules (a majority of the *eligible*
+//!    peers). Effect: the servo's start-up step (NSET, any size, `servo.rs`)
+//!    is no longer decided by the first source to reach 4 samples. The
+//!    hardware counts the truechimers for both allows (`n_t0`, `n_t1`, the
+//!    survivor tests below) and registers the comparisons (`g0`, `g1`) in
+//!    every cycle; FIN1 reads them (their inputs are final from the end of
+//!    INTER): no cycle is added.
 //!    Hardware: no sort; each of the 12 tuples is compared with the 12
 //!    (one comparison per cycle) to get its rank and the counts above. The
 //!    comparator is a two-stage pipeline (task T5.3): the edges of a pair
@@ -116,7 +136,8 @@
 //! # Deviations from RFC 5905 (decisions, see the report of T4.4)
 //!
 //! * The MAXDIST test is `rd < MAXDIST` (no `PHI·2^poll` allowance) and there
-//!   is no loop test on the reference ID (`fit`), no NSANE/MINCLOCK counts.
+//!   is no loop test on the reference ID (`fit`); no NSANE/MINCLOCK counts
+//!   except the start-up majority of step 3b.
 //! * Clustering runs the §11.2.2 test with the RMS selection jitter; the
 //!   A.5.5.1 pseudocode bugs (`qmax = q`, survivors gathered from all tuples)
 //!   are not reproduced.
@@ -137,6 +158,8 @@
 //!   `root_dist` < MAXDIST, its `stratum` in 1..=15, its `leap` ≠ 3; the
 //!   survivors are a subset of the eligible peers and number at least
 //!   `m − allow` > m/2 before clustering (a majority of the eligible peers).
+//! * `ever = 0` and `valid = 1` ⇒ the truechimers number at least
+//!   `n_en / 2 + 1` (step 3b); `ever` never returns to 0.
 //! * A falseticker (eligible, θ outside [low, high]) has `sv` = 0 and enters
 //!   none of `nn`, `dd`, `jj`: it does not influence `offset` or `jitter`.
 //!   Its own fields can change freely without changing the output, as long

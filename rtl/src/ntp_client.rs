@@ -7,7 +7,8 @@
 //! accepted reply into one [`Sample`] for the clock filter (T4.3), or a
 //! `miss` when a poll got no usable answer. Bit-exact specification: the
 //! Python model `tools/golden/ntpclient/client.py` (`build_request`,
-//! `make_sample`, `next_hop4`, `next_hop6`, `src6`), replayed against
+//! `nonce`, `make_sample`, `next_hop4`, `next_hop6`, `src6`, `kod_backoff`),
+//! replayed against
 //! `tools/golden/ntpclient/vectors/client.txt` by `rtl/tests/ntp_client.rs`.
 //!
 //! # Ports (flat, in this order)
@@ -28,6 +29,7 @@
 //! | `precision` | `In<U<8>>` | our precision, signed log2 s, two's complement (`PRECISION_LOG2`) |
 //! | `tx_latency4`, `tx_latency6` | `In<U<64>>` | K of the IPv4 / IPv6 transmit path, 2^-32 s (`ntp_server::TX_LATENCY_V4/V6`) |
 //! | `time` | `In<U<96>>` | clock accumulator; NTP time (32.32) = `time >> 32`, NTP seconds = bits 64..95 |
+//! | `rnd` | `In<U<64>>` | entropy word (`entropy.rs`), low 32 bits sampled in cycle S (« Origin nonce ») |
 //! | `meta`, `rep` | `Rx<Meta>`, `Rx<FrameByte>` | mode-4 replies from `ntp_demux`: one `Meta` then the UDP payload, `err` on `last` = bad datagram |
 //! | `arp_rsp`, `nd_rsp` | `Rx<ArpEntry>` | answers to `arp_lookup` / `nd_lookup` (one per lookup) |
 //!
@@ -41,6 +43,7 @@
 //! | `req6`, `pay6` | `Tx<Udp6TxReq>`, `Tx<FrameByte>` | IPv6 request to `udp6_tx`, same |
 //! | `samples` | `Tx<Sample>` | one per accepted reply (to the clock filter) |
 //! | `miss` | `Tx<U<2>>` | slot index of a poll counted as unanswered |
+//! | `rx_stamp` | `Out<U<64>>` | `Meta.rx_ts` of the last reply `Meta` taken (register `rxts`; 0 after reset): stirring input of the entropy unit |
 //!
 //! All channels must be registered channels or FIFOs (netlist note of
 //! `stream.rs`). The neighbor units must answer every lookup (exactly one
@@ -55,8 +58,9 @@
 //! examines), and `cs`, the slot of the event in progress (reply or request
 //! path). In every cycle the slot wires and the per-slot state are read,
 //! and written, at `ix` = `sp` in `SCAN`, `cs` in every other state.
-//! Per-slot state lives in three 4-word distributed RAMs read
-//! asynchronously at `ix`: `m_t1` (T1 of the outstanding request), `m_tm`
+//! Per-slot state lives in four 4-word distributed RAMs read
+//! asynchronously at `ix`: `m_t1` (T1, the clock reading of the outstanding
+//! request), `m_org` (the 32-bit fraction of the Origin nonce sent), `m_tm`
 //! (`last`: tick of the last poll start, or of the arming (see
 //! Scheduler), bits 95..64; `tsent`: NTP second at which T1 was sampled,
 //! 63..32; `rt`: tick of the last failed lookup, 31..0, a tick being 2^-6
@@ -66,7 +70,11 @@
 //! `burst` = polls started since enable (saturates at 4), bits 9..6
 //! `tries` = failed lookups of the current poll, bit 10 `arm` = the slot's
 //! start time `last` was taken, meaningful while `burst` = 0). All memories start at zero (no reset). At most one write per
-//! memory per cycle.
+//! memory per cycle. The Kiss-o'-Death state of slot i is in registers
+//! (reset 0): `kx<i>` (RATE back-off exponent, 0 = none), `kz<i>` (its
+//! tick mask, `2^(kx + 6) - 1` on 16 bits) and `dd<i>` (`dead`: DENY or
+//! RSTR received), read at `ix` like the RAMs and cleared with the flags
+//! when the slot is disabled (action 1).
 //!
 //! States: `SCAN` (idle: takes a reply or examines slot `sp`), reply path
 //! `RX` → `CHK` → `C2` → `SMP`, request path `LKP` → `LWT` → `REQ` →
@@ -98,8 +106,13 @@
 //!    **stagger** `sp * 2^-2 s` has elapsed since its arming; or `burst` >= 1
 //!    and `now_t - last >= I * 64` ticks with `I` = 2 s ([`IBURST_GAP_S`])
 //!    while `burst < 4`, else `I = 2^clamp(poll_log2, 4, 17)` s (sampled
-//!    then). The poll starts: `last` := `now_t`, `pend` := 1, `tries` := 0,
-//!    `arm` := 0, `burst` := min(burst + 1, 4).
+//!    then), **and** `now_t - last >= 2^(kx + 6)` ticks (the RATE back-off,
+//!    « Kiss-o'-Death » below; always true when `kx` = 0). The poll starts:
+//!    `last` := `now_t`, `pend` := 1, `tries` := 0, `arm` := 0, `burst` :=
+//!    min(burst + 1, 4). For a **dead** slot (`dd` = 1) the same, except
+//!    that `pend` stays 0 and the poll is counted as a miss at once (`cs`
+//!    := `sp`, `MISS`): no lookup, no request, and the clock filter sees an
+//!    unreachable peer every `2^poll` s.
 //!
 //!    **Staggered schedule.** All slots of a freshly enabled (or reset)
 //!    unit are armed within a few cycles of one another, at `t0` (to a few
@@ -167,8 +180,9 @@
 //! * `PAY`: the 48 bytes on `pay4` / `pay6`, one per cycle when the channel
 //!   has room, `last` on byte 47, `err` = 0: byte 0 = 0x23 (LI 0, VN 4,
 //!   mode 3), byte 2 = `poll_log2` (raw, sampled when byte 2 is sent), byte
-//!   3 = `precision` (sampled when byte 3 is sent), bytes 40..47 = T1 big
-//!   endian, every other byte 0 (Python `build_request`).
+//!   3 = `precision` (sampled when byte 3 is sent), bytes 40..47 = the
+//!   **Origin nonce** (below) big endian, every other byte 0 (Python
+//!   `build_request`).
 //!
 //! ## Transmit timestamp T1 (same rule as the server's T3)
 //!
@@ -182,6 +196,38 @@
 //! integration may need to add the cycles of an extra channel stage). In S
 //! `m_t1[cs]` := T1 and `tsent` := `now_s`; when byte 47 is sent, `out` :=
 //! 1, `pend` := 0, `sent` := 1, and the unit returns to `SCAN`.
+//!
+//! ## Origin nonce (security finding F3)
+//!
+//! T1 is our clock reading, predictable to about 7 bits for anyone who
+//! queries our server (`docs/security.md`, F3): sent as is, it lets an
+//! off-path attacker forge upstream replies. So the Transmit Timestamp of
+//! the request (bytes 40..47) is a **nonce**: `N = {T1[63:32], T1[31:0] ^
+//! rnd[31:0]}` with `rnd` sampled in cycle S (`entropy.rs`). In S
+//! `m_org[cs]` := `N[31:0]`; T1 itself goes to `m_t1` as before and is
+//! the only value the arithmetic uses. A reply is matched against `N`
+//! (`CHK`).
+//!
+//! * The **seconds** stay T1's: the nonce is a plausible timestamp (a
+//!   server copies it to the reply's Origin without interpreting it, RFC
+//!   5905 §8; a middlebox or a strict server sees a sane date), and the
+//!   seconds carry no secret anyway. Randomising low seconds bits would add
+//!   entropy but send a timestamp up to 2^k s off, which RFC 5905 does not
+//!   forbid but which data-minimisation leaves to a fully random field
+//!   (chrony): kept for future work.
+//! * The **32 fraction bits** are uniform when `rnd` is (XOR with T1's own
+//!   fraction keeps them uniform): ntpd only randomises the bits below its
+//!   precision; here all 32 are. Entropy budget: 32 bits per request, fresh
+//!   for every request (the generator advances every cycle). An off-path
+//!   attacker must match the exact 64-bit Origin (32 unknown bits) and also
+//!   the upstream's address, source port 123 and a reply that arrives
+//!   before the real one or the 1-2 s deadline: each forged packet succeeds
+//!   with probability 2^-32 (2^31 packets, about 190 GB at 90 bytes each,
+//!   for an even chance per poll), against 2^7 before. The bound assumes
+//!   the entropy unit's output is unknown to him: see `entropy.rs` for what
+//!   that rests on (per-device seed, network arrival jitter; no TRNG).
+//! * An on-path attacker sees the nonce and is not stopped by it (nor by
+//!   anything short of authentication, `docs/security.md` F7).
 //!
 //! # Reply path
 //!
@@ -197,12 +243,38 @@
 //!   ignored. When `last` is taken: dropped (back to `SCAN`, nothing sent)
 //!   if `err`, fewer than 48 bytes or not `hit`; else `CHK`.
 //! * `CHK` (slot `cs`): the reply is **authentic** iff `out` = 1, mode = 4,
-//!   VN = 3 or 4, and Origin == `m_t1[cs]` (anti-spoofing). Not authentic:
-//!   dropped, the request stays outstanding (a bogus reply never causes a
-//!   miss nor closes the request). Authentic: `out` := 0 (so a second reply
-//!   to the same request is dropped as not outstanding), and if stratum = 0
-//!   (KoD), stratum >= 16 or LI = 3 (alarm): `MISS` (the poll is counted as
-//!   a miss at once, no sample); else the first arithmetic stage, `C2`.
+//!   VN = 3 or 4, and Origin == `{m_t1[cs][63:32], m_org[cs]}`, the nonce
+//!   sent (anti-spoofing). Not authentic: dropped, the request stays
+//!   outstanding (a bogus reply never causes a miss nor closes the
+//!   request). Authentic: `out` := 0 (so a second reply to the same
+//!   request is dropped as not outstanding), and if stratum = 0 (KoD,
+//!   below), stratum >= 16 or LI = 3 (alarm): `MISS` (the poll is counted
+//!   as a miss at once, no sample); else the first arithmetic stage, `C2`.
+//!
+//! ## Kiss-o'-Death (security finding F9, RFC 5905 §7.4)
+//!
+//! An authentic reply of stratum 0 is a KoD; its kiss code is the Reference
+//! ID (bytes 12..15). In `CHK`, besides the miss:
+//!
+//! * `"RATE"` ([`KOD_RATE`]): back off. With `e` = max(clamp(`poll_log2`,
+//!   4, 17), `kx`), the exponent in use: if `e` < [`KOD_POLL_MAX`] (10),
+//!   `kx` := `e` + 1 and `kz` := `2^(e + 7) - 1`; else nothing (the
+//!   interval is already 2^10 s or more). The iburst ends (`burst` := 4).
+//!   The slot's polls are then at least `2^kx` s apart (scheduler action
+//!   4), so each RATE doubles the interval in use, up to 2^10 s, never below
+//!   the configured poll; it stays until reset or the slot is disabled.
+//! * `"DENY"` or `"RSTR"` ([`KOD_DENY`], [`KOD_RSTR`]): the slot is
+//!   **dead** (`dd` := 1, `burst` := 4) until reset (or until it is
+//!   disabled and enabled again, impossible on the board where `up<i>_en`
+//!   are synthesis constants): no lookup, no request any more, each later
+//!   poll start a miss.
+//! * Any other kiss code: no state change (one miss, as for an unusable
+//!   reply).
+//!
+//! A KoD acts only if it passes the Origin check: forging one is as hard as
+//! forging a reply (2^-32 per packet off path, F3). An on-path attacker can
+//! silence one upstream slot with a forged DENY; the selection's majority
+//! (F4, `selection.rs`) and three or more upstreams contain that.
 //! * `C2`, `SMP`: arithmetic (below); `SMP` sends the `Sample` when
 //!   `samples` has room and returns to `SCAN`.
 //! * `MISS`: sends `miss(cs)` when `miss` has room, returns to `SCAN`.
@@ -236,8 +308,9 @@
 //!
 //! # Deviations from RFC 5905 (v1 decisions)
 //!
-//! No poll adaptation from the reply's poll, no KoD `RATE`/`DENY` handling
-//! beyond counting the poll as missed, no duplicate test on T3 (the single
+//! No poll adaptation from the reply's poll (a RATE KoD only raises the
+//! slot's own interval, without ever lowering it again), no duplicate test
+//! on T3 (the single
 //! outstanding Origin makes a replay useless), no check of T2/T3 being
 //! nonzero, a fixed 1-2 s reply deadline instead of "until the next poll",
 //! and the reply is taken only from source port 123.
