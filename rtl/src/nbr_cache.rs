@@ -45,7 +45,7 @@ use crate::arp::ArpEntry;
 use crate::icmpv6::NdLearn;
 use txhdl::comp::{mux, Clock, DefaultClock, In, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{check, cover, lower, with, Trace};
 
 #[derive(Trace, Default)]
 pub struct NbrCache {
@@ -62,6 +62,11 @@ pub struct NbrCache {
     pub mac2: Reg<U<48>>,
     pub mac3: Reg<U<48>>,
     pub rr: Reg<U<2>>,
+    // Monitors (check!/cover! only): the last pair learned, and whether flush was high.
+    pub m_have: Reg<Bit>,
+    pub m_lip: Reg<U<128>>,
+    pub m_lmac: Reg<U<48>>,
+    pub m_fl: Reg<Bit>,
 }
 
 #[lower]
@@ -121,12 +126,39 @@ impl Unit<(Rx<NdLearn>, Rx<U<128>>, In<Bit>), (Tx<ArpEntry>,)> for NbrCache {
                 rsp.send(ArpEntry { found: lfound, mac: lmac });
             }
 
+            // ---- formal properties (orchestrator; docs/formal.md, rows "ARP" and "ICMPv6 / NDP") ----
+            let m_have = self.m_have.get();
+            let m_lip = self.m_lip.get();
+            let m_lmac = self.m_lmac.get();
+            check!(!(v0 & v1) | !Bit::from(ip0 == ip1), "no duplicate address in the cache (0,1)");
+            check!(!(v0 & v2) | !Bit::from(ip0 == ip2), "no duplicate address in the cache (0,2)");
+            check!(!(v0 & v3) | !Bit::from(ip0 == ip3), "no duplicate address in the cache (0,3)");
+            check!(!(v1 & v2) | !Bit::from(ip1 == ip2), "no duplicate address in the cache (1,2)");
+            check!(!(v1 & v3) | !Bit::from(ip1 == ip3), "no duplicate address in the cache (1,3)");
+            check!(!(v2 & v3) | !Bit::from(ip2 == ip3), "no duplicate address in the cache (2,3)");
+            check!(!(m_have & v0 & Bit::from(ip0 == m_lip)) | Bit::from(mac0 == m_lmac), "entry 0 holds the learned MAC");
+            check!(!(m_have & v1 & Bit::from(ip1 == m_lip)) | Bit::from(mac1 == m_lmac), "entry 1 holds the learned MAC");
+            check!(!(m_have & v2 & Bit::from(ip2 == m_lip)) | Bit::from(mac2 == m_lmac), "entry 2 holds the learned MAC");
+            check!(!(m_have & v3 & Bit::from(ip3 == m_lip)) | Bit::from(mac3 == m_lmac), "entry 3 holds the learned MAC");
+            check!(!(lk_take & m_have & Bit::from(lip == m_lip)) | (!lfound | Bit::from(lmac == m_lmac)), "a hit returns the MAC that was learned");
+            check!(!(lk_take & !lfound) | Bit::from(lmac == 0u8), "a miss returns mac 0");
+            check!(!(lk_take & !(v0 | v1 | v2 | v3)) | !lfound, "an empty cache never hits");
+            check!(!self.m_fl.get() | !(v0 | v1 | v2 | v3), "after a flush every entry is invalid, even with a learn in the same cycle");
+            check!(!self.m_fl.get() | Bit::from(rr == 0u8), "after a flush the pointer is cleared");
+            cover!(lk_take & lfound, "a lookup hits");
+            cover!(lk_take & !lfound, "a lookup misses");
+            cover!(ln & any_hit, "an address is updated in place");
+            cover!(ln & !any_hit & fl, "a learn is lost to a flush");
+            cover!(ln & !any_hit & Bit::from(rr == 3u8) & v0 & v1 & v2 & v3, "the fifth address evicts the first");
+
             with!(self <= {
                 w0 ? { v0: Bit::One, ip0: l.ip, mac0: l.mac },
                 w1 ? { v1: Bit::One, ip1: l.ip, mac1: l.mac },
                 w2 ? { v2: Bit::One, ip2: l.ip, mac2: l.mac },
                 w3 ? { v3: Bit::One, ip3: l.ip, mac3: l.mac },
                 ln & !any_hit ? rr: rr + 1,
+                ln ? { m_have: Bit::One, m_lip: l.ip, m_lmac: l.mac },
+                m_fl: fl,
                 fl ? {
                     v0: Bit::Zero,
                     v1: Bit::Zero,
