@@ -108,7 +108,7 @@
 use crate::ntp_types::{Selected, PHI_Q32};
 use txhdl::comp::{mux, Clock, DefaultClock, In, Out, Reg, Rx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{check, cover, lower, with, Trace};
 
 /// A `Selected` older than this many seconds no longer keeps us synchronised.
 pub const SYNC_TIMEOUT_S: u64 = 1024;
@@ -158,6 +158,26 @@ pub fn prec_floor(pr: U<8>) -> U<64> {
     )
 }
 
+/// `2^precision` in 32.32 written as a table (formal reference of
+/// [`prec_floor`]): `pr` is a signed log2, -32..=-1 gives `1 << (32 + pr)`,
+/// 0 and above `1 << 32`, below -32 `1`.
+#[lower]
+fn prec_table(pr: U<8>) -> U<64> {
+    mux(pr < 128, U::<64>::from(4294967296u64), mux(pr == 255, U::<64>::from(2147483648u64), mux(pr == 254, U::<64>::from(1073741824u64), mux(pr == 253, U::<64>::from(536870912u64), mux(pr == 252, U::<64>::from(268435456u64), mux(pr == 251, U::<64>::from(134217728u64), mux(pr == 250, U::<64>::from(67108864u64), mux(pr == 249, U::<64>::from(33554432u64), mux(pr == 248, U::<64>::from(16777216u64), mux(pr == 247, U::<64>::from(8388608u64), mux(pr == 246, U::<64>::from(4194304u64), mux(pr == 245, U::<64>::from(2097152u64), mux(pr == 244, U::<64>::from(1048576u64), mux(pr == 243, U::<64>::from(524288u64), mux(pr == 242, U::<64>::from(262144u64), mux(pr == 241, U::<64>::from(131072u64), mux(pr == 240, U::<64>::from(65536u64), mux(pr == 239, U::<64>::from(32768u64), mux(pr == 238, U::<64>::from(16384u64), mux(pr == 237, U::<64>::from(8192u64), mux(pr == 236, U::<64>::from(4096u64), mux(pr == 235, U::<64>::from(2048u64), mux(pr == 234, U::<64>::from(1024u64), mux(pr == 233, U::<64>::from(512u64), mux(pr == 232, U::<64>::from(256u64), mux(pr == 231, U::<64>::from(128u64), mux(pr == 230, U::<64>::from(64u64), mux(pr == 229, U::<64>::from(32u64), mux(pr == 228, U::<64>::from(16u64), mux(pr == 227, U::<64>::from(8u64), mux(pr == 226, U::<64>::from(4u64), mux(pr == 225, U::<64>::from(2u64), mux(pr == 224, U::<64>::from(1u64), U::<64>::from(1u32))))))))))))))))))))))))))))))))))
+}
+
+/// Formal reference of the root dispersion (module header): `sat32(rds +
+/// sat32(ceil48(T)))`, `T = dj * 2^32 + PHI * age` given as `hi * 2^32 + lo`.
+#[lower]
+fn rds_ref(rds: U<32>, hi: U<128>, lo: U<128>) -> U<32> {
+    let t = (hi << 32u32) + lo;
+    let up = mux(Bit::from(t.slice::<0, 48>() == 0), U::<128>::from(0u8), U::<128>::from(1u8));
+    let c = (t >> 48u32) + up;
+    let c32 = mux(Bit::from(c >= U::<128>::from(1u64 << 32)), U::<33>::from(0xFFFF_FFFFu32), c.slice::<0, 33>());
+    let sum = rds.zext::<33>() + c32;
+    mux(sum.bit(32), U::<32>::from(0xFFFF_FFFFu32), sum.slice::<0, 32>())
+}
+
 #[derive(Trace, Default)]
 pub struct SyncState {
     // ---- S: the last usable Selected ----
@@ -197,6 +217,48 @@ pub struct SyncState {
     pub o_rts: Reg<U<64>>,
     pub o_rdl: Reg<U<32>>,
     pub o_rds: Reg<U<32>>,
+    // ---- monitors (only read by check!/cover!; pruned in synthesis) ----
+    // The last usable Selected as it was popped, and whether one ever was.
+    pub ms_v: Reg<Bit>,
+    pub ms_ever: Reg<Bit>,
+    pub ms_peer: Reg<U<2>>,
+    pub ms_st: Reg<U<8>>,
+    pub ms_rdl: Reg<U<32>>,
+    pub ms_rds: Reg<U<32>>,
+    pub ms_delay: Reg<U<64>>,
+    pub ms_disp: Reg<U<64>>,
+    pub ms_jit: Reg<U<64>>,
+    pub ms_t4: Reg<U<64>>,
+    pub ms_upd: Reg<U<64>>,
+    // The outputs expected from it and from the wires, computed in one step
+    // from the module header, then delayed as the pipeline (x1, x2, x3).
+    pub x1_ok: Reg<Bit>,
+    pub x1_sst: Reg<U<8>>,
+    pub x1_pst: Reg<U<8>>,
+    pub x1_srdl: Reg<U<32>>,
+    pub x1_srds: Reg<U<32>>,
+    pub x1_rid: Reg<U<32>>,
+    pub x1_rts: Reg<U<64>>,
+    pub x1_rdl: Reg<U<32>>,
+    pub x1_rds: Reg<U<32>>,
+    pub x2_ok: Reg<Bit>,
+    pub x2_sst: Reg<U<8>>,
+    pub x2_pst: Reg<U<8>>,
+    pub x2_srdl: Reg<U<32>>,
+    pub x2_srds: Reg<U<32>>,
+    pub x2_rid: Reg<U<32>>,
+    pub x2_rts: Reg<U<64>>,
+    pub x2_rdl: Reg<U<32>>,
+    pub x2_rds: Reg<U<32>>,
+    pub x3_ok: Reg<Bit>,
+    pub x3_sst: Reg<U<8>>,
+    pub x3_pst: Reg<U<8>>,
+    pub x3_srdl: Reg<U<32>>,
+    pub x3_srds: Reg<U<32>>,
+    pub x3_rid: Reg<U<32>>,
+    pub x3_rts: Reg<U<64>>,
+    pub x3_rdl: Reg<U<32>>,
+    pub x3_rds: Reg<U<32>>,
 }
 
 #[lower]
@@ -290,6 +352,75 @@ impl
             let rds = sat32(self.p2_rds.get().zext::<96>() + sat32(c48).zext::<96>());
             let ok2 = self.p2_ok.get();
 
+            let o_ok = self.o_ok.get();
+
+            // ---- formal properties (orchestrator; docs/formal.md, row "État de synchro") ----
+            // The expected outputs, restated from the module header on the
+            // monitors (the Selected as popped) and the wires of this cycle.
+            let m_usable = s.valid & !Bit::from(s.stratum == 0) & Bit::from(s.stratum < 15);
+            let ms_v = self.ms_v.get();
+            let ms_st = self.ms_st.get();
+            let ms_upd = self.ms_upd.get();
+            let ms_t4 = self.ms_t4.get();
+            let m_stale = Bit::from(now >= ms_upd) & Bit::from(now - ms_upd > U::<64>::from(1024u64 << 32));
+            let e_ok = ms_v & servo_synced.get() & !m_stale;
+            let mp = self.ms_peer.get();
+            let e_rid = mux(mp == 0, peer_ref0.get(), mux(mp == 1, peer_ref1.get(), mux(mp == 2, peer_ref2.get(), peer_ref3.get())));
+            let e_rts = (ms_upd >> 32u32) << 32u32;
+            // root delay: source root delay + delay in 16.16 rounded up, saturated.
+            let md = self.ms_delay.get();
+            let md_up = (md >> 16u32) + mux(Bit::from(md.slice::<0, 16>() == 0), U::<64>::from(0u8), U::<64>::from(1u8));
+            let md32 = mux(Bit::from(md_up >= U::<64>::from(1u64 << 32)), U::<33>::from(0xFFFF_FFFFu32), md_up.slice::<0, 33>());
+            let md_sum = self.ms_rdl.get().zext::<33>() + md32;
+            let e_rdl = mux(md_sum.bit(32), U::<32>::from(0xFFFF_FFFFu32), md_sum.slice::<0, 32>());
+            // root dispersion: source root dispersion + (disp + max(jitter, 2^precision)) + PHI * age.
+            let m_floor = prec_table(precision.get());
+            let m_j = mux(Bit::from(self.ms_jit.get() < m_floor), m_floor, self.ms_jit.get());
+            let m_dj = self.ms_disp.get().zext::<128>() + m_j.zext::<128>();
+            let m_age = mux(Bit::from(now < ms_t4), U::<64>::from(0u8), now - ms_t4);
+            let e_rds = rds_ref(self.ms_rds.get(), m_dj, m_age.zext::<128>() * U::<128>::from(PHI_Q32));
+            // The same from the pipeline registers (induction: each stage holds its snapshot).
+            let f1_rds = rds_ref(self.p1_rds.get(), self.p1_dj.get().zext::<128>(), self.p1_age.get().zext::<128>() * U::<128>::from(PHI_Q32));
+            let f2_rds = rds_ref(self.p2_rds.get(), self.p2_dj.get().zext::<128>() + self.p2_phi.get().zext::<128>(), self.p2_plo.get().zext::<128>());
+            let o_stratum = mux(o_ok, self.o_st.get(), U::<8>::from(16u8));
+            let o_leap = mux(o_ok, U::<2>::from(0u8), U::<2>::from(3u8));
+            let x1_ok = self.x1_ok.get();
+            let x2_ok = self.x2_ok.get();
+            let x3_ok = self.x3_ok.get();
+            let fmask = U::<64>::from(0xFFFF_FFFF_0000_0000u64);
+            // S is the last usable Selected.
+            check!(!(self.v.get() ^ ms_v), "v: the last Selected popped was usable (valid, stratum 1..=14)");
+            check!(Bit::from(self.peer.get() == mp) & Bit::from(self.s_st.get() == ms_st) & Bit::from(self.s_rdl.get() == self.ms_rdl.get()) & Bit::from(self.s_rds.get() == self.ms_rds.get()), "S: peer, stratum, root delay and root dispersion of the last usable Selected");
+            check!(Bit::from(self.delay.get() == md) & Bit::from(self.disp.get() == self.ms_disp.get()) & Bit::from(self.jit.get() == self.ms_jit.get()) & Bit::from(t4 == ms_t4) & Bit::from(upd == ms_upd), "S: delay, dispersion, jitter, t4 of the last usable Selected and the time it was popped");
+            check!(!ms_v | (self.ms_ever.get() & Bit::from(ms_st >= 1) & Bit::from(ms_st <= 14)), "a usable source was popped and has stratum 1..=14");
+            // Each pipeline stage holds the expected snapshot.
+            check!(!(self.p1_ok.get() ^ x1_ok) & Bit::from(self.p1_st.get() == self.x1_pst.get()) & Bit::from(self.p1_rid.get() == self.x1_rid.get()) & Bit::from(self.p1_rdl.get() == self.x1_rdl.get()) & Bit::from((self.p1_upd.get() & fmask) == self.x1_rts.get()), "stage 1 holds ok, stratum + 1, our ref id, the root delay and the update time expected");
+            check!(Bit::from(self.p1_rds.get() == self.x1_srds.get()) & Bit::from(f1_rds == self.x1_rds.get()), "stage 1 holds the terms of the root dispersion expected");
+            check!(!(self.p2_ok.get() ^ x2_ok) & Bit::from(self.p2_st.get() == self.x2_pst.get()) & Bit::from(self.p2_rid.get() == self.x2_rid.get()) & Bit::from(self.p2_rdl.get() == self.x2_rdl.get()) & Bit::from((self.p2_upd.get() & fmask) == self.x2_rts.get()), "stage 2 holds ok, stratum + 1, our ref id, the root delay and the update time expected");
+            check!(Bit::from(self.p2_rds.get() == self.x2_srds.get()) & Bit::from(f2_rds == self.x2_rds.get()), "stage 2 holds the terms of the root dispersion expected");
+            check!(!x1_ok | (self.ms_ever.get() & Bit::from(self.x1_sst.get() >= 1) & Bit::from(self.x1_sst.get() <= 14) & Bit::from(self.x1_pst.get() == self.x1_sst.get() + U::<8>::from(1u8))), "stage 1 ok: a usable source of stratum 1..=14, to publish with one more");
+            check!(!x2_ok | (self.ms_ever.get() & Bit::from(self.x2_sst.get() >= 1) & Bit::from(self.x2_sst.get() <= 14) & Bit::from(self.x2_pst.get() == self.x2_sst.get() + U::<8>::from(1u8))), "stage 2 ok: a usable source of stratum 1..=14, to publish with one more");
+            check!(!x3_ok | (self.ms_ever.get() & Bit::from(self.x3_sst.get() >= 1) & Bit::from(self.x3_sst.get() <= 14) & Bit::from(self.x3_pst.get() == self.x3_sst.get() + U::<8>::from(1u8))), "stage 3 ok: a usable source of stratum 1..=14, to publish with one more");
+            check!(Bit::from(self.x1_rdl.get() >= self.x1_srdl.get()) & Bit::from(self.x1_rds.get() >= self.x1_srds.get()), "stage 1: the roots expected are never below those of the source");
+            check!(Bit::from(self.x2_rdl.get() >= self.x2_srdl.get()) & Bit::from(self.x2_rds.get() >= self.x2_srds.get()), "stage 2: the roots expected are never below those of the source");
+            check!(Bit::from(self.x3_rdl.get() >= self.x3_srdl.get()) & Bit::from(self.x3_rds.get() >= self.x3_srds.get()), "stage 3: the roots expected are never below those of the source");
+            // The outputs (RFC 5905 §7.3).
+            check!(Bit::from(self.o_st.get() == self.x3_pst.get()), "the output stage holds the stratum expected");
+            check!(!(o_ok ^ x3_ok), "synced iff, three cycles earlier, the last Selected was usable, the servo converged and the update was at most 1024 s old");
+            check!(!o_ok | self.ms_ever.get(), "synced only after a usable Selected");
+            check!(!o_ok | (Bit::from(o_stratum == self.x3_sst.get() + U::<8>::from(1u8)) & Bit::from(o_stratum >= 2) & Bit::from(o_stratum <= 15) & Bit::from(o_leap == 0)), "synced: stratum = stratum of the source + 1, in 2..=15, LI 0");
+            check!(o_ok | (Bit::from(o_stratum == 16) & Bit::from(o_leap == 3)), "not synced: stratum 16 and LI 3");
+            check!(!o_ok | Bit::from(self.o_rid.get() == self.x3_rid.get()), "synced: the reference id is ours for the peer of the source");
+            check!(!o_ok | Bit::from(self.o_rts.get() == self.x3_rts.get()), "synced: the reference timestamp is the time of the last update, whole seconds");
+            check!(Bit::from(self.o_rts.get().slice::<0, 32>() == 0), "the reference timestamp never carries a fraction (F10)");
+            check!(!o_ok | Bit::from(self.o_rdl.get() == self.x3_rdl.get()), "synced: root delay = sat32(source root delay + ceil16(delay))");
+            check!(!o_ok | Bit::from(self.o_rds.get() == self.x3_rds.get()), "synced: root dispersion = sat32(source root dispersion + ceil48((disp + max(jitter, 2^precision)) 2^32 + PHI age))");
+            check!(!o_ok | (Bit::from(self.o_rdl.get() >= self.x3_srdl.get()) & Bit::from(self.o_rds.get() >= self.x3_srds.get())), "synced: root delay and root dispersion are never below those of the source");
+            cover!(o_ok & Bit::from(o_stratum == 2), "synchronised to a stratum 1 source");
+            cover!(o_ok & Bit::from(o_stratum == 15), "synchronised to a stratum 14 source");
+            cover!(!o_ok & self.ms_ever.get() & ms_v, "a usable source but not synchronised");
+            cover!(o_ok & Bit::from(self.o_rds.get() == 0xFFFF_FFFFu32), "the root dispersion saturates");
+
             with!(self <= {
                 pop ? v: usable,
                 pop & usable ? {
@@ -331,16 +462,58 @@ impl
                     o_rdl: self.p2_rdl.get(),
                     o_rds: rds,
                 },
+                // Monitors.
+                pop ? ms_v: m_usable,
+                pop & m_usable ? {
+                    ms_ever: Bit::One,
+                    ms_peer: s.peer,
+                    ms_st: s.stratum,
+                    ms_rdl: s.root_delay,
+                    ms_rds: s.root_disp,
+                    ms_delay: s.delay,
+                    ms_disp: s.disp,
+                    ms_jit: s.jitter,
+                    ms_t4: s.t4,
+                    ms_upd: time.get().slice::<32, 64>(),
+                },
+                Bit::One ? {
+                    x1_ok: e_ok,
+                    x1_sst: ms_st,
+                    x1_pst: ms_st + U::<8>::from(1u8),
+                    x1_srdl: self.ms_rdl.get(),
+                    x1_srds: self.ms_rds.get(),
+                    x1_rid: e_rid,
+                    x1_rts: e_rts,
+                    x1_rdl: e_rdl,
+                    x1_rds: e_rds,
+                    x2_ok: x1_ok,
+                    x2_sst: self.x1_sst.get(),
+                    x2_pst: self.x1_pst.get(),
+                    x2_srdl: self.x1_srdl.get(),
+                    x2_srds: self.x1_srds.get(),
+                    x2_rid: self.x1_rid.get(),
+                    x2_rts: self.x1_rts.get(),
+                    x2_rdl: self.x1_rdl.get(),
+                    x2_rds: self.x1_rds.get(),
+                    x3_ok: x2_ok,
+                    x3_sst: self.x2_sst.get(),
+                    x3_pst: self.x2_pst.get(),
+                    x3_srdl: self.x2_srdl.get(),
+                    x3_srds: self.x2_srds.get(),
+                    x3_rid: self.x2_rid.get(),
+                    x3_rts: self.x2_rts.get(),
+                    x3_rdl: self.x2_rdl.get(),
+                    x3_rds: self.x2_rds.get(),
+                },
             });
 
-            let o_ok = self.o_ok.get();
             synced.set(o_ok);
-            stratum.set(mux(o_ok, self.o_st.get(), U::<8>::from(16u8)));
+            stratum.set(o_stratum);
             ref_id.set(self.o_rid.get());
             ref_ts.set(self.o_rts.get());
             root_delay.set(self.o_rdl.get());
             root_disp.set(self.o_rds.get());
-            leap.set(mux(o_ok, U::<2>::from(0u8), U::<2>::from(3u8)));
+            leap.set(o_leap);
         }
     }
 }
