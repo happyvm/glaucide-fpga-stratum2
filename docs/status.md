@@ -17,7 +17,7 @@ Serveur NTP **stratum 2, IPv4 + IPv6**, entièrement en logique, sur Arty A7-100
 | Horloge, config, top | `clock` (`DisciplinedClock`), `config` (statique, sans DHCP), `top`, `top_client`, `ip_arb`, `udp_arb` |
 
 **Vérification**
-- ~160 000 lignes de test et de code Rust/Python : 38 suites de tests Rust, 59 + 81 tests Python (modèles de référence : `tools/golden/` pour le protocole, `tools/golden/ntpclient/` pour filtre/sélection/servo/client).
+- ≈ 36 000 lignes de Rust (≈ 15 800 de source, ≈ 20 100 de test) plus les modèles Python : 38 suites de tests Rust, 59 + 81 tests Python (modèles de référence : `tools/golden/` pour le protocole, `tools/golden/ntpclient/` pour filtre/sélection/servo/client).
 - Preuves formelles (SymbiYosys) : voir `docs/formal-report.md`.
 - Estimation de ressources : `docs/resources.md` (≈ 15 % des LUT pour le serveur ; la carte avec client compte environ 29 000 bascules sur 126 800).
 
