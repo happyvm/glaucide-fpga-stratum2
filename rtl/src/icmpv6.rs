@@ -501,7 +501,7 @@ impl
                 & !is_nsi
                 & !(is_g & (Bit::from(pos == 2) | Bit::from(pos == 3)));
             let end_out = send_o & Bit::from(oc == 3) & abort;
-            let rst = end_in | end_out;
+            let end_all = end_in | end_out;
             with!(self <= {
                 take ? {
                     pos: pos + U::<16>::from(1u16),
@@ -616,7 +616,7 @@ impl
                     sseen: Bit::Zero,
                     sbad: Bit::Zero,
                 },
-                rst ? {
+                end_all ? {
                     st: U::<4>::from(GATHER),
                     pos: U::<16>::from(0u16),
                     oc: U::<5>::from(0u8),

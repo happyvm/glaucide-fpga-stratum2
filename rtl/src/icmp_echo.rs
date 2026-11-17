@@ -186,7 +186,7 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<IpTxReq>, Tx<FrameByte>)> for IcmpEch
             let to_out = take & ((p2 & last) | p3);
             let end_in = take & last & !(is_g & (Bit::from(pos == 2) | Bit::from(pos == 3)));
             let end_out = send_o & Bit::from(oc == 3) & abort;
-            let rst = end_in | end_out;
+            let end_all = end_in | end_out;
             with!(self <= {
                 take ? {
                     pos: pos + U::<16>::from(1u16),
@@ -210,7 +210,7 @@ impl Unit<(Rx<IpMeta>, Rx<FrameByte>), (Tx<IpTxReq>, Tx<FrameByte>)> for IcmpEch
                     oc: oc + U::<2>::from(1u8),
                 },
                 send_o & Bit::from(oc == 3) ? st: U::<2>::from(PASS),
-                rst ? {
+                end_all ? {
                     st: U::<2>::from(GATHER),
                     pos: U::<16>::from(0u16),
                     acc: U::<32>::from(0u32),
