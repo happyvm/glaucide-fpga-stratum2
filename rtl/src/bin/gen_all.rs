@@ -27,6 +27,11 @@ fn main() {
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
         Some("tx_arb") => print!("{}", TxArb::verilog("tx_arb")),
         Some("tx_path") => print!("{}", TxPath::verilog("tx_path")),
+        Some("rx_path") => print!("{}", ntp_fpga::rx_path::RxPathMii::verilog("rx_path")),
+        Some("phy_init") => print!(
+            "{}",
+            ntp_fpga::phy_init::PhyInit::<ntp_fpga::phy_init::Board>::verilog("phy_init")
+        ),
         other => {
             eprintln!("unknown module {other:?}");
             std::process::exit(1);

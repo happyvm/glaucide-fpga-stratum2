@@ -18,9 +18,17 @@ fn main() {
         Some("eth_tx") => print!("{}", EthTx::verilog("eth_tx")),
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
         Some("tx_arb") => print!("{}", TxArb::verilog("tx_arb")),
-        Some("disciplined_clock") => print!("{}", DisciplinedClock::verilog("disciplined_clock")),
         // 16-byte buffer instance: the proof does not need the real depth.
         Some("tx_path") => print!("{}", TxPathFormal::verilog("tx_path")),
+        Some(u @ ("rx_ingress" | "rx_egress")) => {
+            print!("{}", ntp_fpga::rx_path::formal_verilog(u))
+        }
+        // Shrunken timing instance: same logic, short delays.
+        Some("phy_init") => print!(
+            "{}",
+            ntp_fpga::phy_init::PhyInit::<ntp_fpga::phy_init::Formal>::verilog("phy_init")
+        ),
+        Some("disciplined_clock") => print!("{}", DisciplinedClock::verilog("disciplined_clock")),
         other => {
             eprintln!("unknown unit {other:?}");
             std::process::exit(1);
