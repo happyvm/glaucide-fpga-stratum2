@@ -461,8 +461,11 @@ pub struct NtpClient {
     pub kx1: Reg<U<4>>,
     pub kx2: Reg<U<4>>,
     pub kx3: Reg<U<4>>,
-    /// Regular poll interval of slot i in ticks, `2^max(clamp(poll_log2),
-    /// kx<i>) * 64`, registered every cycle (one cycle behind its inputs).
+    /// Regular poll interval of slot i as a tick mask: the ticks count `T`
+    /// = `2^max(clamp(poll_log2), kx<i>) * 64` (a power of two) is stored as
+    /// `-T` mod 2^32 (the bits at and above log2 T), so that `since >= T`
+    /// is `since & pt != 0` (no carry chain); registered every cycle (one
+    /// cycle behind its inputs).
     pub pt0: Reg<U<32>>,
     pub pt1: Reg<U<32>>,
     pub pt2: Reg<U<32>>,
@@ -730,7 +733,12 @@ impl
                 mux(c0, self.pt3.get(), self.pt2.get()),
                 mux(c0, self.pt1.get(), self.pt0.get()),
             );
-            let ival_t = mux(in_burst, U::<32>::from(IBURST_GAP_S << 6), pt_s);
+            // Iburst: 2 s = 2^7 ticks, mask -2^7.
+            let ival_m = mux(
+                in_burst,
+                U::<32>::from(0u8) - U::<32>::from(IBURST_GAP_S << 6),
+                pt_s,
+            );
             let pcl = poll_clamp(poll_log2.get());
             let kxw = kx_s.zext::<8>();
             let ecur = mux(kxw > pcl, kxw, pcl);
@@ -746,7 +754,7 @@ impl
             let due = mux(
                 Bit::from(f_burst == U::<3>::from(0u8)),
                 f_arm & Bit::from(since >= stagger),
-                Bit::from(since >= ival_t),
+                Bit::from((since & ival_m) != U::<32>::from(0u8)),
             );
             let rt_ok = Bit::from(f_tries == U::<4>::from(0u8))
                 | Bit::from((now_t - m_rt) >= U::<32>::from(RETRY_TICKS));
@@ -1057,10 +1065,10 @@ impl
 
             with!(self <= {
                 oke: org_eq,
-                pt0: poll_secs(pe0) << 6u32,
-                pt1: poll_secs(pe1) << 6u32,
-                pt2: poll_secs(pe2) << 6u32,
-                pt3: poll_secs(pe3) << 6u32,
+                pt0: U::<32>::from(0u8) - (poll_secs(pe0) << 6u32),
+                pt1: U::<32>::from(0u8) - (poll_secs(pe1) << 6u32),
+                pt2: U::<32>::from(0u8) - (poll_secs(pe2) << 6u32),
+                pt3: U::<32>::from(0u8) - (poll_secs(pe3) << 6u32),
                 t1p: now.slice::<32, 64>() + mux(s_v6, tx_latency6.get(), tx_latency4.get()),
                 is_scan ? pri: !self.pri.get(),
                 take_m ? {
