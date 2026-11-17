@@ -23,6 +23,7 @@ pub mod mii_tx;
 pub mod ntp_server;
 pub mod phy_init;
 pub mod rx_path;
+pub mod servo;
 pub mod stream;
 pub mod tx_arb;
 pub mod tx_path;
