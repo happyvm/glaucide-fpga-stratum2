@@ -71,6 +71,18 @@ class StartupStep(unittest.TestCase):
         self.assertEqual(c.servo.steps, 1)
 
 
+    @unittest.skip("FINDING F4: a single source decides the start-up step (docs/security.md)")
+    def test_startup_step_needs_a_majority(self):
+        """Desired behaviour behind F4: with two or more upstreams
+        configured, no step until a majority of them agree (RFC 5905
+        NSANE/MINCLOCK); a single source a year off must not move us."""
+        c = Chain()
+        for k in range(4):
+            s, out = c.sample(0, YEAR, T0 + k * 2 * S)
+            self.assertNotEqual(out["kind"], "step")
+        self.assertEqual(c.servo.steps, 0)
+
+
 class RuntimeLimits(unittest.TestCase):
     def synced_chain(self, peers):
         c = Chain()

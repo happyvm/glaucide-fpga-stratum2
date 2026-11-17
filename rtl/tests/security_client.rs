@@ -483,8 +483,11 @@ fn kod_with_right_origin_costs_one_poll() {
 /// Reference Timestamp follows each update; the poll period is fixed).
 /// Finding F3: an off-path attacker must guess about 2^8 Origin values,
 /// not 2^32 or 2^64.
-#[test]
-fn t1_is_predictable_from_the_poll_tick() {
+/// Runs one IPv4 slot for 41 polls (iburst then regular, poll 6) with the
+/// clock at its real rate; returns T1 - (poll tick boundary) - latency of
+/// polls 1..=40 (the first poll is not tick aligned: it starts when the
+/// slot is armed).
+fn t1_offsets() -> Vec<u64> {
     let mut b = bench();
     b.slot(0, PEER4 as u128, false, true);
     b.lat4.set(U::<64>::from(8032u64));
@@ -506,17 +509,34 @@ fn t1_is_predictable_from_the_poll_tick() {
         let last_tick = prev >> 26;
         let period_ticks = if k < 4 { 2 * 64 } else { 64 * 64 };
         let boundary = (last_tick + period_ticks) << 26; // 32.32
-        // Jump to 50..400 cycles before the boundary, random sub-cycle phase.
+        // Jump to 50..400 cycles before the boundary, random sub-cycle phase
+        // (the time in between is idle for the client).
         let before = 50 + (next() % 350) as u128;
         let phase = (next() as u128) % INCR;
         b.now = ((boundary as u128) << 32) - before * INCR - phase;
         b.until_reqs(k + 1, 2000);
         let q = b.reqs[k].clone();
-        let d = q.t1() - 8032 - boundary;
-        offs.push(d);
+        offs.push(q.t1().wrapping_sub(8032).wrapping_sub(boundary));
         b.feed(reply(&q, PEER4 as u128, 0));
     }
     assert_eq!(b.samples_got.len(), 41);
+    offs
+}
+
+/// How predictable is our Origin (T1)? The client starts a poll at the
+/// first scheduler examination after the poll tick (2^-6 s grid) is
+/// crossed, and samples T1 a fixed number of cycles later; T1 is our clock
+/// reading plus the constant latency. With the clock running at its real
+/// rate, sub-cycle phase chosen at random, over 40 polls of one slot,
+/// T1 - (poll tick boundary) - latency takes values in a window of a few
+/// cycles: about 7 to 8 bits of uncertainty for someone who knows our clock
+/// (our own server tells it to anyone) and the poll tick (our server's
+/// Reference Timestamp follows each update; the poll period is fixed).
+/// Finding F3: an off-path attacker must guess about 2^8 Origin values,
+/// not 2^32 or 2^64.
+#[test]
+fn t1_is_predictable_from_the_poll_tick() {
+    let offs = t1_offsets();
     let (lo, hi) = (*offs.iter().min().unwrap(), *offs.iter().max().unwrap());
     let ns = |x: u64| x as f64 * 1e9 / SEC as f64;
     let mut distinct = offs.clone();
@@ -534,6 +554,23 @@ fn t1_is_predictable_from_the_poll_tick() {
     // 2^-32 s (120 ns), i.e. < 9 bits of uncertainty given the tick.
     assert!(hi - lo < 512, "spread {} units", hi - lo);
     assert!(ns(hi) < 1000.0, "a fixed number of cycles after the tick");
+}
+
+/// The desired property behind F3: the Transmit timestamp of a request (our
+/// Origin) is unpredictable from our clock and schedule, i.e. its offset to
+/// the poll tick is spread over at least 2^20 values (with a random 64-bit
+/// nonce, as chrony sends and RFC 9109 / the data-minimisation draft
+/// recommend, over the whole range).
+#[test]
+#[ignore = "FINDING F3: the client's Origin (T1) is predictable to ~8 bits (docs/security.md)"]
+fn t1_is_unpredictable() {
+    let offs = t1_offsets();
+    let mut distinct = offs.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), offs.len(), "no repeated value");
+    let (lo, hi) = (offs.iter().min().unwrap(), offs.iter().max().unwrap());
+    assert!(hi - lo >= 1 << 20, "spread {} units only", hi - lo);
 }
 
 // ------------------------------------------------------------ ARP cache
@@ -634,6 +671,23 @@ fn arp_poisoning_of_the_gateway() {
     for (what, f, want) in cases {
         let r = arp_run(&[legit.clone(), f], &[GW4]);
         assert_eq!(r, vec![(true, want)], "{what}");
+    }
+}
+
+/// The desired property behind F5 (RFC 826 merge rule plus the usual
+/// hardening): an ARP packet that rebinds an address already in the cache
+/// to another MAC is not believed unless it answers our own pending
+/// request; the configured gateway's entry in particular is not
+/// overwritten by an unsolicited reply or by someone's request.
+#[test]
+#[ignore = "FINDING F5: unsolicited ARP replies/requests rebind the gateway (docs/security.md)"]
+fn arp_gateway_entry_is_not_rebound_by_unsolicited_packets() {
+    let legit = (OUR_MAC, GW_MAC, arp_pkt(2, GW_MAC, GW4, OUR_MAC, LOCAL4));
+    for f in [
+        (OUR_MAC, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, OUR_MAC, LOCAL4)),
+        (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, LOCAL4)),
+    ] {
+        assert_eq!(arp_run(&[legit.clone(), f], &[GW4]), vec![(true, GW_MAC)]);
     }
 }
 

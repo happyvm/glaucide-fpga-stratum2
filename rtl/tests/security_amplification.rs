@@ -411,3 +411,61 @@ fn kod_is_never_larger_than_the_request() {
         }
     }
 }
+
+// ------------------------------------------------------------ source addresses
+
+/// Requests whose source address cannot be a real client (RFC 1122
+/// 3.2.1.3, RFC 4291 2.5.2/2.5.3, RFC 6890): loopback, our own address,
+/// the subnet broadcast, class E; over IPv6 the unspecified address, the
+/// loopback, our own address and IPv4-mapped addresses. A reply to them is
+/// useless at best and, for the subnet broadcast, a reflection towards a
+/// whole link. Desired behaviour: no reply. Finding F8: they are answered
+/// (only 0.0.0.0, 224/4, 255.255.255.255 and ff00::/8 are filtered today).
+#[test]
+#[ignore = "FINDING F8: requests from martian source addresses are answered (docs/security.md)"]
+fn no_reply_to_martian_sources() {
+    let v4 = [
+        0x7F00_0001u32, // 127.0.0.1
+        OUR_IP4,        // ourselves
+        0xC000_02FF,    // 192.0.2.255, our subnet's broadcast
+        0xF000_0001,    // 240.0.0.1, class E
+    ];
+    let v6 = [
+        0u128,                                     // ::
+        1,                                         // ::1
+        OUR_GUA,                                   // ourselves
+        0x0000_0000_0000_0000_0000_FFFF_C000_0202, // ::ffff:192.0.2.2
+    ];
+    let mut b = PinBench::new();
+    for (k, &ip) in v4.iter().enumerate() {
+        b.frame(&ntp4_frame(PEER_MAC, ip, 40000, &ntp_payload(0x23, 48, xmit(k as u64))), 300, false);
+    }
+    for (k, &ip) in v6.iter().enumerate() {
+        b.frame(&ntp6_frame(PEER_MAC, ip, 40000, &ntp_payload(0x23, 48, xmit(10 + k as u64))), 300, false);
+    }
+    let sent = b.run::<FixedSync>(1500);
+    let answered: Vec<u128> = ntp_replies(&sent).iter().map(|s| s.udp.as_ref().unwrap().2).collect();
+    assert!(answered.is_empty(), "replies sent to {answered:x?}");
+}
+
+/// What happens today with those sources (the measured behaviour behind
+/// F8): every one of them is answered.
+#[test]
+fn martian_sources_today() {
+    let v4 = [0x7F00_0001u32, OUR_IP4, 0xC000_02FF, 0xF000_0001];
+    let v6 = [0u128, 1, OUR_GUA, 0x0000_0000_0000_0000_0000_FFFF_C000_0202];
+    let mut b = PinBench::new();
+    for (k, &ip) in v4.iter().enumerate() {
+        b.frame(&ntp4_frame(PEER_MAC, ip, 40000, &ntp_payload(0x23, 48, xmit(k as u64))), 300, false);
+    }
+    for (k, &ip) in v6.iter().enumerate() {
+        b.frame(&ntp6_frame(PEER_MAC, ip, 40000, &ntp_payload(0x23, 48, xmit(10 + k as u64))), 300, false);
+    }
+    let sent = b.run::<FixedSync>(1500);
+    let mut answered: Vec<u128> = ntp_replies(&sent).iter().map(|s| s.udp.as_ref().unwrap().2).collect();
+    answered.sort();
+    println!("answered: {answered:x?}");
+    let mut want: Vec<u128> = v4.iter().map(|&a| a as u128).chain(v6).collect();
+    want.sort();
+    assert_eq!(answered, want);
+}
