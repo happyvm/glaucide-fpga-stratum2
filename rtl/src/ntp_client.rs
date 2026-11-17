@@ -47,39 +47,44 @@
 //!
 //! # Structure
 //!
-//! A single sequencer (`st`, 11 states) serves the four slots one event at
-//! a time; per-slot state lives in three 4-word distributed RAMs read
-//! asynchronously at the current slot `cs`: `m_t1` (T1 of the outstanding
-//! request), `m_tm` (`last`: NTP second of the last poll start, bits
-//! 95..64; `tsent`: NTP second at which T1 was sampled, 63..32; `rt`: tick
-//! of the last failed lookup, 31..0, a tick being 2^-6 s, i.e. `time`
-//! bits 58..89) and `m_fl` (flags: bit 0 `out` = a request is outstanding,
-//! bit 1 `pend` = a poll started and waits for its MAC, bit 2 `sent` = a
-//! request was sent since the slot was enabled, bits 5..3 `burst` =
-//! polls started since enable (saturates at 4), bits 9..6 `tries` = failed
-//! lookups of the current poll). All memories start at zero (no reset).
-//! At most one write per memory per cycle.
+//! A single sequencer (`st`, 10 states) serves the four slots one event at
+//! a time. Two slot indices: `sp`, the scheduler pointer (the slot `SCAN`
+//! examines), and `cs`, the slot of the event in progress (reply or request
+//! path). In every cycle the slot wires and the per-slot state are read,
+//! and written, at `ix` = `sp` in `SCAN`, `cs` in every other state.
+//! Per-slot state lives in three 4-word distributed RAMs read
+//! asynchronously at `ix`: `m_t1` (T1 of the outstanding request), `m_tm`
+//! (`last`: NTP second of the last poll start, bits 95..64; `tsent`: NTP
+//! second at which T1 was sampled, 63..32; `rt`: tick of the last failed
+//! lookup, 31..0, a tick being 2^-6 s, i.e. `time` bits 58..89) and `m_fl`
+//! (flags: bit 0 `out` = a request is outstanding, bit 1 `pend` = a poll
+//! started and waits for its MAC, bit 2 `sent` = a request was sent since
+//! the slot was enabled, bits 5..3 `burst` = polls started since enable
+//! (saturates at 4), bits 9..6 `tries` = failed lookups of the current
+//! poll). All memories start at zero (no reset). At most one write per
+//! memory per cycle.
 //!
-//! States: `SCAN` (idle: takes a reply or examines slot `cs`), reply path
+//! States: `SCAN` (idle: takes a reply or examines slot `sp`), reply path
 //! `RX` → `CHK` → `C2` → `SMP`, request path `LKP` → `LWT` → `REQ` →
 //! `PAY`, and `MISS`. Each event runs to completion; nothing else is
-//! taken meanwhile (replies wait in `meta`/`rep`). Worst case per event
-//! below 70 cycles plus output stalls, against polls every >= 2 s.
+//! taken meanwhile (replies wait in `meta`/`rep`). Without output stalls
+//! an event takes at most 1 + n + 4 cycles for a reply of n bytes, 52 for
+//! a request (plus the lookup's round trip), against polls every >= 2 s.
 //!
 //! # Scheduler (state `SCAN`)
 //!
 //! Let `now_s` = `time` bits 64..95 (NTP seconds, wrapping), `now_t` =
-//! bits 58..89 (ticks of 2^-6 s). Each cycle in `SCAN`, either a reply is
-//! taken (below) or slot `cs` is examined, in this priority:
+//! bits 58..89 (ticks of 2^-6 s). Each cycle in `SCAN` slot `sp` is
+//! examined; its **action** is the first that applies of:
 //!
-//! 1. `up<cs>_en` = 0 and its flags are not all 0: they are cleared (`out`, `pend`, `sent`,
-//!    `burst`, `tries` = 0; an outstanding request is forgotten, **no
-//!    miss**); re-enabling restarts the iburst.
+//! 1. `up<sp>_en` = 0 and its flags are not all 0: they are cleared
+//!    (`out`, `pend`, `sent`, `burst`, `tries` = 0; an outstanding request
+//!    is forgotten, **no miss**); re-enabling restarts the iburst.
 //! 2. `out` and `now_s - tsent >= DEADLINE_S` (2, unsigned 32-bit wrapping
-//!    difference): `out` := 0 and `MISS` sends `miss(cs)`. The deadline is
-//!    thus 1 to 2 s after T1 (whole-second granularity). A backward clock
-//!    step makes the difference huge: the request expires at once (a miss);
-//!    a forward step likewise.
+//!    difference): `out` := 0, `cs` := `sp`, and `MISS` sends `miss(cs)`.
+//!    The deadline is thus 1 to 2 s after T1 (whole-second granularity). A
+//!    backward clock step makes the difference huge: the request expires at
+//!    once (a miss); a forward step likewise.
 //! 3. not `out`, not `pend` and **due**: `burst` = 0, or `now_s - last >=
 //!    I` with `I` = 2 s ([`IBURST_GAP_S`]) while `burst < 4`, else
 //!    `I = 2^clamp(poll_log2, 4, 17)` s (sampled then). The poll starts:
@@ -87,18 +92,21 @@
 //!    1, 4). So after an enable (or reset with the slot enabled) polls start
 //!    at `t0`, `t0 + 2`, `t0 + 4`, `t0 + 6` (**iburst**, [`IBURST_COUNT`] =
 //!    4), then every `2^poll` s, each measured from the previous poll start
-//!    (not from the request), while that poll is finished (`out` = 0 and
+//!    (not from the request), once that poll is finished (`out` = 0 and
 //!    `pend` = 0); a poll due while the previous one is still open waits for
-//!    it (deadline or reply) and starts in the cycle after.
+//!    it (deadline or reply) and starts at the next examination.
 //! 4. `pend` and (`tries` = 0 or `now_t - rt >= RETRY_TICKS` (2)):
-//!    go to `LKP` for slot `cs`.
-//! 5. otherwise (including a disabled slot with clear flags) nothing; `cs` advances (`cs + 1` mod 4).
+//!    `cs` := `sp`, go to `LKP`.
+//! 5. none (including a disabled slot with clear flags): no action.
 //!
-//! In cases 1-3 `cs` stays (the slot is re-examined next cycle), in case 4
-//! the request path keeps it. When a reply `Meta` is waiting and the slot
-//! examination would act (cases 1-4), the two alternate (`pri` toggles each
-//! `SCAN` cycle): a flood of replies cannot starve the scheduler.
-//!
+//! `sp` advances (`sp + 1` mod 4) in each `SCAN` cycle where slot `sp` has
+//! no action, and stays otherwise (after actions 1 and 3 the slot is
+//! examined again in the next `SCAN` cycle). A waiting reply `Meta` is
+//! taken in a `SCAN` cycle when slot `sp` has no action, or when it has one
+//! and `pri` = 1; `pri` toggles in every `SCAN` cycle, so under a flood of
+//! replies actions and replies alternate (the scheduler is never starved);
+//! a cycle that takes a reply performs no action.
+
 //! # Request path
 //!
 //! * **Next hop** (combinational from the slot wires, sampled in `LKP` and
@@ -116,9 +124,10 @@
 //!   `RES_TRIES` (8) the poll is abandoned (`pend` := 0, `tries` := 0) and
 //!   counts as a **miss only if `sent` = 1** (a request was sent to this
 //!   slot since it was enabled: a resolution failure before any request
-//!   is not a miss); else `SCAN` and the scheduler retries 2 to 3 ticks
-//!   (31 to 47 ms... at least 15.6 ms) later (case 4). So at most 8
-//!   lookups and 8 resolves per poll, within about 0.25 s.
+//!   is not a miss); else `SCAN`, and the scheduler retries (action 4) when
+//!   `now_t - rt >= 2`, i.e. 15.6 to 31.3 ms later. So at most 8 lookups
+//!   and 8 resolves per poll, within about 0.22 s; a poll abandoned before
+//!   any request was sent leaves the slot to its next poll start.
 //! * `REQ`: sends `req4` = `UdpTxReq { dst_mac, dst_ip = addr[31:0], sport
 //!   = 123, dport = 123, len = 48 }` or `req6` = `Udp6TxReq { dst_mac,
 //!   dst_ip = addr, src_ip, 123, 123, 48 }` with `src_ip` = `local_ll` if
@@ -145,10 +154,11 @@
 //!
 //! # Reply path
 //!
-//! * `SCAN`: a `Meta` is taken (`recv`). The slot is matched in that cycle:
+//! * `SCAN`: a `Meta` is taken (`recv`, see « Scheduler » for when). The
+//!   slot is matched in that cycle:
 //!   the lowest `i` with `up<i>_en`, `up<i>_v6 == Meta.family`, the address
 //!   equal (all 128 bits for IPv6, the low 32 for IPv4) to `Meta.src`, and
-//!   `Meta.sport == 123`. `hit` and `cs` := i are registered with
+//!   `Meta.sport == 123`. `hit` and `cs` := i (3 when none) are registered with
 //!   `Meta.rx_ts` (T4).
 //! * `RX`: the payload is taken one byte per cycle when present, never
 //!   stalled, up to and including `last`. Kept: bytes 0..15 (header), 24..31

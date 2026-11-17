@@ -1045,7 +1045,8 @@ fn two_slots_in_flight() {
     assert!(b.misses.is_empty());
 }
 
-/// Same address in two slots: the lowest index gets the replies.
+/// A disabled slot sends nothing, forgets its request (no miss, its reply
+/// is dropped) and restarts its iburst when enabled again.
 #[test]
 fn slot_disabled() {
     let mut b = bench();
@@ -1070,6 +1071,22 @@ fn slot_disabled() {
     assert_eq!(b.samples_got.len(), 1);
 }
 
+/// Same address in two slots: the lowest index gets the replies; the other
+/// one's request expires as a miss.
+#[test]
+fn same_address_two_slots() {
+    let mut b = bench();
+    b.slot(1, PEER4 as u128, false, true);
+    b.slot(2, PEER4 as u128, false, true);
+    b.until_reqs(2, 600);
+    let q = b.reqs[0].clone();
+    b.feed(good_reply(&q, PEER4 as u128, 0));
+    assert_eq!(b.samples_got.len(), 1);
+    assert_eq!(b.samples_got[0].0.peer.raw(), 1);
+    b.advance(2 * SEC, 4, 100);
+    assert_eq!(b.misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![2]);
+}
+
 // ------------------------------------------------------------ extremes
 
 /// Offsets near ±2^31 s and an era change between T1 and T4.
@@ -1087,9 +1104,8 @@ fn extreme_timestamps() {
             b.feed(r.clone());
             assert_eq!(b.samples_got.len(), 1);
             check_good(&b.samples_got[0].0, &q, &r, 0);
-            let o = b.samples_got[0].0.offset.raw() as u64 as i64;
-            let want = off.wrapping_add(SEC / 2000 * 0) as i64;
-            assert!((o - want).unsigned_abs() < SEC, "offset {o:x} {want:x}");
+            // symmetric 1 ms paths: the offset is exactly the server's
+            assert_eq!(b.samples_got[0].0.offset.raw() as u64, off);
         }
     }
 }
