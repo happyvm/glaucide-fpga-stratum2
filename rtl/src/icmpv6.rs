@@ -69,8 +69,10 @@
 //! link-layer option (type 1) is recorded (at most one, length 1, else it is
 //! "bad"). On the last byte the NS is accepted only if: checksum good,
 //! message well formed, input `err` clear. Then, **all from registers, a few
-//! cycles later** (states CK0, CK1..; CK0 registers the address comparisons
-//! used in CK1, task T5.3), it is answered only if: the target is
+//! cycles later** (states CK0, CK1..; CK0 acts on the registered verdict of
+//! the last byte and registers the address comparisons used in CK1, task
+//! T5.3; a rejected NS returns to GATHER from CK0), it is answered only if:
+//! the target is
 //! `local_ll`, or `local_gua` with `gua_valid`, and is not multicast (M2); the
 //! destination is the target or the solicited-node address of the target
 //! (`ff02::1:ffXX:XXXX` with the target's low 24 bits, M3); and:
@@ -243,6 +245,12 @@ pub struct Icmpv6 {
     pub m3_r: Reg<Bit>,
     pub unspec_r: Reg<Bit>,
     pub notmc_r: Reg<Bit>,
+    /// The NS/NA just read passed its checks (written with its last byte,
+    /// read in CK0).
+    pub gd: Reg<Bit>,
+    /// `mlen >= 8`, `mlen >= 24` (written with `mlen`).
+    pub ml8: Reg<Bit>,
+    pub ml24: Reg<Bit>,
 }
 
 #[lower]
@@ -311,10 +319,14 @@ impl
             let is_rs1 = Bit::from(st == RS1);
             let is_ck0 = Bit::from(st == CK0);
             let is_rs0 = Bit::from(st == RS0);
-            let p0 = is_g & Bit::from(pos == 0);
-            let p1 = is_g & Bit::from(pos == 1);
-            let p2 = is_g & Bit::from(pos == 2);
-            let p3 = is_g & Bit::from(pos == 3);
+            // In GATHER `pos` is at most 3 (byte 3 leaves GATHER, every way
+            // back sets `pos` to 0): its low 2 bits decode the position
+            // (shorter than a 16-bit compare, task T5.3).
+            let pg = pos.slice::<0, 2>();
+            let p0 = is_g & Bit::from(pg == 0);
+            let p1 = is_g & Bit::from(pg == 1);
+            let p2 = is_g & Bit::from(pg == 2);
+            let p3 = is_g & Bit::from(pg == 3);
 
             let have = Bit::from(payload.peek().is_some());
             let b = payload.head();
@@ -326,18 +338,18 @@ impl
             let echo_acc = Bit::from(hi == U::<8>::from(TYPE_ECHO_REQUEST))
                 & Bit::from(b.data == U::<8>::from(0u8))
                 & !last
-                & Bit::from(mlen >= 8)
+                & self.ml8.get()
                 & !self.mmc.get();
             let ns_acc = Bit::from(hi == U::<8>::from(TYPE_NS))
                 & Bit::from(b.data == U::<8>::from(0u8))
                 & !last
-                & Bit::from(mlen >= 24)
+                & self.ml24.get()
                 & self.h255.get();
             let echo_go = p1 & echo_acc;
             let na_acc = Bit::from(hi == U::<8>::from(TYPE_NA))
                 & Bit::from(b.data == U::<8>::from(0u8))
                 & !last
-                & Bit::from(mlen >= 24)
+                & self.ml24.get()
                 & self.h255.get();
             let ns_go = p1 & (ns_acc | na_acc);
             // A pending resolve request starts a solicitation when idle, at the
@@ -539,7 +551,7 @@ impl
                     st: U::<4>::from(RS0),
                 },
                 is_rs0 ? st: U::<4>::from(RS1),
-                is_ck0 ? st: U::<4>::from(CK1),
+                is_ck0 ? st: mux(self.gd.get(), U::<4>::from(CK1), U::<4>::from(GATHER)),
                 rs_own ? st: U::<4>::from(GATHER),
                 rs_go ? {
                     st: U::<4>::from(CK2),
@@ -557,6 +569,8 @@ impl
                     msrc: m.src,
                     mdst: m.dst,
                     mlen: m.len,
+                    ml8: Bit::from(m.len >= 8),
+                    ml24: Bit::from(m.len >= 24),
                     mmc: m.multicast,
                     h255: Bit::from(m.hop == U::<8>::from(NDP_HOP)),
                 },
@@ -591,13 +605,16 @@ impl
                 },
                 take & o_b & Bit::from(ot == want_t) ? smac: (smac << 8u32) | b.data.zext::<48>(),
                 take & is_nsi ? bad: bad_n,
+                // The verdict of the last byte is registered (`gd`) and acted on
+                // in CK0 (task T5.3: the checksum is not on the path of `st`).
                 ns_end ? {
-                    st: mux(good, U::<4>::from(CK0), U::<4>::from(GATHER)),
+                    st: U::<4>::from(CK0),
+                    gd: good,
                     pos: U::<16>::from(0u16),
                     ost: U::<2>::from(0u8),
                     bad: Bit::Zero,
                 },
-                ns_end & !good ? {
+                is_ck0 & !self.gd.get() ? {
                     sseen: Bit::Zero,
                     sbad: Bit::Zero,
                 },

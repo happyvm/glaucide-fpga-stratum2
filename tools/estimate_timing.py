@@ -25,11 +25,28 @@ Delay model (an indicator, NOT a timing analysis; no placement, routing or fanou
             M/C/PCIN -> P 1.3 ns, each stage cut by its AREG/BREG, MREG, PREG register)
 LUT-RAM / SRL read (address -> data) counts as one LUT level. Input ports start at 0 ns
 and output ports end paths (reported apart: in the full design they continue in the
-neighbouring module, which is why the board top is analysed too).
+neighbouring module, which is why the board top is analysed too). The stored data of a
+LUT-RAM is launched by its write clock (a read in another clock domain is a crossing).
 
-Usage: estimate_timing.py [-n N] [--json FILE] [files...]
+Synthesis differences with Vivado that the numbers inherit:
+* Chained additions: Yosys's `alumacc` turns `a + b + c + ...` into one carry-save tree,
+  Vivado keeps one carry chain per `+`. The default here runs the `coarse` step with
+  `alumacc -macc-only`, so every `+` stays a carry chain (--yosys-macc: Yosys's tree).
+* ABC9 maps for area as much as for depth: wide equality compares often come out as a
+  chain of LUT5 (6 levels for 128 bits, Vivado needs about 4), and in the large flattened
+  board top the same unit path can take 30-40 % more LUT levels than in the module alone.
+  The per-module numbers are the reference; the top shows the paths between units.
+
+Usage: estimate_timing.py [-n N] [-j J] [--json FILE] [--path] [--end RE] [files...]
+       estimate_timing.py --compare BEFORE.json AFTER.json   (Markdown table)
     -n N         also print the N worst endpoint registers per file (default 3)
+    -j J         analyse J files in parallel
     --json FILE  write all results as JSON
+    --path       print the cells of the worst paths (with the public nets crossed)
+    --end RE     also print the worst paths to the endpoints matching RE
+    --yosys-macc let Yosys merge chained additions (see below)
+On the board top (out/top*/arty_top.v), the worst path of each unit instance is listed
+too (--unit-min, default 6 ns).
 """
 import argparse, glob, json, os, re, sys, tempfile
 from collections import defaultdict
@@ -428,7 +445,29 @@ def one_file(f, a):
     return "\n".join(out) + "\n", (label, res)
 
 
+def compare(fa, fb):
+    """Markdown table: worst same-domain path per module and domain, before (fa) and
+    after (fb), from two --json results."""
+    A, B = json.load(open(fa)), json.load(open(fb))
+    print("| module | domaine | avant: ns (LUT/CARRY4) | après: ns (LUT/CARRY4) | verdict après |")
+    print("|---|---|---|---|---|")
+    for m in sorted(set(A) | set(B)):
+        doms = sorted(set(A.get(m, {}).get("domains", {})) | set(B.get(m, {}).get("domains", {})))
+        for d in doms:
+            cell = []
+            for R in (A, B):
+                lst = R.get(m, {}).get("domains", {}).get(d)
+                cell.append(f"{lst[0]['delay']:.1f} ({lst[0]['luts']}/{lst[0]['carry']})" if lst else "-")
+            lst = B.get(m, {}).get("domains", {}).get(d)
+            budget = 40.0 if re.search(r"rx|tx|c_chan", d) else 10.0
+            v = verdict(lst[0], budget) if lst else "-"
+            mark = "**" if cell[0] != cell[1] else ""
+            print(f"| {mark}{m}{mark} | {d} | {cell[0]} | {cell[1]} | {v} |")
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--compare":
+        return compare(sys.argv[2], sys.argv[3])
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", type=int, default=3)
     ap.add_argument("--json")
