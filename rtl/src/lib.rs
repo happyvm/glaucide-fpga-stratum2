@@ -24,6 +24,7 @@ pub mod ntp_server;
 pub mod phy_init;
 pub mod refid;
 pub mod rx_path;
+pub mod sync_state;
 pub mod stream;
 pub mod tx_arb;
 pub mod tx_path;
