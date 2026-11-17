@@ -1156,10 +1156,10 @@ fn chain_rx_ts_follows_its_frame() {
             .collect::<Vec<_>>()
     };
     let ntp = first("ntp4_basic.hex")[0].clone();
-    let other = first("neg_udp_port.hex")[0].clone();
+    let other = first("neg_udp_port.hex")[1].clone(); // port 9999
     let arp = first("arp_request_reply.hex")[0].clone();
     let icmp = first("ping4.hex")[0].clone();
-    let foreign = first("neg_foreign_mac.hex")[0].clone();
+    let foreign = first("neg_foreign_mac.hex")[1].clone();
     let tx = vector("ntp4_basic.hex").into_iter().find(|(r, _)| !*r).unwrap().1;
     let reply = tx[42..].to_vec();
     let frames = vec![
