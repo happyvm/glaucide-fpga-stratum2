@@ -9,6 +9,9 @@ use ntp_fpga::{
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("arp") => print!("{}", ntp_fpga::arp::Arp::verilog("arp")),
+        Some("ipv4_rx") => print!("{}", ntp_fpga::ipv4_rx::Ipv4Rx::verilog("ipv4_rx")),
+        Some("ipv4_tx") => print!("{}", ntp_fpga::ipv4_tx::Ipv4Tx::verilog("ipv4_tx")),
+        Some("icmp_echo") => print!("{}", ntp_fpga::icmp_echo::IcmpEcho::verilog("icmp_echo")),
         Some("formal_smoke") => print!("{}", Digit::verilog("formal_smoke")),
         Some("crc_equiv") => print!("{}", ntp_fpga::crc_equiv::CrcEquiv::verilog("crc_equiv")),
         Some("frame_crc") => print!("{}", FrameCrc::verilog("frame_crc")),
