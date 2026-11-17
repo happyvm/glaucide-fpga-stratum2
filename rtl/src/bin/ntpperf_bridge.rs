@@ -237,6 +237,8 @@ struct NtpOut {
     origin: u64,
     t2: u64,
     t3: u64,
+    /// UDP payload length (the NTP packet).
+    plen: usize,
 }
 
 /// Decodes a transmitted frame (bytes after the SFD, FCS included): `Err`
@@ -287,10 +289,92 @@ fn parse_tx(raw: &[u8]) -> Result<Option<NtpOut>, String> {
         origin: be(&p[24..32]),
         t2: be(&p[32..40]),
         t3: be(&p[40..48]),
+        plen: len - 8,
     }))
 }
 
+// ------------------------------------------------------------ chronyd frames
+
+/// The chronyd client of `--chrony-port`: one more client of the server, on
+/// the same subnet as ntpperf's `-d` address but outside its `-s` network.
+const CHR_MAC: u64 = 0x0200_0000_0003;
+const CHR_IP4: u32 = 0xC0A8_7B02; // 192.168.123.2
+const OUR_MAC: u64 = 0x0200_0000_0001;
+const OUR_IP4: u32 = 0xC0A8_7B01; // 192.168.123.1
+
+fn mac_bytes(m: u64) -> [u8; 6] {
+    let b = m.to_be_bytes();
+    [b[2], b[3], b[4], b[5], b[6], b[7]]
+}
+
+/// IPv4 header (IHL 5, DF, TTL 64) with its checksum; `id` in bytes 4-5.
+fn ipv4_hdr(src: u32, dst: u32, proto: u8, id: u16, data_len: usize) -> Vec<u8> {
+    let tl = 20 + data_len;
+    let i = id.to_be_bytes();
+    let mut h = vec![0x45, 0, (tl >> 8) as u8, tl as u8, i[0], i[1], 0x40, 0, 64, proto, 0, 0];
+    h.extend_from_slice(&src.to_be_bytes());
+    h.extend_from_slice(&dst.to_be_bytes());
+    let c = !fold(sum16(0, &h));
+    h[10] = (c >> 8) as u8;
+    h[11] = c as u8;
+    h
+}
+
+/// UDP datagram over IPv4 with a correct checksum.
+fn udp4(src: u32, dst: u32, sport: u16, dport: u16, pay: &[u8]) -> Vec<u8> {
+    let len = 8 + pay.len();
+    let mut u = sport.to_be_bytes().to_vec();
+    u.extend_from_slice(&dport.to_be_bytes());
+    u.extend_from_slice(&(len as u16).to_be_bytes());
+    u.extend_from_slice(&[0, 0]);
+    u.extend_from_slice(pay);
+    let mut a = sum16(0, &src.to_be_bytes());
+    a = sum16(a, &dst.to_be_bytes());
+    a += 17 + len as u32;
+    a = sum16(a, &u);
+    let mut c = !fold(a);
+    if c == 0 {
+        c = 0xffff;
+    }
+    u[6] = (c >> 8) as u8;
+    u[7] = c as u8;
+    u
+}
+
+/// Ethernet/IPv4/UDP frame without FCS, padded with zeros to 60 bytes.
+fn eth_udp4(dst: u64, src: u64, sip: u32, dip: u32, id: u16, sport: u16, dport: u16, pay: &[u8]) -> Vec<u8> {
+    let u = udp4(sip, dip, sport, dport, pay);
+    let mut v = mac_bytes(dst).to_vec();
+    v.extend_from_slice(&mac_bytes(src));
+    v.extend_from_slice(&0x0800u16.to_be_bytes());
+    v.extend_from_slice(&ipv4_hdr(sip, dip, 17, id, u.len()));
+    v.extend_from_slice(&u);
+    while v.len() < 60 {
+        v.push(0);
+    }
+    v
+}
+
+/// Nibbles on `rxd` of a frame (no FCS yet): 7 bytes of preamble, SFD, the
+/// frame and its FCS, low nibble first.
+fn wire_nibbles(frame: &[u8]) -> Vec<u8> {
+    let mut w = frame.to_vec();
+    w.extend_from_slice(&crc32(&w).to_le_bytes());
+    let mut nibbles = Vec::with_capacity(2 * (w.len() + PREAMBLE));
+    nibbles.extend(std::iter::repeat_n(5u8, 15));
+    nibbles.push(0xd);
+    for b in w {
+        nibbles.push(b & 15);
+        nibbles.push(b >> 4);
+    }
+    nibbles
+}
+
 // ------------------------------------------------------------ time
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
 
 /// NTP 32.32 of a Unix time in ns (rounded).
 fn ntp_of_ns(ns: u128) -> u64 {
@@ -410,6 +494,83 @@ impl Shm {
     }
 }
 
+// The page shared with `tools/chrony/vtime_shim.so` (chronyd), layout of
+// tools/chrony/vtime_shim.c: one more participant of the lockstep.
+const CW_MAGIC: usize = 0;
+const CW_VT_NS: usize = 1;
+const CW_WAIT_SEQ: usize = 2;
+const CW_WAITING: usize = 3;
+const CW_DEADLINE: usize = 4;
+const CW_T0_NS: usize = 5;
+const CW_STOP: usize = 6;
+const CVT_MAGIC: u64 = 0x5654_4d43_4852_4e59;
+const NONE_DEADLINE: u64 = !0;
+
+struct CShm {
+    p: *const AtomicU64,
+}
+
+impl CShm {
+    fn create(path: &str, t0: u64) -> CShm {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        f.set_len(4096).unwrap();
+        // SAFETY: as `Shm::create`.
+        let p = unsafe { mmap(std::ptr::null_mut(), 4096, 3, 1, f.as_raw_fd(), 0) };
+        assert!(!p.is_null() && p as isize != -1, "mmap of {path} failed");
+        let s = CShm { p: p as *const AtomicU64 };
+        s.st(CW_VT_NS, t0);
+        s.st(CW_T0_NS, t0);
+        s.st(CW_DEADLINE, NONE_DEADLINE);
+        s.st(CW_MAGIC, CVT_MAGIC);
+        s
+    }
+    fn ld(&self, i: usize) -> u64 {
+        assert!(i < 512);
+        // SAFETY: i < 512 words of the live 4096-byte mapping.
+        unsafe { (*self.p.add(i)).load(Ordering::SeqCst) }
+    }
+    fn st(&self, i: usize, v: u64) {
+        assert!(i < 512);
+        // SAFETY: as `ld`.
+        unsafe { (*self.p.add(i)).store(v, Ordering::SeqCst) }
+    }
+}
+
+/// A chronyd request between its pickup and its reply.
+struct CPending {
+    idx: u64,
+    /// Virtual time of the pickup: chronyd's T1 (its send instant).
+    t1_ns: u128,
+    wire_ns: Option<u128>,
+    rx_sfd_ns: Option<u128>,
+    req: Vec<u8>,
+}
+
+/// chronyd as one more client (`--chrony-port`).
+struct Chrony {
+    sock: std::net::UdpSocket,
+    shm: CShm,
+    log: std::fs::File,
+    pending: HashMap<(u16, u64), CPending>,
+    addr: HashMap<u16, std::net::SocketAddr>,
+    /// (wait sequence number, since): a reply was delivered in that wait;
+    /// chronyd has not taken it yet.
+    blocked: Option<(u64, Instant)>,
+    next_idx: u64,
+    ip_id: u16,
+    n_req: u64,
+    n_rep: u64,
+    n_qdrop: u64,
+    n_unmatched: u64,
+    n_stuck: u64,
+}
+
 /// Result of a readiness check of ntpperf's processes.
 enum Ready {
     /// Every process waits: the earliest deadline, if any.
@@ -492,6 +653,10 @@ struct Opts {
     t0_ns: u128,
     quantum_ns: u64,
     iface: String,
+    /// chronyd as one more client: UDP port on 127.0.0.1, shared page, CSV log.
+    chrony_port: Option<u16>,
+    chrony_shm: String,
+    chrony_log: Option<String>,
     cmd: Vec<String>,
 }
 
@@ -501,7 +666,7 @@ fn usage() -> ! {
          [--rate-limit 0|1|2|4|8|16 (0)] [--kod] [--queue-bytes N (65536)] [--log CSV] [--no-ff] \
          [--idle-cycles N (400)] [--status WALL_S (10)] [--max-wall WALL_S (3600)] \
          [--max-virtual S (100)] [--t0 UNIX_NS] [--quantum-ns N (1000000)] [--iface NAME (sim0)] \
-         -- NTPPERF ARGS..."
+         [--chrony-port P --chrony-shm FILE [--chrony-log CSV]] -- NTPPERF ARGS..."
     );
     std::process::exit(2)
 }
@@ -523,6 +688,9 @@ fn opts() -> Opts {
         t0_ns: DEFAULT_T0_S as u128 * NS,
         quantum_ns: 1_000_000,
         iface: "sim0".into(),
+        chrony_port: None,
+        chrony_shm: String::new(),
+        chrony_log: None,
         cmd: vec![],
     };
     let a: Vec<String> = std::env::args().skip(1).collect();
@@ -556,6 +724,9 @@ fn opts() -> Opts {
             "--t0" => o.t0_ns = num(val(i)),
             "--quantum-ns" => o.quantum_ns = num(val(i)),
             "--iface" => o.iface = val(i),
+            "--chrony-port" => o.chrony_port = Some(num(val(i))),
+            "--chrony-shm" => o.chrony_shm = val(i),
+            "--chrony-log" => o.chrony_log = Some(val(i)),
             "--kod" => {
                 o.kod = true;
                 i += 1;
@@ -571,6 +742,10 @@ fn opts() -> Opts {
         i += 2;
     }
     if o.shm.is_empty() || o.shim.is_empty() || o.cmd.is_empty() {
+        usage();
+    }
+    if o.chrony_port.is_some() != !o.chrony_shm.is_empty() {
+        eprintln!("--chrony-port and --chrony-shm go together");
         usage();
     }
     o
@@ -623,6 +798,8 @@ struct Reply {
 /// A frame waiting in the sender's queue model.
 struct Frame {
     id: Option<usize>,
+    /// A request of chronyd (key of `Chrony::pending`).
+    ckey: Option<(u16, u64)>,
     ready_ns: u128,
     nibbles: Vec<u8>,
 }
@@ -675,6 +852,35 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
     let wall0 = Instant::now();
     let t0_ns = o.t0_ns;
     let shm = Shm::create(&o.shm, t0_ns as u64, o.quantum_ns);
+    // chronyd as one more client (its UDP socket, its own page of the
+    // virtual time, its CSV log).
+    let mut chr: Option<Chrony> = o.chrony_port.map(|port| {
+        let sock = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap_or_else(|e| panic!("bind: {e}"));
+        sock.set_nonblocking(true).unwrap();
+        let mut log = std::fs::File::create(o.chrony_log.as_deref().unwrap_or("/dev/null"))
+            .unwrap_or_else(|e| panic!("chrony log: {e}"));
+        writeln!(
+            log,
+            "idx,sport,len,t1_ns,t4_ns,t2,t3,rx_sfd_ns,tx_sfd_ns,e2_ns,e3_ns,offset_ns,delay_ns,wire_ns,\
+             req_hex,reply_hex"
+        )
+        .unwrap();
+        Chrony {
+            sock,
+            shm: CShm::create(&o.chrony_shm, t0_ns as u64),
+            log,
+            pending: HashMap::new(),
+            addr: HashMap::new(),
+            blocked: None,
+            next_idx: 0,
+            ip_id: 0,
+            n_req: 0,
+            n_rep: 0,
+            n_qdrop: 0,
+            n_unmatched: 0,
+            n_stuck: 0,
+        }
+    });
 
     // The "interface": a SOCK_SEQPACKET pair; [0] is ours, [1] ntpperf's.
     let mut sv = [0i32; 2];
@@ -757,7 +963,7 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
     let mut queue: VecDeque<Frame> = VecDeque::new();
     let mut queued_bytes = 0usize;
     let (mut max_queued, mut n_qdrop, mut n_ctrl) = (0usize, 0u64, 0u64);
-    let mut cur: Option<(Option<usize>, Vec<u8>, usize)> = None;
+    let mut cur: Option<(Option<usize>, Option<(u16, u64)>, Vec<u8>, usize)> = None;
     let mut gap = 0u32;
     let mut nib: Vec<u8> = vec![];
     let mut tx_sfd_ns = 0u128;
@@ -780,6 +986,11 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
 
     let mut vt: u128 = vt_at(now(), ff_ns);
     let child_status;
+    // ntpperf has exited at this virtual time; chronyd's last requests are
+    // still given a few instants to be answered.
+    let mut child_exit: Option<(std::process::ExitStatus, u128)> = None;
+    let mut cbuf = [0u8; 2048];
+    let (mut st_ce2, mut st_ce3) = (Stat::default(), Stat::default());
     let debug = std::env::var_os("NTPPERF_BRIDGE_DEBUG").is_some();
     'main: loop {
         // ---- 1. wait until every ntpperf process is ready
@@ -849,7 +1060,7 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
                 }
                 queued_bytes += wl;
                 max_queued = max_queued.max(queued_bytes);
-                queue.push_back(Frame { id, ready_ns: vt, nibbles });
+                queue.push_back(Frame { id, ckey: None, ready_ns: vt, nibbles });
             }
             // Replies not delivered yet.
             while let Some(m) = out_q.front() {
@@ -860,9 +1071,16 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
                 }
                 out_q.pop_front();
             }
-            if let Ok(Some(s)) = child.try_wait() {
-                child_status = s;
-                break 'main;
+            if child_exit.is_none() {
+                if let Ok(Some(s)) = child.try_wait() {
+                    child_exit = Some((s, vt));
+                }
+            }
+            if let Some((s, dvt)) = child_exit {
+                if chr.as_ref().is_none_or(|c| c.pending.is_empty()) || vt >= dvt + 200_000 {
+                    child_status = s;
+                    break 'main;
+                }
             }
             if wall0.elapsed().as_secs_f64() > o.max_wall_s {
                 eprintln!("ntpperf_bridge: --max-wall reached, stopping ntpperf");
@@ -873,13 +1091,95 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
                 exit_code = 3;
                 break 'main;
             }
-            let seq = shm.ld(SW_SEQ);
-            match readiness(&shm, vt as u64) {
-                Ready::Yes(d) => {
-                    not_ready_since = None;
-                    break d;
+            // chronyd: blocked in a wait for a virtual deadline (and not still
+            // taking a delivery)? Then its pending requests are picked up: it
+            // sent them while it computed, i.e. while time stood still, so
+            // `vt` is their send instant (T1).
+            let mut cdl: Option<u64> = None;
+            let mut c_ok = true;
+            if let Some(c) = chr.as_mut() {
+                c_ok = false;
+                if c.shm.ld(CW_WAITING) == 1 {
+                    let cseq = c.shm.ld(CW_WAIT_SEQ);
+                    let held = match c.blocked {
+                        Some((s, since)) if s == cseq => {
+                            if since.elapsed() > Duration::from_millis(500) {
+                                c.n_stuck += 1;
+                                eprintln!("ntpperf_bridge: chronyd did not take a delivery; resuming");
+                                c.blocked = None;
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        _ => {
+                            c.blocked = None;
+                            false
+                        }
+                    };
+                    if !held {
+                        loop {
+                            match c.sock.recv_from(&mut cbuf) {
+                                Ok((n, src)) => {
+                                    let std::net::SocketAddr::V4(a) = src else { continue };
+                                    if !a.ip().is_loopback() {
+                                        continue;
+                                    }
+                                    let pay = cbuf[..n].to_vec();
+                                    c.n_req += 1;
+                                    c.addr.insert(a.port(), src);
+                                    let xmit = if n >= 48 { be(&pay[40..48]) } else { 0 };
+                                    c.ip_id = c.ip_id.wrapping_add(1);
+                                    let f = eth_udp4(OUR_MAC, CHR_MAC, CHR_IP4, OUR_IP4, c.ip_id, a.port(), 123, &pay);
+                                    let wl = f.len() + 4;
+                                    if queued_bytes + wl > o.queue_bytes {
+                                        c.n_qdrop += 1;
+                                        eprintln!("ntpperf_bridge: chronyd request dropped by the queue model");
+                                        continue;
+                                    }
+                                    queued_bytes += wl;
+                                    max_queued = max_queued.max(queued_bytes);
+                                    let key = (a.port(), xmit);
+                                    let idx = c.next_idx;
+                                    c.next_idx += 1;
+                                    c.pending.insert(
+                                        key,
+                                        CPending { idx, t1_ns: vt, wire_ns: None, rx_sfd_ns: None, req: pay },
+                                    );
+                                    queue.push_back(Frame {
+                                        id: None,
+                                        ckey: Some(key),
+                                        ready_ns: vt,
+                                        nibbles: wire_nibbles(&f),
+                                    });
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) => panic!("chrony recv: {e}"),
+                            }
+                        }
+                        let dl = c.shm.ld(CW_DEADLINE);
+                        if c.shm.ld(CW_WAITING) == 1 && c.shm.ld(CW_WAIT_SEQ) == cseq {
+                            if dl != NONE_DEADLINE && vt >= dl as u128 {
+                                // Woken by its deadline, not running yet.
+                                c.blocked = Some((cseq, Instant::now()));
+                            } else {
+                                c_ok = true;
+                                cdl = (dl != NONE_DEADLINE).then_some(dl);
+                            }
+                        }
+                    }
                 }
-                _ => {}
+            }
+            let seq = shm.ld(SW_SEQ);
+            let nr = if child_exit.is_some() { Ready::Yes(None) } else { readiness(&shm, vt as u64) };
+            if let (Ready::Yes(d), true) = (nr, c_ok) {
+                not_ready_since = None;
+                break match (d, cdl) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b.min(vt as u64 + 1000)),
+                    (None, None) => None,
+                };
             }
             let since = *not_ready_since.get_or_insert_with(Instant::now);
             if since.elapsed() > Duration::from_secs(2) {
@@ -899,10 +1199,13 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
             // (the processes are still waiting, nothing can change).
             continue 'main;
         }
-        let target = match target {
+        let mut target = match target {
             Some(d) => d as u128,
             None => vt + 1000,
         };
+        if let Some((_, dvt)) = child_exit {
+            target = target.min(dvt + 200_000);
+        }
         if target > max_vt {
             eprintln!("ntpperf_bridge: --max-virtual reached, stopping ntpperf");
             shm.st(SW_STOP, 1);
@@ -927,6 +1230,7 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
             );
         }
         let ts = Instant::now();
+        let mut stop_c = false;
         while vt < target {
             let t = now();
             if ClkRx25::rising_at(t) {
@@ -961,17 +1265,23 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
                             if let Some(i) = f.id {
                                 reqs[i].wire_ns = Some(vt);
                             }
-                            cur = Some((f.id, f.nibbles, 0));
+                            if let Some(p) = f.ckey.and_then(|k| chr.as_mut().and_then(|c| c.pending.get_mut(&k))) {
+                                p.wire_ns = Some(vt);
+                            }
+                            cur = Some((f.id, f.ckey, f.nibbles, 0));
                         }
                     }
                 }
-                if let Some((id, nibs, pos)) = cur.as_mut() {
+                if let Some((id, ckey, nibs, pos)) = cur.as_mut() {
                     let n = nibs[*pos];
                     out = (n, true);
                     // The SFD is the 16th nibble.
                     if *pos == 15 {
                         if let Some(i) = *id {
                             reqs[i].rx_sfd_ns = Some(vt);
+                        }
+                        if let Some(p) = ckey.and_then(|k| chr.as_mut().and_then(|c| c.pending.get_mut(&k))) {
+                            p.rx_sfd_ns = Some(vt);
                         }
                     }
                     *pos += 1;
@@ -1021,6 +1331,51 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
                             n_bad += 1;
                             eprintln!("ntpperf_bridge: bad transmitted frame ({why})");
                         }
+                        Ok(Some(p)) if p.dst_ip == CHR_IP4 && chr.is_some() => {
+                            // A reply to chronyd: UDP to its socket at this
+                            // very instant (T4), and time stops until it
+                            // has taken it.
+                            let c = chr.as_mut().unwrap();
+                            let cseq = c.shm.ld(CW_WAIT_SEQ);
+                            let pay = &bytes[42..42 + p.plen];
+                            match c.pending.remove(&(p.dport, p.origin)) {
+                                Some(q) => {
+                                    c.n_rep += 1;
+                                    let rx_sfd = q.rx_sfd_ns.unwrap_or(0);
+                                    let e2 = diff_ns(p.t2, ntp_of_ns(rx_sfd));
+                                    let e3 = diff_ns(p.t3, ntp_of_ns(tx_sfd_ns));
+                                    let (t1n, t4n) = (ntp_of_ns(q.t1_ns), ntp_of_ns(end_ns));
+                                    let off = (diff_ns(p.t2, t1n) + diff_ns(p.t3, t4n)) / 2.0;
+                                    let del = diff_ns(t4n, t1n) - diff_ns(p.t3, p.t2);
+                                    st_ce2.add(e2);
+                                    st_ce3.add(e3);
+                                    writeln!(
+                                        c.log,
+                                        "{},{},{},{},{end_ns},{:016x},{:016x},{rx_sfd},{tx_sfd_ns},{e2:.2},{e3:.2},\
+                                         {off:.2},{del:.2},{},{},{}",
+                                        q.idx,
+                                        p.dport,
+                                        q.req.len(),
+                                        q.t1_ns,
+                                        p.t2,
+                                        p.t3,
+                                        q.wire_ns.unwrap_or(0),
+                                        hex(&q.req),
+                                        hex(pay)
+                                    )
+                                    .unwrap();
+                                    c.log.flush().unwrap();
+                                }
+                                None => c.n_unmatched += 1,
+                            }
+                            c.shm.st(CW_VT_NS, end_ns as u64);
+                            if let Some(a) = c.addr.get(&p.dport) {
+                                let _ = c.sock.send_to(pay, a);
+                            }
+                            c.blocked = Some((cseq, Instant::now()));
+                            stop_c = true;
+                            clk_err.add(diff_ns((ctl.time.get() >> 32) as u64, ntp_of_ns(end_ns)));
+                        }
                         Ok(p) => {
                             if let Some(p) = p {
                                 match by_key.remove(&(p.dst_ip, p.dport, p.origin)) {
@@ -1065,6 +1420,9 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
                 }
             }
             vt = vt_at(now(), ff_ns);
+            if stop_c {
+                break;
+            }
         }
         sim_wall += ts.elapsed();
         // Deliver what the design sent, then publish the time.
@@ -1075,6 +1433,9 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
                 break;
             }
             out_q.pop_front();
+        }
+        if let Some(c) = chr.as_ref() {
+            c.shm.st(CW_VT_NS, vt as u64);
         }
         shm.st(SW_VT_NS, vt as u64);
         shm.w(SW_EPOCH).fetch_add(1, Ordering::SeqCst);
@@ -1100,6 +1461,23 @@ fn run<C: ConfigSet + 'static>(o: &Opts) -> i32 {
         }
     }
     shm.st(SW_STOP, 1);
+    if let Some(c) = chr.as_ref() {
+        c.shm.st(CW_STOP, 1);
+        let _ = c.shm.ld(CW_T0_NS);
+        let _ = c.shm.ld(CW_MAGIC);
+        eprintln!(
+            "ntpperf_bridge: chronyd: requests {}, replies {}, unanswered {}, queue drops {}, unmatched \
+             replies {}, deliveries not taken {}",
+            c.n_req,
+            c.n_rep,
+            c.pending.len(),
+            c.n_qdrop,
+            c.n_unmatched,
+            c.n_stuck
+        );
+        eprintln!("ntpperf_bridge: chronyd T2 - RX SFD (ns): {}", st_ce2.show());
+        eprintln!("ntpperf_bridge: chronyd T3 - TX SFD (ns): {}", st_ce3.show());
+    }
     let w = wall0.elapsed().as_secs_f64();
     let n = reqs.len();
     let answered = reqs.iter().filter(|r| r.reply.is_some()).count();
