@@ -13,9 +13,10 @@
 //! * `eth_rx -> ipv6_rx -> icmpv6 -> nbr_cache` (the learning path of the
 //!   IPv6 neighbor cache), frames as `fcs_check` delivers them.
 use ntp_fpga::arp::{Arp, ArpEntry};
+use ntp_fpga::arp::{ArpTiming, Board, Sim};
 use ntp_fpga::eth_rx::{EthMeta, EthRx};
 use ntp_fpga::eth_tx::EthHdr;
-use ntp_fpga::icmpv6::{Icmpv6, NdLearn};
+use ntp_fpga::icmpv6::{Icmpv6With, NdLearn};
 use ntp_fpga::ipv6_rx::{Ip6Meta, Ipv6Rx};
 use ntp_fpga::ipv6_tx::Ip6TxReq;
 use ntp_fpga::nbr_cache::NbrCache;
@@ -592,14 +593,15 @@ fn arp_pkt(op: u16, sha: u64, spa: u32, tha: u64, tpa: u32) -> Vec<u8> {
 }
 
 /// (eth dst, eth src, ARP payload) frames into `Arp`, then lookups of
-/// `look`, one after the other; returns (found, mac) per lookup.
-fn arp_run(frames: &[(u64, u64, Vec<u8>)], look: &[u32]) -> Vec<(bool, u64)> {
+/// `look`, one after the other; returns (found, mac) per lookup. `resolve`
+/// is an address the unit starts resolving before the first frame.
+fn arp_run(resolve: Option<u32>, frames: &[(u64, u64, Vec<u8>)], look: &[u32]) -> Vec<(bool, u64)> {
     let (mac_o, mac) = signal::<U<48>, DefaultClock>();
     let (ip_o, ip) = signal::<U<32>, DefaultClock>();
     let (fl_o, fl) = signal::<Bit, DefaultClock>();
     let (mt, mr) = chan::<EthMeta, DefaultClock>();
     let (pt, pr) = chan::<FrameByte, DefaultClock>();
-    let (_rt, rr) = chan::<U<32>, DefaultClock>();
+    let (rt, rr) = chan::<U<32>, DefaultClock>();
     let (lt, lr) = chan::<U<32>, DefaultClock>();
     let (ht, hr) = chan::<EthHdr, DefaultClock>();
     let (ot, or) = chan::<FrameByte, DefaultClock>();
@@ -612,7 +614,14 @@ fn arp_run(frames: &[(u64, u64, Vec<u8>)], look: &[u32]) -> Vec<(bool, u64)> {
     let (mut fi, mut bi) = (0usize, 0usize);
     let mut li = 0;
     let mut out = vec![];
+    let mut resolve = resolve;
     for _ in 0..(frames.len() * 120 + look.len() * 10 + 200) {
+        if let Some(r) = resolve {
+            if rt.ready().to_bool() {
+                rt.send(U::<32>::from(r));
+                resolve = None;
+            }
+        }
         if fi < frames.len() {
             let (d, s, p) = &frames[fi];
             if bi == 0 {
@@ -651,60 +660,88 @@ fn arp_run(frames: &[(u64, u64, Vec<u8>)], look: &[u32]) -> Vec<(bool, u64)> {
 
 const BCAST: u64 = 0xFFFF_FFFF_FFFF;
 
-/// ARP cache poisoning (finding F5). The cache learns from any ARP packet
-/// addressed to our IPv4 address, solicited or not, request or reply, and
-/// updates an existing entry in place: an on-link attacker redirects our
-/// requests to the gateway (so the NTP client's polls) with one unsolicited
-/// reply or one request. Packets not for us (gratuitous ARP, requests for
-/// another host) are not learned, and nothing ages.
+/// ARP cache poisoning (finding F5, fixed): the cache learns only the reply
+/// that answers our own pending resolution (op 2, sender = the address being
+/// resolved, addressed to our IP and MAC). The gateway is being resolved and
+/// answers first; whatever an on-link attacker sends afterwards (unsolicited
+/// reply, request carrying the gateway as sender, gratuitous ARP, wrong
+/// target...) never rebinds the entry.
 #[test]
 fn arp_poisoning_of_the_gateway() {
     let legit = (OUR_MAC, GW_MAC, arp_pkt(2, GW_MAC, GW4, OUR_MAC, LOCAL4));
-    let cases: Vec<(&str, (u64, u64, Vec<u8>), u64)> = vec![
-        ("unsolicited reply to us", (OUR_MAC, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, OUR_MAC, LOCAL4)), ATT_MAC),
-        ("request for us, broadcast", (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, LOCAL4)), ATT_MAC),
-        ("reply, eth src differs from sha", (OUR_MAC, GW_MAC, arp_pkt(2, ATT_MAC, GW4, OUR_MAC, LOCAL4)), ATT_MAC),
-        ("gratuitous request (tpa = spa)", (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, GW4)), GW_MAC),
-        ("gratuitous reply (tpa = spa)", (BCAST, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, BCAST, GW4)), GW_MAC),
-        ("request for another host", (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, 0xC000_0277)), GW_MAC),
+    let cases: Vec<(&str, (u64, u64, Vec<u8>))> = vec![
+        ("unsolicited reply to us", (OUR_MAC, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, OUR_MAC, LOCAL4))),
+        ("request for us, broadcast", (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, LOCAL4))),
+        ("reply, eth src differs from sha", (OUR_MAC, GW_MAC, arp_pkt(2, ATT_MAC, GW4, OUR_MAC, LOCAL4))),
+        ("gratuitous request (tpa = spa)", (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, GW4))),
+        ("gratuitous reply (tpa = spa)", (BCAST, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, BCAST, GW4))),
+        ("request for another host", (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, 0xC000_0277))),
     ];
-    for (what, f, want) in cases {
-        let r = arp_run(&[legit.clone(), f], &[GW4]);
-        assert_eq!(r, vec![(true, want)], "{what}");
+    for (what, f) in cases {
+        let r = arp_run(Some(GW4), &[legit.clone(), f], &[GW4]);
+        assert_eq!(r, vec![(true, GW_MAC)], "{what}");
     }
 }
 
-/// The desired property behind F5 (RFC 826 merge rule plus the usual
-/// hardening): an ARP packet that rebinds an address already in the cache
-/// to another MAC is not believed unless it answers our own pending
-/// request; the configured gateway's entry in particular is not
-/// overwritten by an unsolicited reply or by someone's request.
+/// Attacks that reach us while the gateway is being resolved but are not a
+/// valid reply to our request: they are ignored and the genuine reply that
+/// follows is learned. Without any resolution nothing is ever learned.
 #[test]
-#[ignore = "FINDING F5: unsolicited ARP replies/requests rebind the gateway (docs/security.md)"]
+fn arp_invalid_replies_while_resolving_and_without_resolution() {
+    let legit = (OUR_MAC, GW_MAC, arp_pkt(2, GW_MAC, GW4, OUR_MAC, LOCAL4));
+    let bad = vec![
+        (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, LOCAL4)),
+        (OUR_MAC, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, OUR_MAC, LOCAL4 + 1)),
+        (OUR_MAC, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, ATT_MAC, LOCAL4)),
+        (OUR_MAC, ATT_MAC, arp_pkt(2, ATT_MAC, GW4 + 1, OUR_MAC, LOCAL4)),
+        (BCAST, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, BCAST, GW4)),
+    ];
+    for f in &bad {
+        assert_eq!(arp_run(Some(GW4), &[f.clone(), legit.clone()], &[GW4, GW4 + 1]), vec![(true, GW_MAC), (false, 0)]);
+        // No resolution: neither the attack nor even the genuine reply is learned.
+        assert_eq!(arp_run(None, &[f.clone(), legit.clone()], &[GW4]), vec![(false, 0)]);
+    }
+}
+
+/// Residual risk, stated (docs/security.md F5): an attacker that answers our
+/// own request BEFORE the gateway wins the race (ARP without DAI/SEND); the
+/// genuine reply that follows is then unsolicited and ignored.
+#[test]
+fn arp_residual_race_attacker_answers_first() {
+    let att = (OUR_MAC, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, OUR_MAC, LOCAL4));
+    let legit = (OUR_MAC, GW_MAC, arp_pkt(2, GW_MAC, GW4, OUR_MAC, LOCAL4));
+    assert_eq!(arp_run(Some(GW4), &[att, legit], &[GW4]), vec![(true, ATT_MAC)]);
+}
+
+/// The desired property behind F5, formerly ignored: the gateway entry is
+/// not rebound by unsolicited packets.
+#[test]
 fn arp_gateway_entry_is_not_rebound_by_unsolicited_packets() {
     let legit = (OUR_MAC, GW_MAC, arp_pkt(2, GW_MAC, GW4, OUR_MAC, LOCAL4));
     for f in [
         (OUR_MAC, ATT_MAC, arp_pkt(2, ATT_MAC, GW4, OUR_MAC, LOCAL4)),
         (BCAST, ATT_MAC, arp_pkt(1, ATT_MAC, GW4, 0, LOCAL4)),
     ] {
-        assert_eq!(arp_run(&[legit.clone(), f], &[GW4]), vec![(true, GW_MAC)]);
+        assert_eq!(arp_run(Some(GW4), &[legit.clone(), f], &[GW4]), vec![(true, GW_MAC)]);
     }
 }
 
-/// Cache churn (finding F6): four ARP requests for us from four other
-/// hosts (any on-link client that ARPs us to send a request) evict the
-/// gateway; the client must resolve it again at its next poll.
+/// Cache churn (finding F6, fixed by F5): any number of requests for us
+/// (and unsolicited replies) from other hosts create no entry, so they cannot
+/// evict the gateway.
 #[test]
 fn arp_cache_eviction_by_ordinary_requests() {
     let mut frames = vec![(OUR_MAC, GW_MAC, arp_pkt(2, GW_MAC, GW4, OUR_MAC, LOCAL4))];
-    for k in 0..4u64 {
+    for k in 0..6u64 {
         let m = 0x0200_0000_1000 + k;
-        frames.push((BCAST, m, arp_pkt(1, m, 0xC000_0210 + k as u32, 0, LOCAL4)));
+        if k % 2 == 0 {
+            frames.push((BCAST, m, arp_pkt(1, m, 0xC000_0210 + k as u32, 0, LOCAL4)));
+        } else {
+            frames.push((OUR_MAC, m, arp_pkt(2, m, 0xC000_0210 + k as u32, OUR_MAC, LOCAL4)));
+        }
     }
-    let r = arp_run(&frames[..4], &[GW4]);
-    assert_eq!(r, vec![(true, GW_MAC)], "three clients: the gateway stays");
-    let r = arp_run(&frames, &[GW4]);
-    assert_eq!(r, vec![(false, 0)], "the fourth client evicts the gateway");
+    let r = arp_run(Some(GW4), &frames, &[GW4, 0xC000_0210]);
+    assert_eq!(r, vec![(true, GW_MAC), (false, 0)], "the gateway stays, the clients are not learned");
 }
 
 // ------------------------------------------------------------ IPv6 neighbor cache
@@ -771,8 +808,14 @@ fn ns(target: u128, slla: Option<u64>) -> Vec<u8> {
 }
 
 /// Frames through eth_rx -> ipv6_rx -> icmpv6 -> nbr_cache, then lookups;
-/// returns (found, mac) per lookup.
-fn nd_run(frames: &[Vec<u8>], look: &[u128]) -> Vec<(bool, u64)> {
+/// returns (found, mac) per lookup. `resolve` is the address the unit
+/// solicits before the first frame (None: no solicitation). An empty frame
+/// stands for an idle gap of 400 cycles.
+fn nd_run(resolve: Option<u128>, frames: &[Vec<u8>], look: &[u128]) -> Vec<(bool, u64)> {
+    nd_run_t::<Board>(resolve, frames, look)
+}
+
+fn nd_run_t<T: ArpTiming>(resolve: Option<u128>, frames: &[Vec<u8>], look: &[u128]) -> Vec<(bool, u64)> {
     let (mac_o, mac1) = signal::<U<48>, DefaultClock>();
     let mac2 = mac1.clone();
     let (sn_o, sn1) = signal::<U<24>, DefaultClock>();
@@ -804,12 +847,12 @@ fn nd_run(frames: &[Vec<u8>], look: &[u128]) -> Vec<(bool, u64)> {
     let (rq_t, rq) = chan::<Ip6TxReq, DefaultClock>();
     let (op_t, op) = chan::<FrameByte, DefaultClock>();
     let (st_t, st_r) = chan::<Ts, DefaultClock>();
-    let (_rs_t, rs_r) = chan::<U<128>, DefaultClock>();
+    let (rs_t, rs_r) = chan::<U<128>, DefaultClock>();
     let (ln_t, ln_r) = chan::<NdLearn, DefaultClock>();
     let (lk_t, lk_r) = chan::<U<128>, DefaultClock>();
     let (rsp_t, rsp_r) = chan::<ArpEntry, DefaultClock>();
     let (mut d_eth, mut d_rx, mut d_icmp, mut d_cache) =
-        (EthRx::default(), Ipv6Rx::default(), Icmpv6::default(), NbrCache::default());
+        (EthRx::default(), Ipv6Rx::default(), Icmpv6With::<T>::default(), NbrCache::default());
     let mut sim = Running::new(join2(
         join2(
             d_eth.run((in_r, mac1, sn1, st_r), (am_t, ap_t, v4m_t, v4p_t, v6m_t, v6p_t)),
@@ -825,12 +868,26 @@ fn nd_run(frames: &[Vec<u8>], look: &[u128]) -> Vec<(bool, u64)> {
     // Lookups start 150 cycles after the last frame byte (the learn has
     // reached the cache by then).
     let mut quiet = 0usize;
-    for _ in 0..(frames.len() * 200 + look.len() * 10 + 300) {
+    let mut resolve = resolve;
+    let mut gap = 0usize;
+    for _ in 0..(frames.len() * 200 + look.len() * 10 + 300 + 400 * frames.iter().filter(|f| f.is_empty()).count()) {
+        if let Some(r) = resolve {
+            if rs_t.ready().to_bool() {
+                rs_t.send(U::<128>::from(r));
+                resolve = None;
+            }
+        }
         if stamps < frames.len() as u64 && st_t.ready().to_bool() {
             stamps += 1;
             st_t.send(Ts::from(stamps));
         }
-        if fi < frames.len() {
+        if fi < frames.len() && frames[fi].is_empty() {
+            gap += 1;
+            if gap == 400 {
+                gap = 0;
+                fi += 1;
+            }
+        } else if fi < frames.len() {
             if in_t.ready().to_bool() {
                 let f = &frames[fi];
                 let last = bi + 1 == f.len();
@@ -857,40 +914,69 @@ fn nd_run(frames: &[Vec<u8>], look: &[u128]) -> Vec<(bool, u64)> {
     out
 }
 
-/// NDP spoofing (finding F5, IPv6 side; no SEND, RFC 3971, as nearly
-/// everywhere): an unsolicited NA (S = 0), even with O = 0 (RFC 4861
-/// 7.2.5: must not override an existing link-layer address), or an NS for
-/// us carrying a Source LLA, rebinds the gateway fe80::1 to the attacker.
-/// An NA with a hop limit below 255 (sent from off link) or to the
-/// all-nodes group is not learned.
+/// NDP spoofing (finding F5, IPv6 side, fixed): an NA is learned only when
+/// it answers our outstanding solicitation (target = the address being
+/// resolved, S = 1, source = target, hop limit 255); an NS never teaches.
+/// The gateway fe80::1 is solicited and answers; whatever the attacker sends
+/// afterwards, or before the genuine NA, never wins.
 #[test]
 fn nd_spoofing_of_the_gateway() {
     let legit = icmp6_frame(OUR_MAC, GW_MAC, GW6, LL, 255, 136, &na(0x60, GW6, Some(GW_MAC)));
     let all_nodes = 0xff02_0000_0000_0000_0000_0000_0000_0001u128;
-    let cases: Vec<(&str, Vec<u8>, u64)> = vec![
-        ("unsolicited NA, S=0 O=1", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 136, &na(0x20, GW6, Some(ATT_MAC))), ATT_MAC),
-        ("NA with O=0 (must not override)", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 136, &na(0x40, GW6, Some(ATT_MAC))), ATT_MAC),
-        ("NA without TLLA: eth source", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 136, &na(0x20, GW6, None)), ATT_MAC),
-        ("NA from another source address", icmp6_frame(OUR_MAC, ATT_MAC, 0xfe80_0000_0000_0000_0000_0000_0000_0bad, LL, 255, 136, &na(0x20, GW6, Some(ATT_MAC))), ATT_MAC),
-        ("NS for us with SLLA, source = gateway", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 135, &ns(LL, Some(ATT_MAC))), ATT_MAC),
-        ("NA hop limit 64 (off link)", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 64, 136, &na(0x20, GW6, Some(ATT_MAC))), GW_MAC),
-        ("NA to all-nodes", icmp6_frame(0x3333_0000_0001, ATT_MAC, GW6, all_nodes, 255, 136, &na(0x20, GW6, Some(ATT_MAC))), GW_MAC),
+    let other = 0xfe80_0000_0000_0000_0000_0000_0000_0bad_u128;
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("unsolicited NA, S=0 O=1", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 136, &na(0x20, GW6, Some(ATT_MAC)))),
+        ("NA with S=0 O=0", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 136, &na(0x00, GW6, Some(ATT_MAC)))),
+        ("NA without TLLA, S=0", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 136, &na(0x20, GW6, None))),
+        ("NA S=1 from another source address", icmp6_frame(OUR_MAC, ATT_MAC, other, LL, 255, 136, &na(0x60, GW6, Some(ATT_MAC)))),
+        ("NA S=1 for another target", icmp6_frame(OUR_MAC, ATT_MAC, other, LL, 255, 136, &na(0x60, other, Some(ATT_MAC)))),
+        ("NS for us with SLLA, source = gateway", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 135, &ns(LL, Some(ATT_MAC)))),
+        ("NA S=1 hop limit 64 (off link)", icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 64, 136, &na(0x60, GW6, Some(ATT_MAC)))),
+        ("NA to all-nodes, S=0", icmp6_frame(0x3333_0000_0001, ATT_MAC, GW6, all_nodes, 255, 136, &na(0x20, GW6, Some(ATT_MAC)))),
     ];
-    for (what, f, want) in cases {
-        let r = nd_run(&[legit.clone(), f], &[GW6]);
-        assert_eq!(r, vec![(true, want)], "{what}");
+    for (what, f) in cases {
+        let r = nd_run(Some(GW6), &[legit.clone(), f.clone()], &[GW6]);
+        assert_eq!(r, vec![(true, GW_MAC)], "{what}: after the genuine NA");
+        let r = nd_run(Some(GW6), &[f.clone(), legit.clone()], &[GW6]);
+        assert_eq!(r, vec![(true, GW_MAC)], "{what}: while resolving");
+        let r = nd_run(None, &[f, legit.clone()], &[GW6]);
+        assert_eq!(r, vec![(false, 0)], "{what}: no solicitation, nothing is learned");
     }
 }
 
-/// Neighbor cache churn (finding F6): four unsolicited NAs for unrelated
-/// targets evict the gateway (4 entries, round robin, no aging).
+/// Residual risk (docs/security.md F5): an attacker's valid-looking solicited
+/// NA that arrives before the genuine one wins the race (no SEND).
+#[test]
+fn nd_residual_race_attacker_answers_first() {
+    let att = icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 136, &na(0x60, GW6, Some(ATT_MAC)));
+    let legit = icmp6_frame(OUR_MAC, GW_MAC, GW6, LL, 255, 136, &na(0x60, GW6, Some(GW_MAC)));
+    assert_eq!(nd_run(Some(GW6), &[att, legit], &[GW6]), vec![(true, ATT_MAC)]);
+}
+
+/// Neighbor cache churn (finding F6, fixed by F5): unsolicited NAs for
+/// unrelated targets, even with S = 1, no longer evict the gateway.
 #[test]
 fn nd_cache_eviction_by_unsolicited_na() {
     let mut frames = vec![icmp6_frame(OUR_MAC, GW_MAC, GW6, LL, 255, 136, &na(0x60, GW6, Some(GW_MAC)))];
-    for k in 0..4u128 {
+    for k in 0..6u128 {
         let t = 0x2001_0db8_0000_0000_0000_0000_0000_1000 + k;
-        frames.push(icmp6_frame(OUR_MAC, ATT_MAC, t, GUA, 255, 136, &na(0x20, t, Some(ATT_MAC))));
+        frames.push(icmp6_frame(OUR_MAC, ATT_MAC, t, GUA, 255, 136, &na(0x60, t, Some(ATT_MAC))));
     }
-    let r = nd_run(&frames, &[GW6]);
-    assert_eq!(r, vec![(false, 0)], "the gateway was evicted");
+    let r = nd_run(Some(GW6), &frames, &[GW6]);
+    assert_eq!(r, vec![(true, GW_MAC)], "the gateway stays");
+}
+
+/// An NA that arrives after the pending-solicitation timeout is ignored
+/// (`Sim` timeout: 300 cycles); on time it is learned.
+#[test]
+fn nd_na_after_the_timeout_is_not_learned() {
+    let legit = icmp6_frame(OUR_MAC, GW_MAC, GW6, LL, 255, 136, &na(0x60, GW6, Some(GW_MAC)));
+    let r = nd_run_t::<Sim>(Some(GW6), &[vec![], legit.clone()], &[GW6]);
+    assert_eq!(r, vec![(false, 0)], "late NA");
+    let r = nd_run_t::<Sim>(Some(GW6), &[legit.clone()], &[GW6]);
+    assert_eq!(r, vec![(true, GW_MAC)], "on-time NA");
+    // A second genuine NA after the entry was learned is ignored (one learn per solicitation).
+    let again = icmp6_frame(OUR_MAC, ATT_MAC, GW6, LL, 255, 136, &na(0x60, GW6, Some(ATT_MAC)));
+    let r = nd_run_t::<Sim>(Some(GW6), &[legit, again], &[GW6]);
+    assert_eq!(r, vec![(true, GW_MAC)], "a second solicited-looking NA");
 }
