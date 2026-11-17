@@ -57,7 +57,7 @@ use crate::ipv6_tx::Ip6TxReq;
 use crate::stream::FrameByte;
 use txhdl::comp::{mux, Clock, DefaultClock, Reg, Rx, Tx, Unit};
 use txhdl::types::{Bit, U};
-use txhdl::{lower, with, Trace};
+use txhdl::{check, cover, lower, with, Trace};
 
 const IDLE: u8 = 0;
 const PAY: u8 = 1;
@@ -127,6 +127,22 @@ impl Unit<(Rx<IpTxReq>, Rx<FrameByte>, Rx<IpTxReq>, Rx<FrameByte>), (Tx<IpTxReq>
                 payload.send(ob);
             }
             let end = go & o_last;
+            // ---- formal properties (orchestrator; docs/formal.md, rows "Flux d'octets", row tx_arb) ----
+            check!(!take | is_idle, "a source is granted only between packets");
+            check!(!go | is_pay, "payload bytes are forwarded only inside a granted packet");
+            check!(!(take & go), "a grant and a payload byte never share a cycle");
+            check!(!(t0 & t1), "one source granted at a time");
+            check!(!take | (q0 | q1), "a grant needs a pending request");
+            check!(!(take & q0 & q1) | (s1 != rr), "both pending: the source not granted last wins (round robin)");
+            check!(!(take & q1 & !q0) | s1, "only source 1 pending: it wins");
+            check!(!(take & q0 & !q1) | !s1, "only source 0 pending: it wins");
+            check!(!go | pv, "a byte is forwarded only when the granted source offers one");
+            check!(!end | o_last, "the packet ends on the granted source's last byte");
+            cover!(take & q0 & q1, "both sources compete");
+            cover!(take & s1, "source 1 is granted");
+            cover!(end, "a packet is completed");
+            cover!(is_pay & !payload.ready() & pv, "back-pressure inside a packet");
+
             with!(self <= {
                 take ? { st: U::<1>::from(PAY), gr: s1, rr: s1 },
                 end ? st: U::<1>::from(IDLE),
@@ -201,6 +217,22 @@ impl Unit<(Rx<Ip6TxReq>, Rx<FrameByte>, Rx<Ip6TxReq>, Rx<FrameByte>), (Tx<Ip6TxR
                 payload.send(ob);
             }
             let end = go & o_last;
+            // ---- formal properties (orchestrator; docs/formal.md, rows "Flux d'octets", row tx_arb) ----
+            check!(!take | is_idle, "a source is granted only between packets");
+            check!(!go | is_pay, "payload bytes are forwarded only inside a granted packet");
+            check!(!(take & go), "a grant and a payload byte never share a cycle");
+            check!(!(t0 & t1), "one source granted at a time");
+            check!(!take | (q0 | q1), "a grant needs a pending request");
+            check!(!(take & q0 & q1) | (s1 != rr), "both pending: the source not granted last wins (round robin)");
+            check!(!(take & q1 & !q0) | s1, "only source 1 pending: it wins");
+            check!(!(take & q0 & !q1) | !s1, "only source 0 pending: it wins");
+            check!(!go | pv, "a byte is forwarded only when the granted source offers one");
+            check!(!end | o_last, "the packet ends on the granted source's last byte");
+            cover!(take & q0 & q1, "both sources compete");
+            cover!(take & s1, "source 1 is granted");
+            cover!(end, "a packet is completed");
+            cover!(is_pay & !payload.ready() & pv, "back-pressure inside a packet");
+
             with!(self <= {
                 take ? { st: U::<1>::from(PAY), gr: s1, rr: s1 },
                 end ? st: U::<1>::from(IDLE),

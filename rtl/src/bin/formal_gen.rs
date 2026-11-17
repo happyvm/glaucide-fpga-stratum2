@@ -34,6 +34,11 @@ fn main() {
             ntp_fpga::ipv4_hdr_equiv::Ipv4HdrEquiv::verilog("ipv4_hdr_equiv")
         ),
         Some("ntp_client") => print!("{}", ntp_fpga::ntp_client::NtpClient::verilog("ntp_client")),
+        Some("ip_arb4") => print!("{}", ntp_fpga::ip_arb::IpArb4::verilog("ip_arb4")),
+        Some("ip_arb6") => print!("{}", ntp_fpga::ip_arb::IpArb6::verilog("ip_arb6")),
+        Some("udp_arb4") => print!("{}", ntp_fpga::udp_arb::UdpArb4::verilog("udp_arb4")),
+        Some("udp_arb6") => print!("{}", ntp_fpga::udp_arb::UdpArb6::verilog("udp_arb6")),
+        Some("meta_arb") => print!("{}", ntp_fpga::udp_arb::MetaArb::verilog("meta_arb")),
         Some("nbr_cache") => print!("{}", ntp_fpga::nbr_cache::NbrCache::verilog("nbr_cache")),
         Some("formal_smoke") => print!("{}", Digit::verilog("formal_smoke")),
         Some("crc_equiv") => print!("{}", ntp_fpga::crc_equiv::CrcEquiv::verilog("crc_equiv")),
