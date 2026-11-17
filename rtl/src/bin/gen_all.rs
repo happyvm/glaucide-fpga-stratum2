@@ -15,6 +15,7 @@ fn main() {
         Some("eth_rx") => print!("{}", EthRx::verilog("eth_rx")),
         Some("eth_tx") => print!("{}", EthTx::verilog("eth_tx")),
         Some("fcs_check") => print!("{}", FcsCheck::verilog("fcs_check")),
+        Some("rx_path") => print!("{}", ntp_fpga::rx_path::RxPathMii::verilog("rx_path")),
         other => {
             eprintln!("unknown module {other:?}");
             std::process::exit(1);
