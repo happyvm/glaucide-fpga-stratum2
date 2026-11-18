@@ -354,3 +354,18 @@ tools/golden` et `tools/golden/ntpclient` verts ; `python3 tools/formal/contract
 `top_gen` (serveur et `--with-client`) : Yosys `read_verilog` + `hierarchy -check -top
 arty_top_board` + `proc` + `check -assert` sans problème. Preuves formelles non relancées
 (l'orchestrateur les refait, voir § 6).
+
+
+## Placement/routage indicatif (nextpnr-xilinx)
+
+Mesure sans Vivado, au commit `0cc611f` ; méthode et limites dans `tools/pnr/README.md`. Cœur `arty_top` seul (sans MMCM ni tampons d'horloge), toutes horloges visées à 100 MHz, XC7A100T.
+
+| Carte | Graine | Fmax `clk` (système) | Fmax `clk_rx` | Fmax `clk_tx` |
+|---|---:|---:|---:|---:|
+| Serveur | 1 / 2 / 3 | 42,7 / 43,2 / 43,6 MHz | 181 / 148 / 142 MHz | 125 / 114 / 101 MHz |
+| Stratum 2 (client) | 1 | 34,8 MHz | 79,7 MHz | 108,8 MHz |
+
+- **Aucune carte n'atteint 100 MHz sur l'horloge système** avec cet outil. Les horloges MII sont visées à 100 MHz alors qu'elles tournent à 25 MHz : seul `clk` est à lire strictement ; `clk_rx` passe sur le serveur et manque sur la carte client à 100 MHz, ce qui reste très au-dessus de 25 MHz.
+- Serveur, chemin critique de `clk` (23,4 ns, dont **21 ns de routage** pour 2,4 ns de logique, 11 étages de LUT) : registre d'indice de bucket du limiteur → lecture de la table `rl` (RAM distribuée) → chaîne de comparaisons → registre. Quelques liaisons de 4 à 6 ns traversent la puce : placement médiocre plus que logique profonde. Client : 24,5 ns de routage pour 4,2 ns de logique.
+- Utilisation après remplacement des DSP par des LUT : serveur 25 879 LUT (20 %), 15 441 bascules (12 %), 526 CARRY4 ; client 58 522 LUT (46 %), 30 552 bascules (24 %), 1 862 CARRY4. Ces LUT sont plus nombreuses que l'estimation Yosys de `docs/resources.md` (éclatement de `RAM256X1S` en `RAM64M`, multiplieurs en LUT) ; les chiffres de ressources de référence restent ceux de `resources.md`.
+- **Ce que cela indique** : le chemin du limiteur (`ntp_server`, accès à `rl` puis comparaison) est le premier à surveiller sous Vivado, avec les multiplieurs de la carte client ; un étage de registre après la lecture de `rl` est la première piste. Ce n'est pas une preuve d'échec : Vivado route généralement bien mieux, et les contraintes `tools/vivado/top_timing.xdc` ne sont pas appliquées ici.

@@ -63,5 +63,6 @@ La somme des modules isolés ne vaut pas le niveau supérieur : elle compte une 
 - `icmpv6` (2 811 LUT) : comparaisons d'adresses 128 bits et graine de checksum à une seule étape (risque de timing, voir `docs/timing.md`).
 
 ## Limites
+- Un placement/routage indicatif (nextpnr-xilinx) donne des chiffres d'utilisation et de Fmax différents : voir `docs/timing.md`, section « Placement/routage indicatif ».
 - Ni MMCM, ni tampons d'horloge BUFG/BUFGCE, ni contraintes : le comptage final dépend de Vivado (`tools/vivado/README.md`).
 - Les marges de timing à 100 MHz ne sont pas mesurées ici.
