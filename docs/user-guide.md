@@ -133,8 +133,7 @@ python3 -m venv /chemin/v && /chemin/v/bin/pip install pyosys
 
 Méthode : Yosys natif, `synth_xilinx -family xc7` sur chaque `out/*.v`, module par module, sans
 optimisation inter-modules, sans niveau supérieur ni analyse de timing ; précision annoncée ±15 %. Résultats
-(photographie ancienne, sans client) dans [resources.md](resources.md). Ce script n'a pas été relancé pour ce
-guide (`pyosys` n'est pas installé dans l'environnement où il a été écrit). Seuls les dénombrements de
+(cartes complètes serveur et client, mises à jour) dans [resources.md](resources.md). Seuls les dénombrements de
 bascules de la section 3 (`top_gen` suivi de Yosys) viennent de [top-client-hooks.md](top-client-hooks.md).
 
 ## 5. Où est chaque module

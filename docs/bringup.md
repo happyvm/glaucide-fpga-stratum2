@@ -71,8 +71,8 @@ Sorties dans `out/vivado/` : `arty_ntp.bit`, `post_synth.dcp`, `post_route.dcp`,
    `eth_tx_clk` ; ils sont placés en groupes asynchrones par `top_timing.xdc`.
 5. `methodology.rpt` et `drc.rpt` : chaque avertissement sur un croisement d'horloge, un reset ou une E/S est
    à comprendre.
-6. `utilization.rpt` : à comparer à l'estimation ([resources.md](resources.md), environ 15 % des LUT pour le serveur
-   seul ; 29 255 bascules sur 126 800 pour la carte avec client d'après Yosys). Un écart important signale un
+6. `utilization.rpt` : à comparer à l'estimation ([resources.md](resources.md), environ 31 % des LUT et 15 441 bascules pour le
+   serveur seul ; 39 190 LUT et 30 313 bascules sur 126 800 pour la carte avec client d'après Yosys). Un écart important signale un
    problème de génération.
 7. `clock_utilization.rpt` : sept tampons globaux attendus (retour MMCM, `clk_sys`, `clk_25`, copies libres
    `eth_rx_clk`/`eth_tx_clk`, deux `BUFGCE`).

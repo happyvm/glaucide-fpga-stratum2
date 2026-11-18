@@ -344,7 +344,7 @@ Par ordre d'importance :
 Ressources : les changements de T5.3 ne modifient pas la consommation de façon notable
 (`tools/estimate_resources.py` sur les modules modifiés : `selection` −52 LUT / +219 bascules
 pour le pipeline du comparateur et `rdx`, les autres à ±70 LUT et ±20 bascules) ;
-`docs/resources.md` n'est pas mis à jour.
+`docs/resources.md` a depuis été remesuré (cartes complètes).
 
 ## 8. Vérifications faites après les modifications
 

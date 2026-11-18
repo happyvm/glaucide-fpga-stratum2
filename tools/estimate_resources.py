@@ -15,8 +15,8 @@ COST = {"RAM64M": 4, "RAM32M": 4, "RAM64X1S": 1, "RAM32X1S": 1, "RAM64X1D": 2, "
 
 def synth(path):
     src = open(path).read()
-    # Yosys refuses the 4096-step memory init loop of tx_path; the init is irrelevant here.
-    src = re.sub(r"^\s*initial for \(mem_i.*$", "", src, flags=re.M)
+    # Yosys refuses the 4096-step memory init loops of tx_path and the rate limiter; the init is irrelevant here.
+    src = re.sub(r"^\s*initial for \((?:mem_i|rl_i).*$", "", src, flags=re.M)
     top = re.search(r"^module\s+(\w+)", src, re.M).group(1)
     with tempfile.TemporaryDirectory() as d:
         v, st = os.path.join(d, "m.v"), os.path.join(d, "m.stat")

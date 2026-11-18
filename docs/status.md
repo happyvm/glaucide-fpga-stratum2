@@ -19,7 +19,7 @@ Serveur NTP **stratum 2, IPv4 + IPv6**, entièrement en logique, sur Arty A7-100
 **Vérification**
 - ≈ 36 000 lignes de Rust (≈ 15 800 de source, ≈ 20 100 de test) plus les modèles Python : 38 suites de tests Rust, 59 + 81 tests Python (modèles de référence : `tools/golden/` pour le protocole, `tools/golden/ntpclient/` pour filtre/sélection/servo/client).
 - Preuves formelles (SymbiYosys) : voir `docs/formal-report.md`.
-- Estimation de ressources : `docs/resources.md` (≈ 15 % des LUT pour le serveur ; la carte avec client compte environ 29 000 bascules sur 126 800).
+- Estimation de ressources : `docs/resources.md` (serveur seul ≈ 31 % des LUT et 12 % des bascules ; carte stratum 2 avec client ≈ 62 % des LUT, 24 % des bascules, 12 DSP).
 
 ## Mesuré en simulation
 - Horodatage d'émission (T3) contre l'instant SFD réel sur les broches : **+5 à +10 ns** avec les vraies unités MII à 25 MHz (8 phases) ; réception (T2) : 0 à +5 ns. Hors latence propre du PHY, à mesurer sur carte.
