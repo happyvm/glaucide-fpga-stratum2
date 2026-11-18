@@ -723,6 +723,11 @@ impl Unit<(Rx<Sample>, Rx<U<2>>), Tx<PeerStat>> for ClockFilter {
             check!(!q_v | self.q_tks.get() | (Bit::from(self.p_tnow.read(wp) == self.q_tnow.get()) & Bit::from(self.p_meta.read(wp) == self.q_meta.get())), "tnow and the metadata of a peer change only when a sample of that peer is taken (a miss leaves them)");
             check!(!q_v | self.q_acc.get() | (!(self.p_hv.read(wp).bit(0) ^ self.q_hv.get()) & Bit::from(self.p_tlast.read(wp) == self.q_tlast.get()) & Bit::from(self.p_roff.read(wp) == self.q_roff.get()) & Bit::from(self.p_rdly.read(wp) == self.q_rdly.get()) & Bit::from(self.p_rdsp.read(wp) == self.q_rdsp.get()) & Bit::from(self.p_rjit.read(wp) == self.q_rjit.get())), "the result of a peer changes only when an update of that peer is accepted");
             check!(!self.q_acc.get() | (m_acc & Bit::from(cp == wp)), "a result is accepted only for the peer of the event");
+            // Within the reach of the solver (the four below need 22 to 300 cycles: simulation only).
+            cover!(take_s, "a sample is taken");
+            cover!(take_m, "a miss is taken");
+            cover!(s_agef, "the dispersion of a stage is aged");
+            cover!(s_rank, "the ageing pass ends");
             cover!(send_o & m_s & valid & m_acc, "a sample is accepted and reported valid");
             cover!(send_o & !m_s & !valid, "a miss is reported with valid = 0");
             cover!(send_o & m_s & !m_acc, "a sample that is not usable leaves the result unchanged");
