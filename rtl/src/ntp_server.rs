@@ -525,6 +525,12 @@ pub struct NtpServer {
     pub k: Reg<U<6>>,
     /// `(time >> 32) + tx_latency` of the previous cycle.
     pub t3p: Reg<U<64>>,
+    /// Registered read of the rate-limiter table: `rl[bix]` of the previous
+    /// cycle. `bix` is final 33 cycles after a request is taken and the
+    /// request's last byte comes at least 47 cycles after that, so in cycle L
+    /// this register holds `rl[bix]`. It cuts the path
+    /// `bix` -> table read -> compare -> table write into two.
+    pub rlq: Reg<U<32>>,
     /// Rate limiter: `{sec[31:16], cnt[15:0]}` per bucket (distributed RAM:
     /// the read is asynchronous; Yosys 0.5x refuses to map it to block RAM,
     /// see the header).
@@ -540,6 +546,8 @@ pub struct NtpServer {
     pub m_rc: Reg<U<64>>,
     /// T3 as sent in byte 40 (check!/cover! only).
     pub m_t3: Reg<U<64>>,
+    /// Cycles since the last request was taken, saturating at 63.
+    pub m_t: Reg<U<6>>,
 }
 
 #[lower]
@@ -712,7 +720,8 @@ impl
 
             // Rate limiter (cycle L).
             let sec = now.slice::<64, 16>();
-            let word = self.rl.read(bucket);
+            let word_rd = self.rl.read(bucket);
+            let word = self.rlq.get();
             let same = Bit::from(word.slice::<16, 16>() == sec);
             let cnt = mux(same, word.slice::<0, 16>(), U::<16>::from(0u16));
             let lim = rate_limit.get();
@@ -798,6 +807,15 @@ impl
             check!(!(done & go) | (Bit::from((m_b0 & 7u8) == 3u8) & (Bit::from(((m_b0 >> 3u32) & 7u8) == 3u8) | Bit::from(((m_b0 >> 3u32) & 7u8) == 4u8))), "answered only if mode 3 and version 3 or 4 (N2, N3)");
             check!(!ok0 | (Bit::from((m_b0 & 7u8) == 3u8) & Bit::from(vn_r.zext::<8>() == ((m_b0 >> 3u32) & 7u8)) & (Bit::from(vn_r == 3u8) | Bit::from(vn_r == 4u8))), "ok0 reflects the raw first byte");
             check!(!(done & go_k) | (!allowed & !leaked), "a KoD only when the request is limited and not leaked");
+            // Why the registered read is current: `bix` is final once 34 cycles passed since the
+            // request was taken (hs = 32), a request is judged only at byte 47 or later (so
+            // after at least 47 cycles) and the table is written only when a request is judged.
+            let m_t = self.m_t.get();
+            check!(Bit::from(self.pos.get() <= m_t) | !is_recv, "bytes taken never exceed the cycles since the request was taken");
+            check!(Bit::from(hs == mux(Bit::from(m_t < U::<6>::from(32u8)), m_t, U::<6>::from(32u8))), "the hash step counter is the number of cycles since the request was taken, up to 32");
+            check!(!(Bit::from(m_t >= U::<6>::from(34u8)) & is_recv) | Bit::from(hs == U::<6>::from(32u8)), "the hash is complete 34 cycles after the request was taken");
+            check!(!(Bit::from(m_t >= U::<6>::from(36u8)) & is_recv) | Bit::from(word == word_rd), "the registered table read is current from cycle 36 of a request");
+            check!(!(done & valid) | Bit::from(word == word_rd), "the registered table read is current when a request is judged (cycle L)");
             check!(!(done & go_n & go_k), "a request gets a normal reply or a KoD, not both");
             check!(!(done & go_k) | kod_enable.get(), "a KoD only when enabled");
             check!(!(done & go) | valid, "nothing is answered unless valid");
@@ -894,6 +912,8 @@ impl
 
             with!(self <= {
                 t3p: now.slice::<32, 64>() + tx_latency.get(),
+                rlq: word_rd,
+                m_t: mux(take_m, U::<6>::from(0u8), mux(Bit::from(self.m_t.get() == U::<6>::from(63u8)), U::<6>::from(63u8), self.m_t.get() + U::<6>::from(1u8))),
                 take_m ? {
                     st: U::<2>::from(RECV),
                     sel6: pick6,
