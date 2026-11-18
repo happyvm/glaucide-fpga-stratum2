@@ -1,0 +1,957 @@
+// SPDX-License-Identifier: Apache-2.0
+//! NTP server reply builder (tasks T2.3, T2.4, T2.7, and the shared v4/v6
+//! front of T3.6), domain `DefaultClock` (`clk_sys`, 100 MHz).
+//!
+//! One unit, [`NtpServer`], turns client requests (the UDP payload of a
+//! datagram to port 123, IPv4 or IPv6) into 48-byte server replies
+//! (RFC 5905 §7.3, §8, §9.2 `fast_xmit`), applies the policy of T2.4
+//! (which requests get an answer, per-source rate limit, Kiss-o'-Death
+//! `RATE`) and writes the precision field of T2.7. The byte-exact
+//! specification is `tools/golden/responder.py` (rules N1-N10).
+//!
+//! # Ports (flat, in this order)
+//!
+//! Inputs:
+//!
+//! | port | type | meaning |
+//! |---|---|---|
+//! | `meta4`, `req4` | `Rx<Meta>`, `Rx<FrameByte>` | IPv4 requests: `udp4_rx`'s `ntp_meta`, `ntp` |
+//! | `meta6`, `req6` | `Rx<Meta>`, `Rx<FrameByte>` | IPv6 requests: same contract from the IPv6 UDP layer |
+//! | `time` | `In<U<96>>` | clock accumulator (`DisciplinedClock`), NTP time = `time >> 32` |
+//! | `synced` | `In<Bit>` | the clock is synchronised to an upstream |
+//! | `stratum` | `In<U<8>>` | stratum to announce when synchronised (2) |
+//! | `ref_id` | `In<U<32>>` | Reference ID in IPv4 replies (first wire byte most significant) |
+//! | `ref_id6` | `In<U<32>>` | Reference ID in IPv6 replies (rule N8 of the model, see below) |
+//! | `ref_ts` | `In<U<64>>` | Reference Timestamp (32.32): last update of the clock |
+//! | `root_delay` | `In<U<32>>` | Root Delay, NTP short format 16.16 |
+//! | `root_disp` | `In<U<32>>` | Root Dispersion, 16.16 |
+//! | `precision` | `In<U<8>>` | Precision, signed log2 seconds, two's complement (default −24 = `0xE8`, [`DEFAULT_PRECISION`], T2.7) |
+//! | `tx_latency` | `In<U<64>>` | constant K added to the sampled time for T3, units of 2^-32 s (see « Transmit timestamp ») |
+//! | `rate_limit` | `In<U<16>>` | replies per second allowed per source, 0 = unlimited |
+//! | `kod_enable` | `In<Bit>` | over the limit: 0 = silence, 1 = a 48-byte KoD `RATE` |
+//! | `hash_key` | `In<U<64>>` | multiplier of the rate-limiter hash, `rl_mult(ConfigSet::RATE_SECRET)` (a constant) |
+//! | `leak` | `In<U<16>>` | over the limit, still answer with probability `leak / 2^16` ([`RL_LEAK_Q16`] = 1/16), 0 = never |
+//!
+//! Outputs: `reply_meta: Tx<NtpReplyMeta>` (one per reply, sent before its
+//! first byte) and `reply: Tx<FrameByte>` (exactly 48 bytes per reply,
+//! `last` on the 48th).
+//!
+//! Every wire input (`synced` .. `leak`) is sampled in the cycle
+//! named below for it; they may change at any time otherwise.
+//!
+//! # Input contract
+//!
+//! Each request source is a pair (`Meta`, payload) with the contract of
+//! `stream.rs`: one `Meta` per datagram, then the UDP payload bytes, `last`
+//! on the final one, `err` with `last` = the datagram is bad (UDP checksum,
+//! FCS...). Used fields of `Meta`: `src` (client address, IPv4 in the low
+//! 32 bits), `dst` (the address the request was sent to), `sport` (client
+//! port), `eth_src` (client MAC), `rx_ts` (receive timestamp of the frame,
+//! NTP 32.32, threaded in-band by T1.13). `family`, `dport` and `len` are
+//! not used: the family is the channel the request came on (`meta4`/`req4`
+//! = IPv4, `meta6`/`req6` = IPv6), the destination port is 123 by
+//! construction of the UDP layer, and the length is counted on the stream.
+//! A source must deliver the payload of each `Meta` it sent (at least one
+//! byte); the unit waits for it.
+//!
+//! # Behaviour, one request at a time
+//!
+//! States: IDLE → RECV → (META → OUT) → IDLE.
+//!
+//! 1. **IDLE**: if `meta4` or `meta6` has a `Meta`, one is popped (round
+//!    robin: when both are pending, the family *not* served last wins, IPv6
+//!    first after reset (`rr` = 0 reads as "IPv4 served last"); when
+//!    only one is pending it is taken). Its fields are registered, together
+//!    with the rate-limiter key of the source (see « Rate limiter »). No
+//!    payload byte is taken in this cycle.
+//! 2. **RECV**: the payload of the chosen source is taken, one byte per
+//!    cycle when present, never stalled (the other source is not touched).
+//!    Parsed on the fly: byte 0 (LI/VN/Mode), byte 2 (Poll), bytes 40-47
+//!    (the client's Transmit Timestamp, kept as Origin). Bytes after the
+//!    48th (extension fields, MAC) are taken and ignored. In the cycle the
+//!    byte with `last` is taken (**cycle L**), the unit decides:
+//!    * the request is *valid* iff (N1) it has at least 48 bytes and its
+//!      UDP source port is not 0, 7, 13, 17, 19 or 37 (F8, « Source port
+//!      rule »), (N2)
+//!      Mode = 3, (N3) VN = 3 or 4 (the model's set: VN 0, 1, 2, 5, 6, 7 are
+//!      dropped), and its `last` came without `err`;
+//!    * a valid request goes through the rate limiter (below): *allowed* or
+//!      *limited*;
+//!    * valid and allowed: a normal reply; valid, limited and
+//!      `kod_enable = 1`: a KoD reply; anything else: **nothing is emitted
+//!      at all** (no `reply_meta`, no byte) and the unit returns to IDLE.
+//!
+//!    Nothing is ever emitted before the request's `last` is known, so a
+//!    request ending with `err` simply produces nothing (`reply` never
+//!    carries `err`: the reply stream's `err` is constant 0).
+//!    In cycle L the unit samples `synced`, `stratum`, `ref_id`/`ref_id6`,
+//!    `ref_ts`, `root_delay`, `root_disp`, `precision`, `rate_limit`,
+//!    `kod_enable`, `leak` and the seconds of `time` (for the rate limiter), and
+//!    builds bytes 0-39 of the reply into registers.
+//! 3. **META**: `reply_meta` is sent as soon as it has room:
+//!    `family` = the source channel (0 IPv4, 1 IPv6), `dst_ip` = `Meta.src`
+//!    (the client), `src_ip` = `Meta.dst` (we answer from the address the
+//!    request was sent to), `dst_mac` = `Meta.eth_src`, `sport` = 123,
+//!    `dport` = `Meta.sport`, `len` = 48.
+//! 4. **OUT**: the 48 reply bytes go out on `reply`, one per cycle when it
+//!    has room, `last` on byte 47, `err` = 0. After byte 47 is sent the unit
+//!    is in IDLE the next cycle and takes the next request.
+//!
+//! # Reply fields (normal reply)
+//!
+//! Let `sync = synced & (stratum != 0) & (stratum < 16)` (sampled in L): an
+//! out-of-range stratum input is treated as "not synchronised", so a
+//! server reply never carries stratum 0 (that would read as a KoD) nor
+//! LI = 0 with stratum 16.
+//!
+//! | bytes | field | value |
+//! |---|---|---|
+//! | 0 | LI, VN, Mode | LI = 0 if `sync` else 3 (N4); VN = request's VN (3 or 4, = min(VN, 4), N5); Mode = 4 |
+//! | 1 | Stratum | `stratum` if `sync` else 16 (N6) |
+//! | 2 | Poll | request's byte 2 (N7) |
+//! | 3 | Precision | `precision` input (T2.7) |
+//! | 4-7 | Root Delay | `root_delay` |
+//! | 8-11 | Root Dispersion | `root_disp` |
+//! | 12-15 | Reference ID | `ref_id` for an IPv4 request, `ref_id6` for IPv6 (N8; kept when not synchronised, as the model) |
+//! | 16-23 | Reference Timestamp | `ref_ts` |
+//! | 24-31 | Origin Timestamp | request bytes 40-47, verbatim (N9) |
+//! | 32-39 | Receive Timestamp | `Meta.rx_ts` |
+//! | 40-47 | Transmit Timestamp | T3, below |
+//!
+//! Multi-byte fields are big endian (first wire byte = most significant).
+//! The reply is exactly 48 bytes (N10), never longer than the request
+//! (which is at least 48): no amplification.
+//!
+//! # Transmit timestamp (T3)
+//!
+//! Let **S** be the cycle in which reply byte 40 is sent on `reply`. The
+//! unit keeps a pipeline register `t3p <= (time >> 32) + tx_latency`
+//! (modulo 2^64) loaded every cycle, so in cycle S `t3p` holds the value
+//! computed from `time` and `tx_latency` **of cycle S − 1**. Then
+//!
+//! `T3 = max(t3p, rx_ts)` (unsigned 64-bit compare),
+//!
+//! so **T3 ≥ Receive Timestamp holds unconditionally** (unsigned). Without
+//! the clamp it would hold only under the assumption that the clock is
+//! monotone between the frame's receive stamp and S (no backward step by
+//! the servo, no wrap of the 64-bit NTP time, i.e. no era change, in
+//! between) and `tx_latency` ≥ 0; under that assumption the clamp never
+//! acts. Sampling at byte 40 (and not at L) means every stall of `reply`
+//! before byte 40 moves T3 with it; stalls after it, and queueing
+//! downstream, are not covered (see below).
+//!
+//! ## `tx_latency` (K)
+//!
+//! K is the time from the sampling of `time` (cycle S − 1) to the instant
+//! the reply's SFD is put on the MII, for a reply that finds the transmit
+//! path idle. It is the sum of
+//!
+//! 1. `clk_sys` cycles from S − 1 to the cycle `tx_path` accepts the last
+//!    byte (FCS) of the frame from `eth_tx` (call it s0): 7 more reply
+//!    bytes, `udp4_tx`'s store and forward (2 cycles of latency, then the
+//!    8 + 48 datagram bytes), `ipv4_tx`'s 20 header bytes, `tx_arb`'s
+//!    header cycle, `eth_tx`'s 14 header bytes and 4 FCS bytes, one byte per
+//!    cycle, plus the registered channels in between. Measured by the
+//!    chain test (`rtl/tests/ntp_server.rs`, `chain_ntp4_basic`):
+//!    [`TX_CYCLES_V4`] = 108 cycles for IPv4 (90-byte frame + 4 FCS);
+//!    the IPv6 frame has a 40-byte IP header instead of 20,
+//!    [`TX_CYCLES_V6`] = 128 cycles (`chain_latency_v6`, through `ipv6_tx`
+//!    with `udp4_tx` standing in for the UDP layer, whose latency structure
+//!    T3.4 is expected to mirror; the testbench's extra relay stage is
+//!    subtracted);
+//! 2. `tx_path`'s latency from s0 to the SFD strobe of `mii_tx` (the
+//!    `ClkTx` edge where the SFD's 0xD nibble goes out): 770 to 810 ns for
+//!    a frame that finds the transmitter idle (its header, « Latency
+//!    model »), taken at the middle, [`TX_PATH_LATENCY_PS`] = 790 ns.
+//!    This includes the 7 preamble bytes and the SFD (15 nibbles).
+//!
+//! Defaults: [`TX_LATENCY_V4`] = 108 × 10 ns + 790 ns = 1.870 µs = 8032
+//! units of 2^-32 s, and [`TX_LATENCY_V6`] = 128 × 10 ns + 790 ns = 2.070 µs
+//! = 8891 units (rounded to nearest; the uncertainty is ±20 ns from
+//! `tx_path`'s window, ±1 `clk_sys` cycle of channel phase). The
+//! reference instant (SFD 0xD nibble on the MII) is the same one the
+//! receive stamp of `rx_path` estimates, so the PHY latencies (DP83848J,
+//! fixed, to be measured on the board, T5.4) are excluded from both; that
+//! is why K is an input wire: calibrate on the board. Not covered by K:
+//! the ±20 ns phase jitter of the `clk_sys`/`ClkTx` handshake in
+//! `tx_path`; a frame queued behind another one in `tx_arb`/`eth_tx`/
+//! `tx_path` (whole frame times, e.g. at line rate behind the previous
+//! reply), or a stall of `reply` after byte 40: T3 is then early by that
+//! amount. A single K serves both families only approximately (the IPv6
+//! frame is 20 bytes longer, 200 ns); the integration may feed K per
+//! family from the family of the reply in progress, or accept the error.
+//!
+//! # Kiss-o'-Death `RATE` (RFC 8633, RFC 5905 §7.4)
+//!
+//! Sent instead of silence only when `kod_enable` = 1 and the request is
+//! valid but rate limited. Same 48-byte layout and same `reply_meta`, with:
+//! LI = 3, Stratum = 0, Reference ID = ASCII "RATE" (`0x52415445`),
+//! Reference Timestamp = 0, Origin = request's Transmit (N9 as usual),
+//! **Receive = Transmit = the request's Transmit** (as ntpd does: a KoD
+//! carries no time). VN, Mode 4, Poll, Precision, Root Delay and Root
+//! Dispersion as in a normal reply. A KoD is never larger than the request.
+//! Every limited request gets one KoD when enabled (the KoD itself is not
+//! further limited): the reply volume equals the request volume at most.
+//!
+//! # Rate limiter (T2.4/T2.5, hardened by findings F1 and F2)
+//!
+//! **Table.** [`RL_ENTRIES`] = 4096 words (12-bit index) in distributed RAM
+//! (`#[distributed]`, 512 RAM256X1S = about 2 050 LUT-RAM; the read is
+//! asynchronous and Yosys refuses to map this memory to block RAM even with a
+//! dedicated address register, so block RAM (4 RAMB36) is left to a later
+//! change that makes the read synchronous. Estimate for the whole unit with
+//! `tools/estimate_resources.py`: about 1 800 LUT of logic, 2 050 LUT-RAM,
+//! 1 200 FF, against 1 224 LUT, 32 LUT-RAM, 866 FF before: about +2 600 LUTs, 4 % of the device).
+//! Each word is `{sec: U<16>, cnt: U<16>}`: the low 16 bits of the NTP
+//! seconds of the window it counts, and the replies counted in it. The table
+//! starts at zero (bitstream initial value) and has no reset.
+//!
+//! **Key.** The IPv4 address (zero extended to 64 bits) for IPv4, the upper
+//! 64 bits (the /64 prefix) for IPv6 (an IPv6 host normally owns a whole
+//! /64, so limiting per address would be no limit).
+//!
+//! **Hash** ([`rl_index`]): `bucket = ((m * key + b) mod 2^64) >> 52`, i.e.
+//! the top 12 bits of a 64-bit multiply-add (multiply-shift hashing; for a
+//! random odd `m` any two distinct keys collide with probability at most
+//! 2/4096). `m = rl_mult(RATE_SECRET)` is SplitMix64 of the per-device secret
+//! `ConfigSet::RATE_SECRET`, made odd (computed at elaboration: the
+//! `hash_key` wire carries it as a constant), and `b = rotl32(m) xor
+//! 0x9E3779B97F4A7C15`. The function is NOT linear over GF(2) (carries), so
+//! unlike the old XOR fold sources cannot be chosen to collide by a public
+//! formula: without `m`, nothing predicts which sources share a bucket.
+//! The product is computed serially, two multiplier bits per cycle, 32
+//! steps (registers `hx`, `hm`, `hacc`, `hs`), starting in the IDLE cycle
+//! that pops the `Meta`; a *valid* request has at least 48 payload bytes,
+//! so the bucket is ready (cycle >= 49 after the pop) long before cycle L.
+//! A request that ends earlier is invalid and never reads the table.
+//!
+//! **Rate semantics.** In cycle L, for a *valid* request only (invalid ones,
+//! including those dropped by the source-port rule, do not touch the table),
+//! with `now` = bits 64..79 of `time` (low 16 bits of the NTP seconds) and
+//! `lim` = `rate_limit`:
+//!
+//! * `c` = `cnt` if `sec == now`, else 0 (a new one-second window);
+//! * allowed iff `lim == 0` (unlimited) or `c < lim`; the word becomes
+//!   `{now, c + 1}` if allowed and `lim != 0`, else `{now, c}`;
+//! * **leak (F2)**: a request over the limit is nevertheless answered with
+//!   probability `leak / 2^16` = 2^-[`RL_LEAK_LOG2`] = 1/16 (wire `leak`,
+//!   [`RL_LEAK_Q16`] in the integration, 0 = never, used by the
+//!   deterministic tests). A leaked request gets a normal reply (not a KoD)
+//!   and is *not* counted. Otherwise it is silence, or a KoD if `kod_enable`.
+//!
+//! The leak decision is `rng[39:24] < leak`, `rng` being a 64-bit state
+//! advanced every cycle (`rng <= xorshift64(rng) xor weyl`, a Weyl counter
+//! `weyl += 0x9E3779B97F4A7C15` so the state never sticks at 0) into which
+//! the receive timestamp of each request is xored when it is popped (the
+//! low bits are the phase of the asynchronous PHY clock, a few bits of noise
+//! per request that the sender does not control). It is not a cryptographic
+//! generator: its only job is to make "which of the requests over the limit
+//! leaks" unpredictable to a remote sender without cycle-exact knowledge of
+//! the arrival time, a state that moves 10^8 times per second.
+//!
+//! **Guarantees (worst case, `lim` = `rate_limit`, `p` = 2^-4, `n` requests
+//! of one source in one NTP second window, all valid and answered or not).**
+//! * Replies to one source key per window: `lim + B`, with `B` binomial
+//!   `(n - lim, p)`, expectation `lim + (n - lim) p`, never more than `n`.
+//!   With `lim` = 8 and a flood at line rate (109 000 requests/s) that is
+//!   `8 + 6 812` = 6 820 replies/s on average (6 820 x 94 bytes = 5.1 Mb/s
+//!   for a flood of 80 Mb/s: a reduction by 16, never an amplification), at
+//!   2 000 requests/s `8 + 124.5` = 132 +- 11. The test
+//!   `leak_rate_over_the_limit` measures 123 and 128 normal replies for 2 000
+//!   requests (expected 132.5 for the first window).
+//! * Replies in the whole table per window: at most `4096 lim + N p` for `N`
+//!   requests in total (`lim` = 8: 32 768 + `N`/16, against 64 x 8 = 512
+//!   before the fix). A flood that makes every bucket reach its limit needs
+//!   about 4096 x 9 = 36 900 requests/s from at least as many distinct
+//!   sources (the old limiter fell to 576), and even then each legitimate
+//!   request keeps a 1/16 chance.
+//! * The leak does not defeat the purpose: it lowers the reflected volume
+//!   by 16 at best (a flood of `N` requests/s produces at most `lim + N/16`
+//!   replies/s per source) and the victim of a spoofed flood still receives
+//!   at most the same.
+//!
+//! **What an attacker can do.** Flood from one source: that source gets
+//! `lim + n/16` replies per second. Spoof a victim V: V's real requests
+//! are then answered with probability 1/16 each (they were never answered
+//! before the fix, F2); a client that retries (ntpd, chrony: every 1 to 8
+//! seconds in burst mode) gets through. Shares of a bucket with V: needs
+//! the secret. Deny the whole service: needs about 37 000 forged requests/s
+//! from varied sources, and even then every legitimate request has a 1/16
+//! chance. **What it cannot do**: choose sources that collide (without
+//! `RATE_SECRET`; the 2/4096 universality bound holds for any pair), make the
+//! unit send more than one 48-byte reply per request, or exceed the
+//! per-window bound above. **Limits**: the secret is a build constant, so
+//! it is the same for the whole life of a bitstream and can in principle be
+//! learned by an adversary who can run many chosen probe floods against
+//! the live device (an oracle: flood X, then watch whether a source Y of its
+//! own is limited; a pair per test, thousands of probes to map one bucket);
+//! it is not secret from whoever has the bitstream or the source; it must be
+//! chosen per deployment (`config.rs`). Window edges: fixed windows aligned
+//! on whole seconds allow up to `2 lim` replies in a sliding second that
+//! straddles a boundary. A word whose window is exactly 65536 s old is taken
+//! for the current one (only early limiting, never extra replies).
+//!
+//! # Source port rule (F8, server part)
+//!
+//! Rule N1 is extended: a request whose UDP source port is 0 (reserved),
+//! 7 (echo), 13 (daytime), 17 (quote of the day), 19 (chargen) or 37 (time),
+//! [`src_port_denied`], is invalid: nothing is emitted and the limiter is not
+//! touched. These are the classic small services (RFC 862, 867, 865, 864,
+//! 868) that echo or answer text to whoever sends them a datagram: a request
+//! with such a source port is either a reflection towards the service or the
+//! start of a loop with it (a chargen line starting with `c` is itself a valid
+//! mode 3 request; our mode 4 reply echoed back is dropped by N2). 123 and
+//! every other port, including the neighbouring ones and all ports above
+//! 1023, are served. The source-ADDRESS filters of F8 are in `ipv4_rx` and
+//! `udp6_rx`, not here.
+//!
+//! # Throughput
+//!
+//! Per request, without stalls: 1 cycle (IDLE, `Meta`) + `n` cycles (the
+//! `n` payload bytes, n ≥ 48) + 1 cycle (META) + 48 cycles (OUT) =
+//! **`n + 50` cycles, 98 for a plain 48-byte request**, against ~917
+//! cycles between two requests at the IPv4 line rate (109 000/s). The
+//! test `throughput_back_to_back` measures it. A request is not taken
+//! while a reply is still being handed to `reply`: the input stalls
+//! (`udp4_rx` and the layers below buffer).
+//!
+//! # Integration
+//!
+//! All channels must be registered channels or FIFOs (never port to port,
+//! see the netlist note of `stream.rs`). `reply_meta` is sent before the
+//! first `reply` byte; one `reply_meta` is followed by exactly one 48-byte
+//! reply. Adapters from [`NtpReplyMeta`] to the UDP transmit requests
+//! (`udp4_tx`'s `UdpTxReq`, the future `udp6_tx`) are the integration's.
+//! `meta4`/`meta6` are popped independently of the payload channels (in
+//! IDLE); the producer may send a `Meta` before or with its first byte.
+use crate::stream::{FrameByte, Meta};
+use txhdl::comp::{mux, Clock, DefaultClock, In, Mem, Reg, Rx, Tx, Unit};
+use txhdl::types::{Bit, U};
+use txhdl::{assume, check, cover, lower, with, Trace, Transaction as TransactionDerive, Value as ValueDerive};
+
+/// UDP port of NTP.
+pub const NTP_PORT: u16 = 123;
+/// Length of every reply (and minimum length of a request), bytes.
+pub const NTP_LEN: u16 = 48;
+/// Default precision field: −24 (≈ 60 ns, `docs/references.md`), T2.7.
+pub const DEFAULT_PRECISION: u8 = 0xE8;
+/// Reference ID of a Kiss-o'-Death `RATE` packet: ASCII "RATE".
+pub const KOD_RATE: u32 = 0x5241_5445;
+/// Address bits of the rate-limiter table.
+pub const RL_IDX_BITS: u32 = 12;
+/// Words of the rate-limiter table.
+pub const RL_ENTRIES: usize = 1 << RL_IDX_BITS;
+/// Leak probability exponent: a request over its limit is still answered
+/// with probability 2^-`RL_LEAK_LOG2` (F2). The integration feeds the
+/// `leak` wire with [`RL_LEAK_Q16`].
+pub const RL_LEAK_LOG2: u32 = 4;
+/// The `leak` wire value for [`RL_LEAK_LOG2`]: probability in units of 2^-16.
+pub const RL_LEAK_Q16: u16 = 1 << (16 - RL_LEAK_LOG2);
+
+/// `clk_sys` cycles from the sampling of `time` (cycle S − 1) to the cycle
+/// `tx_path` accepts the last FCS byte, IPv4 reply on an idle path
+/// (measured by `chain_ntp4_basic`).
+pub const TX_CYCLES_V4: u64 = 108;
+/// Same for IPv6: 20 more header bytes (measured by `chain_latency_v6`).
+pub const TX_CYCLES_V6: u64 = TX_CYCLES_V4 + 20;
+/// `tx_path` latency from the last byte accepted to the SFD strobe,
+/// middle of its documented 770..810 ns, in picoseconds.
+pub const TX_PATH_LATENCY_PS: u64 = 790_000;
+/// Period of `clk_sys`, picoseconds.
+pub const CLK_SYS_PS: u64 = 10_000;
+
+/// Picoseconds to NTP 2^-32 s units, rounded to nearest.
+pub const fn ps_to_ntp(ps: u64) -> u64 {
+    ((ps as u128 * (1u128 << 32) + 500_000_000_000) / 1_000_000_000_000) as u64
+}
+
+/// Default `tx_latency` for IPv4 replies, 2^-32 s units.
+pub const TX_LATENCY_V4: u64 = ps_to_ntp(TX_CYCLES_V4 * CLK_SYS_PS + TX_PATH_LATENCY_PS);
+/// Default `tx_latency` for IPv6 replies, 2^-32 s units.
+pub const TX_LATENCY_V6: u64 = ps_to_ntp(TX_CYCLES_V6 * CLK_SYS_PS + TX_PATH_LATENCY_PS);
+
+/// Where and how a reply goes; one per reply, before its 48 bytes.
+#[derive(TransactionDerive, ValueDerive, Clone, Copy, Default, Debug)]
+pub struct NtpReplyMeta {
+    /// 0 = IPv4, 1 = IPv6 (the channel the request came on).
+    pub family: Bit,
+    /// The client's address (the request's source); IPv4 in the low 32 bits.
+    pub dst_ip: U<128>,
+    /// The address the request was sent to: answer from it.
+    pub src_ip: U<128>,
+    /// The client's MAC (the request frame's source MAC).
+    pub dst_mac: U<48>,
+    /// 123.
+    pub sport: U<16>,
+    /// The client's source port.
+    pub dport: U<16>,
+    /// UDP payload length: 48.
+    pub len: U<16>,
+}
+
+/// Multiplicative constant of the Weyl counter of the leak generator
+/// (2^64 / golden ratio, odd).
+pub const RNG_WEYL: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// SplitMix64 finaliser (Steele, Lea, Flood): a bijective, well mixing
+/// function of 64 bits, used at elaboration time only.
+pub const fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(RNG_WEYL);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The multiplier of the rate-limiter hash for a secret: SplitMix64 of the
+/// secret, made odd. It is what the integration puts on the `hash_key`
+/// wire (a constant: the mixing costs no hardware). Mixing it at build time
+/// makes the quality of the hash independent of the structure of the
+/// secret (a multiply-shift hash is poor for a multiplier such as
+/// 0x1111...).
+pub const fn rl_mult(secret: u64) -> u64 {
+    splitmix64(secret) | 1
+}
+
+/// The additive constant of the rate-limiter hash for a multiplier: the
+/// multiplier rotated by 32 bits, xor [`RNG_WEYL`] (computed in hardware
+/// from the `hash_key` wire).
+pub const fn rl_add(mult: u64) -> u64 {
+    mult.rotate_left(32) ^ RNG_WEYL
+}
+
+/// Rate-limiter bucket of a 64-bit source key under a 64-bit secret: the
+/// top [`RL_IDX_BITS`] bits of `(m * key + rl_add(m)) mod 2^64` with
+/// `m = rl_mult(secret)` (multiply-shift hashing, Dietzfelbinger et al.).
+/// This is the exact function the unit computes serially (see « Rate
+/// limiter »); the key is the IPv4 address zero extended, or the /64
+/// prefix of an IPv6 address.
+pub const fn rl_index(key: u64, secret: u64) -> usize {
+    let m = rl_mult(secret);
+    (m.wrapping_mul(key).wrapping_add(rl_add(m)) >> (64 - RL_IDX_BITS)) as usize
+}
+
+/// Quality test of a rate-limiter secret (ntpperf finding N1, `docs/security.md`): a
+/// multiply-shift hash is universal only on average over its multiplier, and for some
+/// secrets CONSECUTIVE client addresses fall into very few buckets and share limits.
+/// This counts the distinct buckets used by arithmetic progressions of addresses (a /24
+/// of hosts: stride 1 and 2; consecutive /24 and /16 networks: strides 256 and 65536,
+/// starting at 192.0.2.0) and requires at least ~90 % of what a random function would
+/// use (random expectation: 2589 of 4096 for 4096 keys, 1612 for 2048). It is a const
+/// fn: `config::Checks` runs it at compile time, `tools/gen_rate_secret.py` is the same
+/// test in Python to pick a value. About 4 secrets in 10 pass.
+pub const fn rl_secret_ok(secret: u64) -> bool {
+    const CASES: [(u64, usize, usize); 4] =
+        [(1, 4096, 2330), (2, 4096, 2330), (256, 2048, 1450), (65536, 2048, 1450)];
+    let mut c = 0;
+    while c < CASES.len() {
+        let (stride, n, min) = CASES[c];
+        let mut seen = [false; 4096];
+        let mut distinct = 0usize;
+        let mut i = 0u64;
+        while i < n as u64 {
+            let b = rl_index(0xC000_0200u64 + i * stride, secret);
+            if !seen[b] {
+                seen[b] = true;
+                distinct += 1;
+            }
+            i += 1;
+        }
+        if distinct < min {
+            return false;
+        }
+        c += 1;
+    }
+    true
+}
+
+/// UDP source ports a request is never answered from (rule N1 extended,
+/// F8): 0 (reserved, no valid sender) and the classic "small services"
+/// echo (7), daytime (13), qotd (17), chargen (19), time (37), the ones
+/// that answer or reflect text/binary back to the sender.
+pub const fn src_port_denied(p: u16) -> bool {
+    matches!(p, 0 | 7 | 13 | 17 | 19 | 37)
+}
+
+const IDLE: u8 = 0;
+const RECV: u8 = 1;
+const META: u8 = 2;
+const OUT: u8 = 3;
+
+#[derive(Trace, Default)]
+pub struct NtpServer {
+    /// IDLE, RECV, META, OUT.
+    pub st: Reg<U<2>>,
+    /// The request in progress came on `meta6`/`req6`.
+    pub sel6: Reg<Bit>,
+    /// The last request taken was IPv6 (round robin).
+    pub rr: Reg<Bit>,
+    /// Payload bytes taken, saturating at 48.
+    pub pos: Reg<U<6>>,
+    /// Byte 0 says Mode 3 and VN 3 or 4.
+    pub ok0: Reg<Bit>,
+    pub vn: Reg<U<3>>,
+    pub poll: Reg<U<8>>,
+    /// Request bytes 40-47 (client Transmit), shifted in; the reply's Origin.
+    pub org: Reg<U<64>>,
+    pub m_src: Reg<U<128>>,
+    pub m_dst: Reg<U<128>>,
+    pub m_sport: Reg<U<16>>,
+    pub m_esrc: Reg<U<48>>,
+    pub m_rxts: Reg<U<64>>,
+    /// Rate-limiter hash, serial multiplier: the source key, shifted right
+    /// 2 bits per step (its two low bits are the digit in use).
+    pub hx: Reg<U<64>>,
+    /// Multiplicand `rl_mult(secret)`, shifted left 2 bits per step.
+    pub hm: Reg<U<64>>,
+    /// Accumulator, starts at `rl_add(secret)`; its top 12 bits are the
+    /// bucket once `hs` reached 32.
+    pub hacc: Reg<U<64>>,
+    /// Hash steps done, saturates at 32.
+    pub hs: Reg<U<6>>,
+    /// Bucket index, loaded when the product is complete; the only user of
+    /// it is the table's address (read and write).
+    pub bix: Reg<U<12>>,
+    /// Leak generator: xorshift state and Weyl counter.
+    pub rng_x: Reg<U<64>>,
+    pub rng_w: Reg<U<64>>,
+    /// The reply in progress is a KoD.
+    pub kod: Reg<Bit>,
+    /// Reply image: `ra` bytes 0-15, `rb` 16-31, `rc` 32-39; byte k is the
+    /// top byte of `ra` when it is sent, the three shift left by 8 together.
+    pub ra: Reg<U<128>>,
+    pub rb: Reg<U<128>>,
+    pub rc: Reg<U<64>>,
+    /// Reply bytes sent (0..=47).
+    pub k: Reg<U<6>>,
+    /// `(time >> 32) + tx_latency` of the previous cycle.
+    pub t3p: Reg<U<64>>,
+    /// Rate limiter: `{sec[31:16], cnt[15:0]}` per bucket (distributed RAM:
+    /// the read is asynchronous; Yosys 0.5x refuses to map it to block RAM,
+    /// see the header).
+    #[distributed]
+    pub rl: Mem<U<32>, 4096, DefaultClock>,
+    // Monitors (only read by check!/cover!; pruned in synthesis): the raw first byte of the
+    // request, and whether the request in progress was accepted (reply or KoD).
+    pub m_b0: Reg<U<8>>,
+    pub m_go: Reg<Bit>,
+    /// Image of bytes 0-39 as built in cycle L (never shifted).
+    pub m_ra: Reg<U<128>>,
+    pub m_rb: Reg<U<128>>,
+    pub m_rc: Reg<U<64>>,
+    /// T3 as sent in byte 40 (check!/cover! only).
+    pub m_t3: Reg<U<64>>,
+}
+
+#[lower]
+impl
+    Unit<
+        (
+            Rx<Meta>,
+            Rx<FrameByte>,
+            Rx<Meta>,
+            Rx<FrameByte>,
+            In<U<96>>,
+            In<Bit>,
+            In<U<8>>,
+            In<U<32>>,
+            In<U<32>>,
+            In<U<64>>,
+            In<U<32>>,
+            In<U<32>>,
+            In<U<8>>,
+            In<U<64>>,
+            In<U<16>>,
+            In<Bit>,
+            In<U<64>>,
+            In<U<16>>,
+        ),
+        (Tx<NtpReplyMeta>, Tx<FrameByte>),
+    > for NtpServer
+{
+    async fn run(
+        &mut self,
+        (
+            meta4,
+            req4,
+            meta6,
+            req6,
+            time,
+            synced,
+            stratum,
+            ref_id,
+            ref_id6,
+            ref_ts,
+            root_delay,
+            root_disp,
+            precision,
+            tx_latency,
+            rate_limit,
+            kod_enable,
+            hash_key,
+            leak,
+        ): (
+            Rx<Meta>,
+            Rx<FrameByte>,
+            Rx<Meta>,
+            Rx<FrameByte>,
+            In<U<96>>,
+            In<Bit>,
+            In<U<8>>,
+            In<U<32>>,
+            In<U<32>>,
+            In<U<64>>,
+            In<U<32>>,
+            In<U<32>>,
+            In<U<8>>,
+            In<U<64>>,
+            In<U<16>>,
+            In<Bit>,
+            In<U<64>>,
+            In<U<16>>,
+        ),
+        (reply_meta, reply): (Tx<NtpReplyMeta>, Tx<FrameByte>),
+    ) {
+        loop {
+            DefaultClock::rising().await;
+            let st = self.st.get();
+            let sel6 = self.sel6.get();
+            let pos = self.pos.get();
+            let org = self.org.get();
+            let k = self.k.get();
+            let ra = self.ra.get();
+            let rb = self.rb.get();
+            let rc = self.rc.get();
+            let kod = self.kod.get();
+            let is_idle = Bit::from(st == IDLE);
+            let is_recv = Bit::from(st == RECV);
+            let is_meta = Bit::from(st == META);
+            let is_out = Bit::from(st == OUT);
+            let now = time.get();
+
+            // ---------------------------------------------------- IDLE
+            let v4 = Bit::from(meta4.peek().is_some());
+            let v6 = Bit::from(meta6.peek().is_some());
+            let pick6 = v6 & (!v4 | !self.rr.get());
+            let take_m = is_idle & (v4 | v6);
+            let _ = meta4.recv_if(take_m & !pick6);
+            let _ = meta6.recv_if(take_m & pick6);
+            let m4 = meta4.head();
+            let m6 = meta6.head();
+            let n_src = mux(pick6, m6.src, m4.src);
+            let n_dst = mux(pick6, m6.dst, m4.dst);
+            let n_sport = mux(pick6, m6.sport, m4.sport);
+            let n_esrc = mux(pick6, m6.eth_src, m4.eth_src);
+            let n_rxts = mux(pick6, m6.rx_ts, m4.rx_ts);
+            let key = mux(
+                pick6,
+                n_src.slice::<64, 64>(),
+                n_src.slice::<0, 32>().zext::<64>(),
+            );
+            // Rate-limiter hash: loaded here, computed serially during RECV.
+            let sec_k = hash_key.get(); // the multiplier `rl_mult(secret)`
+            let h_a = sec_k | U::<64>::from(1u64);
+            let h_b = ((sec_k << 32u32) | (sec_k >> 32u32)) ^ U::<64>::from(RNG_WEYL);
+
+            // ---------------------------------------------------- RECV
+            let p4 = Bit::from(req4.peek().is_some());
+            let p6 = Bit::from(req6.peek().is_some());
+            let b4 = req4.head();
+            let b6 = req6.head();
+            let have = mux(sel6, p6, p4);
+            let data = mux(sel6, b6.data, b4.data);
+            let last = mux(sel6, b6.last, b4.last);
+            let err = mux(sel6, b6.err, b4.err);
+            let take = is_recv & have;
+            let _ = req4.recv_if(take & !sel6);
+            let _ = req6.recv_if(take & sel6);
+
+            let mode = data.slice::<0, 3>();
+            let vn = data.slice::<3, 3>();
+            let hdr_ok = Bit::from(mode == 3) & (Bit::from(vn == 3) | Bit::from(vn == 4));
+            let in_ts = Bit::from(pos >= 40) & Bit::from(pos < 48);
+            let org_sh = (org << 8u32) | data.zext::<64>();
+            // Origin complete in cycle L even when byte 47 is the last one.
+            let org_now = mux(Bit::from(pos == 47), org_sh, org);
+            let done = take & last;
+            // N1 extended (F8): never answer from a UDP source port of 0 or
+            // of an echo-style service.
+            let sp = self.m_sport.get();
+            let sp_ok = !(Bit::from(sp == 0u16)
+                | Bit::from(sp == 7u16)
+                | Bit::from(sp == 13u16)
+                | Bit::from(sp == 17u16)
+                | Bit::from(sp == 19u16)
+                | Bit::from(sp == 37u16));
+            let valid = self.ok0.get() & Bit::from(pos >= 47) & !err & sp_ok;
+
+            // Serial multiply-add, two multiplier bits per step, 32 steps
+            // (`hs` = 0..31, the product is complete when `hs` = 32).
+            let hs = self.hs.get();
+            let hx = self.hx.get();
+            let hm = self.hm.get();
+            let hacc = self.hacc.get();
+            let h_run = Bit::from(hs < U::<6>::from(32u8)) & !take_m;
+            let zero64 = U::<64>::from(0u64);
+            let hp0 = mux(hx.bit(0), hm, zero64);
+            let hp1 = mux(hx.bit(1), hm << 1u32, zero64);
+            let hacc_n = hacc + hp0 + hp1;
+            let bucket = self.bix.get();
+            let bix_n = hacc_n.slice::<52, 12>();
+
+            // Leak generator: xorshift64 step xor a Weyl counter (so the
+            // state never sticks at 0), the receive timestamp of each
+            // request folded in when it is taken.
+            let rx_ = self.rng_x.get();
+            let rw_ = self.rng_w.get();
+            let xs1 = rx_ ^ (rx_ << 13u32);
+            let xs2 = xs1 ^ (xs1 >> 7u32);
+            let xs3 = xs2 ^ (xs2 << 17u32);
+            let rng_n = xs3 ^ rw_ ^ mux(take_m, n_rxts, zero64);
+            let leak_w = leak.get();
+            let leak_hit = Bit::from(rx_.slice::<24, 16>() < leak_w);
+
+            // Rate limiter (cycle L).
+            let sec = now.slice::<64, 16>();
+            let word = self.rl.read(bucket);
+            let same = Bit::from(word.slice::<16, 16>() == sec);
+            let cnt = mux(same, word.slice::<0, 16>(), U::<16>::from(0u16));
+            let lim = rate_limit.get();
+            let unl = Bit::from(lim == U::<16>::from(0u16));
+            let allowed = unl | Bit::from(cnt < lim);
+            let cnt_n = mux(allowed & !unl, cnt + U::<16>::from(1u16), cnt);
+            let word_n = (sec.zext::<32>() << 16u32) | cnt_n.zext::<32>();
+            // Over the limit: a leaked request is answered like an allowed
+            // one but not counted (F2).
+            let leaked = !allowed & leak_hit;
+            let go_n = valid & (allowed | leaked);
+            let go_k = valid & !allowed & !leaked & kod_enable.get();
+            let go = go_n | go_k;
+
+            // Reply image (cycle L).
+            let s_in = stratum.get();
+            let sync = synced.get()
+                & Bit::from(s_in != U::<8>::from(0u8))
+                & Bit::from(s_in < U::<8>::from(16u8));
+            let alarm = go_k | !sync;
+            let li = mux(alarm, U::<2>::from(3u8), U::<2>::from(0u8));
+            let b0 =
+                (li.zext::<8>() << 6u32) | (self.vn.get().zext::<8>() << 3u32) | U::<8>::from(4u8);
+            let s_out = mux(go_k, U::<8>::from(0u8), mux(sync, s_in, U::<8>::from(16u8)));
+            let rid = mux(
+                go_k,
+                U::<32>::from(KOD_RATE),
+                mux(sel6, ref_id6.get(), ref_id.get()),
+            );
+            let n_ra = (b0.zext::<128>() << 120u32)
+                | (s_out.zext::<128>() << 112u32)
+                | (self.poll.get().zext::<128>() << 104u32)
+                | (precision.get().zext::<128>() << 96u32)
+                | (root_delay.get().zext::<128>() << 64u32)
+                | (root_disp.get().zext::<128>() << 32u32)
+                | rid.zext::<128>();
+            let n_rts = mux(go_k, U::<64>::from(0u64), ref_ts.get());
+            let n_rb = (n_rts.zext::<128>() << 64u32) | org_now.zext::<128>();
+            let n_rc = mux(go_k, org_now, self.m_rxts.get());
+
+            // ---------------------------------------------------- META
+            let send_m = is_meta & reply_meta.ready();
+            if send_m.to_bool() {
+                reply_meta.send(NtpReplyMeta {
+                    family: sel6,
+                    dst_ip: self.m_src.get(),
+                    src_ip: self.m_dst.get(),
+                    dst_mac: self.m_esrc.get(),
+                    sport: U::<16>::from(NTP_PORT),
+                    dport: self.m_sport.get(),
+                    len: U::<16>::from(NTP_LEN),
+                });
+            }
+
+            // ---------------------------------------------------- OUT
+            let rx = self.m_rxts.get();
+            let t3p = self.t3p.get();
+            let t3c = mux(Bit::from(t3p < rx), rx, t3p);
+            let t3 = mux(kod, org, t3c);
+            let at40 = Bit::from(k == 40);
+            let o_last = Bit::from(k == 47);
+            let send_o = is_out & reply.ready();
+            let data_o = mux(at40, t3.slice::<56, 8>(), ra.slice::<120, 8>());
+            if send_o.to_bool() {
+                reply.send(FrameByte {
+                    data: data_o,
+                    last: o_last,
+                    err: Bit::Zero,
+                });
+            }
+            let ra_sh = (ra << 8u32) | rb.slice::<120, 8>().zext::<128>();
+            let ra_n = mux(at40, t3.zext::<128>() << 72u32, ra_sh);
+            let rb_sh = (rb << 8u32) | rc.slice::<56, 8>().zext::<128>();
+
+            // ---- formal properties (orchestrator; docs/formal.md, row "NTP serveur") ----
+            assume!(!(have & is_recv) | !err | last, "payload: err only together with last (stream contract 2)");
+            let m_b0 = self.m_b0.get();
+            let m_go = self.m_go.get();
+            let ok0 = self.ok0.get();
+            let vn_r = self.vn.get();
+            // Which requests are answered (N1-N3, F8), restated from the raw first byte.
+            check!(!(done & go) | (Bit::from(pos >= 47) & !err & sp_ok), "answered only if at least 48 bytes, no err, source port not reserved (N1, F8)");
+            check!(!(done & go) | (Bit::from((m_b0 & 7u8) == 3u8) & (Bit::from(((m_b0 >> 3u32) & 7u8) == 3u8) | Bit::from(((m_b0 >> 3u32) & 7u8) == 4u8))), "answered only if mode 3 and version 3 or 4 (N2, N3)");
+            check!(!ok0 | (Bit::from((m_b0 & 7u8) == 3u8) & Bit::from(vn_r.zext::<8>() == ((m_b0 >> 3u32) & 7u8)) & (Bit::from(vn_r == 3u8) | Bit::from(vn_r == 4u8))), "ok0 reflects the raw first byte");
+            check!(!(done & go_k) | (!allowed & !leaked), "a KoD only when the request is limited and not leaked");
+            check!(!(done & go_n & go_k), "a request gets a normal reply or a KoD, not both");
+            check!(!(done & go_k) | kod_enable.get(), "a KoD only when enabled");
+            check!(!(done & go) | valid, "nothing is answered unless valid");
+            // Reply image (cycle L), RFC 5905 7.3 / RFC 8633.
+            check!(!(done & go) | Bit::from((n_ra.slice::<120, 8>() & 7u8) == 4u8), "the reply is mode 4 (server)");
+            check!(!(done & go) | Bit::from(n_ra.slice::<123, 3>() == vn_r), "the reply version is the request's (3 or 4)");
+            check!(!(done & go & sync & !go_k) | (Bit::from(n_ra.slice::<126, 2>() == 0u8) & Bit::from(s_out == s_in) & Bit::from(s_in >= 1) & Bit::from(s_in <= 15)), "synchronised: LI 0 and the configured stratum 1..15 (N4, N6)");
+            check!(!(done & go & !sync & !go_k) | (Bit::from(n_ra.slice::<126, 2>() == 3u8) & Bit::from(s_out == 16u8)), "not synchronised: LI 3 and stratum 16 (N4, N6)");
+            check!(!(done & go_k) | (Bit::from(n_ra.slice::<126, 2>() == 3u8) & Bit::from(s_out == 0u8) & Bit::from(rid == KOD_RATE) & Bit::from(n_rts == 0u64) & Bit::from(n_rc == org_now)), "KoD RATE: LI 3, stratum 0, RATE, no reference time, receive = origin");
+            check!(!(done & go) | Bit::from(n_rb.slice::<0, 64>() == org_now), "origin timestamp = the request's transmit timestamp (N9)");
+            check!(!(done & go) | Bit::from(n_ra.slice::<104, 8>() == self.poll.get()), "poll echoed (N7)");
+            check!(!(done & go & !go_k) | Bit::from(n_rc == self.m_rxts.get()), "receive timestamp = the frame's hardware receive stamp");
+            // Sequencing: one request at a time, one meta then exactly 48 bytes.
+            check!(!take_m | is_idle, "a request is taken only between requests");
+            check!(!(is_meta | is_out) | m_go, "a reply is sent only for an answered request");
+            check!(!is_out | Bit::from(k <= 47), "the reply has 48 bytes");
+            check!(!(send_o & o_last) | Bit::from(k == 47), "last on the 48th byte");
+            check!(!(send_o & Bit::from(k == 47)) | o_last, "the 48th byte carries last");
+            check!(!send_o | is_out, "reply bytes only in the OUT state");
+            check!(!send_m | is_meta, "the reply meta only in the META state");
+            // Transmit timestamp: never before the receive timestamp (RFC 5905: T3 >= T2).
+            check!(!(send_o & at40 & !kod) | (Bit::from(t3 >= self.m_rxts.get()) & (Bit::from(t3 == t3p) | Bit::from(t3 == self.m_rxts.get()))), "T3 >= T2, the sampled time or the receive stamp");
+            check!(!(send_o & at40 & kod) | Bit::from(t3 == org), "KoD: transmit = origin");
+            // Shift registers against the image (never shifted): after k sends, byte i of
+            // (ra, rb, rc) is byte k + i of the image, and byte k sent is byte k of the image.
+            let mra = self.m_ra.get();
+            let mrb = self.m_rb.get();
+            let mrc = self.m_rc.get();
+            let inv = is_out & Bit::from(k <= 40);
+            check!(!is_meta | (Bit::from(ra == mra) & Bit::from(rb == mrb) & Bit::from(rc == mrc)), "before the first byte the shift registers hold the image");
+            check!(!inv | Bit::from(ra.slice::<120, 8>() == mux(Bit::from(k == 0), mra.slice::<120, 8>(), mux(Bit::from(k == 1), mra.slice::<112, 8>(), mux(Bit::from(k == 2), mra.slice::<104, 8>(), mux(Bit::from(k == 3), mra.slice::<96, 8>(), mux(Bit::from(k == 4), mra.slice::<88, 8>(), mux(Bit::from(k == 5), mra.slice::<80, 8>(), mux(Bit::from(k == 6), mra.slice::<72, 8>(), mux(Bit::from(k == 7), mra.slice::<64, 8>(), mux(Bit::from(k == 8), mra.slice::<56, 8>(), mux(Bit::from(k == 9), mra.slice::<48, 8>(), mux(Bit::from(k == 10), mra.slice::<40, 8>(), mux(Bit::from(k == 11), mra.slice::<32, 8>(), mux(Bit::from(k == 12), mra.slice::<24, 8>(), mux(Bit::from(k == 13), mra.slice::<16, 8>(), mux(Bit::from(k == 14), mra.slice::<8, 8>(), mux(Bit::from(k == 15), mra.slice::<0, 8>(), mux(Bit::from(k == 16), mrb.slice::<120, 8>(), mux(Bit::from(k == 17), mrb.slice::<112, 8>(), mux(Bit::from(k == 18), mrb.slice::<104, 8>(), mux(Bit::from(k == 19), mrb.slice::<96, 8>(), mux(Bit::from(k == 20), mrb.slice::<88, 8>(), mux(Bit::from(k == 21), mrb.slice::<80, 8>(), mux(Bit::from(k == 22), mrb.slice::<72, 8>(), mux(Bit::from(k == 23), mrb.slice::<64, 8>(), mux(Bit::from(k == 24), mrb.slice::<56, 8>(), mux(Bit::from(k == 25), mrb.slice::<48, 8>(), mux(Bit::from(k == 26), mrb.slice::<40, 8>(), mux(Bit::from(k == 27), mrb.slice::<32, 8>(), mux(Bit::from(k == 28), mrb.slice::<24, 8>(), mux(Bit::from(k == 29), mrb.slice::<16, 8>(), mux(Bit::from(k == 30), mrb.slice::<8, 8>(), mux(Bit::from(k == 31), mrb.slice::<0, 8>(), mux(Bit::from(k == 32), mrc.slice::<56, 8>(), mux(Bit::from(k == 33), mrc.slice::<48, 8>(), mux(Bit::from(k == 34), mrc.slice::<40, 8>(), mux(Bit::from(k == 35), mrc.slice::<32, 8>(), mux(Bit::from(k == 36), mrc.slice::<24, 8>(), mux(Bit::from(k == 37), mrc.slice::<16, 8>(), mux(Bit::from(k == 38), mrc.slice::<8, 8>(), mux(Bit::from(k == 39), mrc.slice::<0, 8>(), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 0 is image byte k + 0");
+            check!(!inv | Bit::from(ra.slice::<112, 8>() == mux(Bit::from(k == 0), mra.slice::<112, 8>(), mux(Bit::from(k == 1), mra.slice::<104, 8>(), mux(Bit::from(k == 2), mra.slice::<96, 8>(), mux(Bit::from(k == 3), mra.slice::<88, 8>(), mux(Bit::from(k == 4), mra.slice::<80, 8>(), mux(Bit::from(k == 5), mra.slice::<72, 8>(), mux(Bit::from(k == 6), mra.slice::<64, 8>(), mux(Bit::from(k == 7), mra.slice::<56, 8>(), mux(Bit::from(k == 8), mra.slice::<48, 8>(), mux(Bit::from(k == 9), mra.slice::<40, 8>(), mux(Bit::from(k == 10), mra.slice::<32, 8>(), mux(Bit::from(k == 11), mra.slice::<24, 8>(), mux(Bit::from(k == 12), mra.slice::<16, 8>(), mux(Bit::from(k == 13), mra.slice::<8, 8>(), mux(Bit::from(k == 14), mra.slice::<0, 8>(), mux(Bit::from(k == 15), mrb.slice::<120, 8>(), mux(Bit::from(k == 16), mrb.slice::<112, 8>(), mux(Bit::from(k == 17), mrb.slice::<104, 8>(), mux(Bit::from(k == 18), mrb.slice::<96, 8>(), mux(Bit::from(k == 19), mrb.slice::<88, 8>(), mux(Bit::from(k == 20), mrb.slice::<80, 8>(), mux(Bit::from(k == 21), mrb.slice::<72, 8>(), mux(Bit::from(k == 22), mrb.slice::<64, 8>(), mux(Bit::from(k == 23), mrb.slice::<56, 8>(), mux(Bit::from(k == 24), mrb.slice::<48, 8>(), mux(Bit::from(k == 25), mrb.slice::<40, 8>(), mux(Bit::from(k == 26), mrb.slice::<32, 8>(), mux(Bit::from(k == 27), mrb.slice::<24, 8>(), mux(Bit::from(k == 28), mrb.slice::<16, 8>(), mux(Bit::from(k == 29), mrb.slice::<8, 8>(), mux(Bit::from(k == 30), mrb.slice::<0, 8>(), mux(Bit::from(k == 31), mrc.slice::<56, 8>(), mux(Bit::from(k == 32), mrc.slice::<48, 8>(), mux(Bit::from(k == 33), mrc.slice::<40, 8>(), mux(Bit::from(k == 34), mrc.slice::<32, 8>(), mux(Bit::from(k == 35), mrc.slice::<24, 8>(), mux(Bit::from(k == 36), mrc.slice::<16, 8>(), mux(Bit::from(k == 37), mrc.slice::<8, 8>(), mux(Bit::from(k == 38), mrc.slice::<0, 8>(), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 1 is image byte k + 1");
+            check!(!inv | Bit::from(ra.slice::<104, 8>() == mux(Bit::from(k == 0), mra.slice::<104, 8>(), mux(Bit::from(k == 1), mra.slice::<96, 8>(), mux(Bit::from(k == 2), mra.slice::<88, 8>(), mux(Bit::from(k == 3), mra.slice::<80, 8>(), mux(Bit::from(k == 4), mra.slice::<72, 8>(), mux(Bit::from(k == 5), mra.slice::<64, 8>(), mux(Bit::from(k == 6), mra.slice::<56, 8>(), mux(Bit::from(k == 7), mra.slice::<48, 8>(), mux(Bit::from(k == 8), mra.slice::<40, 8>(), mux(Bit::from(k == 9), mra.slice::<32, 8>(), mux(Bit::from(k == 10), mra.slice::<24, 8>(), mux(Bit::from(k == 11), mra.slice::<16, 8>(), mux(Bit::from(k == 12), mra.slice::<8, 8>(), mux(Bit::from(k == 13), mra.slice::<0, 8>(), mux(Bit::from(k == 14), mrb.slice::<120, 8>(), mux(Bit::from(k == 15), mrb.slice::<112, 8>(), mux(Bit::from(k == 16), mrb.slice::<104, 8>(), mux(Bit::from(k == 17), mrb.slice::<96, 8>(), mux(Bit::from(k == 18), mrb.slice::<88, 8>(), mux(Bit::from(k == 19), mrb.slice::<80, 8>(), mux(Bit::from(k == 20), mrb.slice::<72, 8>(), mux(Bit::from(k == 21), mrb.slice::<64, 8>(), mux(Bit::from(k == 22), mrb.slice::<56, 8>(), mux(Bit::from(k == 23), mrb.slice::<48, 8>(), mux(Bit::from(k == 24), mrb.slice::<40, 8>(), mux(Bit::from(k == 25), mrb.slice::<32, 8>(), mux(Bit::from(k == 26), mrb.slice::<24, 8>(), mux(Bit::from(k == 27), mrb.slice::<16, 8>(), mux(Bit::from(k == 28), mrb.slice::<8, 8>(), mux(Bit::from(k == 29), mrb.slice::<0, 8>(), mux(Bit::from(k == 30), mrc.slice::<56, 8>(), mux(Bit::from(k == 31), mrc.slice::<48, 8>(), mux(Bit::from(k == 32), mrc.slice::<40, 8>(), mux(Bit::from(k == 33), mrc.slice::<32, 8>(), mux(Bit::from(k == 34), mrc.slice::<24, 8>(), mux(Bit::from(k == 35), mrc.slice::<16, 8>(), mux(Bit::from(k == 36), mrc.slice::<8, 8>(), mux(Bit::from(k == 37), mrc.slice::<0, 8>(), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 2 is image byte k + 2");
+            check!(!inv | Bit::from(ra.slice::<96, 8>() == mux(Bit::from(k == 0), mra.slice::<96, 8>(), mux(Bit::from(k == 1), mra.slice::<88, 8>(), mux(Bit::from(k == 2), mra.slice::<80, 8>(), mux(Bit::from(k == 3), mra.slice::<72, 8>(), mux(Bit::from(k == 4), mra.slice::<64, 8>(), mux(Bit::from(k == 5), mra.slice::<56, 8>(), mux(Bit::from(k == 6), mra.slice::<48, 8>(), mux(Bit::from(k == 7), mra.slice::<40, 8>(), mux(Bit::from(k == 8), mra.slice::<32, 8>(), mux(Bit::from(k == 9), mra.slice::<24, 8>(), mux(Bit::from(k == 10), mra.slice::<16, 8>(), mux(Bit::from(k == 11), mra.slice::<8, 8>(), mux(Bit::from(k == 12), mra.slice::<0, 8>(), mux(Bit::from(k == 13), mrb.slice::<120, 8>(), mux(Bit::from(k == 14), mrb.slice::<112, 8>(), mux(Bit::from(k == 15), mrb.slice::<104, 8>(), mux(Bit::from(k == 16), mrb.slice::<96, 8>(), mux(Bit::from(k == 17), mrb.slice::<88, 8>(), mux(Bit::from(k == 18), mrb.slice::<80, 8>(), mux(Bit::from(k == 19), mrb.slice::<72, 8>(), mux(Bit::from(k == 20), mrb.slice::<64, 8>(), mux(Bit::from(k == 21), mrb.slice::<56, 8>(), mux(Bit::from(k == 22), mrb.slice::<48, 8>(), mux(Bit::from(k == 23), mrb.slice::<40, 8>(), mux(Bit::from(k == 24), mrb.slice::<32, 8>(), mux(Bit::from(k == 25), mrb.slice::<24, 8>(), mux(Bit::from(k == 26), mrb.slice::<16, 8>(), mux(Bit::from(k == 27), mrb.slice::<8, 8>(), mux(Bit::from(k == 28), mrb.slice::<0, 8>(), mux(Bit::from(k == 29), mrc.slice::<56, 8>(), mux(Bit::from(k == 30), mrc.slice::<48, 8>(), mux(Bit::from(k == 31), mrc.slice::<40, 8>(), mux(Bit::from(k == 32), mrc.slice::<32, 8>(), mux(Bit::from(k == 33), mrc.slice::<24, 8>(), mux(Bit::from(k == 34), mrc.slice::<16, 8>(), mux(Bit::from(k == 35), mrc.slice::<8, 8>(), mux(Bit::from(k == 36), mrc.slice::<0, 8>(), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 3 is image byte k + 3");
+            check!(!inv | Bit::from(ra.slice::<88, 8>() == mux(Bit::from(k == 0), mra.slice::<88, 8>(), mux(Bit::from(k == 1), mra.slice::<80, 8>(), mux(Bit::from(k == 2), mra.slice::<72, 8>(), mux(Bit::from(k == 3), mra.slice::<64, 8>(), mux(Bit::from(k == 4), mra.slice::<56, 8>(), mux(Bit::from(k == 5), mra.slice::<48, 8>(), mux(Bit::from(k == 6), mra.slice::<40, 8>(), mux(Bit::from(k == 7), mra.slice::<32, 8>(), mux(Bit::from(k == 8), mra.slice::<24, 8>(), mux(Bit::from(k == 9), mra.slice::<16, 8>(), mux(Bit::from(k == 10), mra.slice::<8, 8>(), mux(Bit::from(k == 11), mra.slice::<0, 8>(), mux(Bit::from(k == 12), mrb.slice::<120, 8>(), mux(Bit::from(k == 13), mrb.slice::<112, 8>(), mux(Bit::from(k == 14), mrb.slice::<104, 8>(), mux(Bit::from(k == 15), mrb.slice::<96, 8>(), mux(Bit::from(k == 16), mrb.slice::<88, 8>(), mux(Bit::from(k == 17), mrb.slice::<80, 8>(), mux(Bit::from(k == 18), mrb.slice::<72, 8>(), mux(Bit::from(k == 19), mrb.slice::<64, 8>(), mux(Bit::from(k == 20), mrb.slice::<56, 8>(), mux(Bit::from(k == 21), mrb.slice::<48, 8>(), mux(Bit::from(k == 22), mrb.slice::<40, 8>(), mux(Bit::from(k == 23), mrb.slice::<32, 8>(), mux(Bit::from(k == 24), mrb.slice::<24, 8>(), mux(Bit::from(k == 25), mrb.slice::<16, 8>(), mux(Bit::from(k == 26), mrb.slice::<8, 8>(), mux(Bit::from(k == 27), mrb.slice::<0, 8>(), mux(Bit::from(k == 28), mrc.slice::<56, 8>(), mux(Bit::from(k == 29), mrc.slice::<48, 8>(), mux(Bit::from(k == 30), mrc.slice::<40, 8>(), mux(Bit::from(k == 31), mrc.slice::<32, 8>(), mux(Bit::from(k == 32), mrc.slice::<24, 8>(), mux(Bit::from(k == 33), mrc.slice::<16, 8>(), mux(Bit::from(k == 34), mrc.slice::<8, 8>(), mux(Bit::from(k == 35), mrc.slice::<0, 8>(), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 4 is image byte k + 4");
+            check!(!inv | Bit::from(ra.slice::<80, 8>() == mux(Bit::from(k == 0), mra.slice::<80, 8>(), mux(Bit::from(k == 1), mra.slice::<72, 8>(), mux(Bit::from(k == 2), mra.slice::<64, 8>(), mux(Bit::from(k == 3), mra.slice::<56, 8>(), mux(Bit::from(k == 4), mra.slice::<48, 8>(), mux(Bit::from(k == 5), mra.slice::<40, 8>(), mux(Bit::from(k == 6), mra.slice::<32, 8>(), mux(Bit::from(k == 7), mra.slice::<24, 8>(), mux(Bit::from(k == 8), mra.slice::<16, 8>(), mux(Bit::from(k == 9), mra.slice::<8, 8>(), mux(Bit::from(k == 10), mra.slice::<0, 8>(), mux(Bit::from(k == 11), mrb.slice::<120, 8>(), mux(Bit::from(k == 12), mrb.slice::<112, 8>(), mux(Bit::from(k == 13), mrb.slice::<104, 8>(), mux(Bit::from(k == 14), mrb.slice::<96, 8>(), mux(Bit::from(k == 15), mrb.slice::<88, 8>(), mux(Bit::from(k == 16), mrb.slice::<80, 8>(), mux(Bit::from(k == 17), mrb.slice::<72, 8>(), mux(Bit::from(k == 18), mrb.slice::<64, 8>(), mux(Bit::from(k == 19), mrb.slice::<56, 8>(), mux(Bit::from(k == 20), mrb.slice::<48, 8>(), mux(Bit::from(k == 21), mrb.slice::<40, 8>(), mux(Bit::from(k == 22), mrb.slice::<32, 8>(), mux(Bit::from(k == 23), mrb.slice::<24, 8>(), mux(Bit::from(k == 24), mrb.slice::<16, 8>(), mux(Bit::from(k == 25), mrb.slice::<8, 8>(), mux(Bit::from(k == 26), mrb.slice::<0, 8>(), mux(Bit::from(k == 27), mrc.slice::<56, 8>(), mux(Bit::from(k == 28), mrc.slice::<48, 8>(), mux(Bit::from(k == 29), mrc.slice::<40, 8>(), mux(Bit::from(k == 30), mrc.slice::<32, 8>(), mux(Bit::from(k == 31), mrc.slice::<24, 8>(), mux(Bit::from(k == 32), mrc.slice::<16, 8>(), mux(Bit::from(k == 33), mrc.slice::<8, 8>(), mux(Bit::from(k == 34), mrc.slice::<0, 8>(), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 5 is image byte k + 5");
+            check!(!inv | Bit::from(ra.slice::<72, 8>() == mux(Bit::from(k == 0), mra.slice::<72, 8>(), mux(Bit::from(k == 1), mra.slice::<64, 8>(), mux(Bit::from(k == 2), mra.slice::<56, 8>(), mux(Bit::from(k == 3), mra.slice::<48, 8>(), mux(Bit::from(k == 4), mra.slice::<40, 8>(), mux(Bit::from(k == 5), mra.slice::<32, 8>(), mux(Bit::from(k == 6), mra.slice::<24, 8>(), mux(Bit::from(k == 7), mra.slice::<16, 8>(), mux(Bit::from(k == 8), mra.slice::<8, 8>(), mux(Bit::from(k == 9), mra.slice::<0, 8>(), mux(Bit::from(k == 10), mrb.slice::<120, 8>(), mux(Bit::from(k == 11), mrb.slice::<112, 8>(), mux(Bit::from(k == 12), mrb.slice::<104, 8>(), mux(Bit::from(k == 13), mrb.slice::<96, 8>(), mux(Bit::from(k == 14), mrb.slice::<88, 8>(), mux(Bit::from(k == 15), mrb.slice::<80, 8>(), mux(Bit::from(k == 16), mrb.slice::<72, 8>(), mux(Bit::from(k == 17), mrb.slice::<64, 8>(), mux(Bit::from(k == 18), mrb.slice::<56, 8>(), mux(Bit::from(k == 19), mrb.slice::<48, 8>(), mux(Bit::from(k == 20), mrb.slice::<40, 8>(), mux(Bit::from(k == 21), mrb.slice::<32, 8>(), mux(Bit::from(k == 22), mrb.slice::<24, 8>(), mux(Bit::from(k == 23), mrb.slice::<16, 8>(), mux(Bit::from(k == 24), mrb.slice::<8, 8>(), mux(Bit::from(k == 25), mrb.slice::<0, 8>(), mux(Bit::from(k == 26), mrc.slice::<56, 8>(), mux(Bit::from(k == 27), mrc.slice::<48, 8>(), mux(Bit::from(k == 28), mrc.slice::<40, 8>(), mux(Bit::from(k == 29), mrc.slice::<32, 8>(), mux(Bit::from(k == 30), mrc.slice::<24, 8>(), mux(Bit::from(k == 31), mrc.slice::<16, 8>(), mux(Bit::from(k == 32), mrc.slice::<8, 8>(), mux(Bit::from(k == 33), mrc.slice::<0, 8>(), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 6 is image byte k + 6");
+            check!(!inv | Bit::from(ra.slice::<64, 8>() == mux(Bit::from(k == 0), mra.slice::<64, 8>(), mux(Bit::from(k == 1), mra.slice::<56, 8>(), mux(Bit::from(k == 2), mra.slice::<48, 8>(), mux(Bit::from(k == 3), mra.slice::<40, 8>(), mux(Bit::from(k == 4), mra.slice::<32, 8>(), mux(Bit::from(k == 5), mra.slice::<24, 8>(), mux(Bit::from(k == 6), mra.slice::<16, 8>(), mux(Bit::from(k == 7), mra.slice::<8, 8>(), mux(Bit::from(k == 8), mra.slice::<0, 8>(), mux(Bit::from(k == 9), mrb.slice::<120, 8>(), mux(Bit::from(k == 10), mrb.slice::<112, 8>(), mux(Bit::from(k == 11), mrb.slice::<104, 8>(), mux(Bit::from(k == 12), mrb.slice::<96, 8>(), mux(Bit::from(k == 13), mrb.slice::<88, 8>(), mux(Bit::from(k == 14), mrb.slice::<80, 8>(), mux(Bit::from(k == 15), mrb.slice::<72, 8>(), mux(Bit::from(k == 16), mrb.slice::<64, 8>(), mux(Bit::from(k == 17), mrb.slice::<56, 8>(), mux(Bit::from(k == 18), mrb.slice::<48, 8>(), mux(Bit::from(k == 19), mrb.slice::<40, 8>(), mux(Bit::from(k == 20), mrb.slice::<32, 8>(), mux(Bit::from(k == 21), mrb.slice::<24, 8>(), mux(Bit::from(k == 22), mrb.slice::<16, 8>(), mux(Bit::from(k == 23), mrb.slice::<8, 8>(), mux(Bit::from(k == 24), mrb.slice::<0, 8>(), mux(Bit::from(k == 25), mrc.slice::<56, 8>(), mux(Bit::from(k == 26), mrc.slice::<48, 8>(), mux(Bit::from(k == 27), mrc.slice::<40, 8>(), mux(Bit::from(k == 28), mrc.slice::<32, 8>(), mux(Bit::from(k == 29), mrc.slice::<24, 8>(), mux(Bit::from(k == 30), mrc.slice::<16, 8>(), mux(Bit::from(k == 31), mrc.slice::<8, 8>(), mux(Bit::from(k == 32), mrc.slice::<0, 8>(), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 7 is image byte k + 7");
+            check!(!inv | Bit::from(ra.slice::<56, 8>() == mux(Bit::from(k == 0), mra.slice::<56, 8>(), mux(Bit::from(k == 1), mra.slice::<48, 8>(), mux(Bit::from(k == 2), mra.slice::<40, 8>(), mux(Bit::from(k == 3), mra.slice::<32, 8>(), mux(Bit::from(k == 4), mra.slice::<24, 8>(), mux(Bit::from(k == 5), mra.slice::<16, 8>(), mux(Bit::from(k == 6), mra.slice::<8, 8>(), mux(Bit::from(k == 7), mra.slice::<0, 8>(), mux(Bit::from(k == 8), mrb.slice::<120, 8>(), mux(Bit::from(k == 9), mrb.slice::<112, 8>(), mux(Bit::from(k == 10), mrb.slice::<104, 8>(), mux(Bit::from(k == 11), mrb.slice::<96, 8>(), mux(Bit::from(k == 12), mrb.slice::<88, 8>(), mux(Bit::from(k == 13), mrb.slice::<80, 8>(), mux(Bit::from(k == 14), mrb.slice::<72, 8>(), mux(Bit::from(k == 15), mrb.slice::<64, 8>(), mux(Bit::from(k == 16), mrb.slice::<56, 8>(), mux(Bit::from(k == 17), mrb.slice::<48, 8>(), mux(Bit::from(k == 18), mrb.slice::<40, 8>(), mux(Bit::from(k == 19), mrb.slice::<32, 8>(), mux(Bit::from(k == 20), mrb.slice::<24, 8>(), mux(Bit::from(k == 21), mrb.slice::<16, 8>(), mux(Bit::from(k == 22), mrb.slice::<8, 8>(), mux(Bit::from(k == 23), mrb.slice::<0, 8>(), mux(Bit::from(k == 24), mrc.slice::<56, 8>(), mux(Bit::from(k == 25), mrc.slice::<48, 8>(), mux(Bit::from(k == 26), mrc.slice::<40, 8>(), mux(Bit::from(k == 27), mrc.slice::<32, 8>(), mux(Bit::from(k == 28), mrc.slice::<24, 8>(), mux(Bit::from(k == 29), mrc.slice::<16, 8>(), mux(Bit::from(k == 30), mrc.slice::<8, 8>(), mux(Bit::from(k == 31), mrc.slice::<0, 8>(), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 8 is image byte k + 8");
+            check!(!inv | Bit::from(ra.slice::<48, 8>() == mux(Bit::from(k == 0), mra.slice::<48, 8>(), mux(Bit::from(k == 1), mra.slice::<40, 8>(), mux(Bit::from(k == 2), mra.slice::<32, 8>(), mux(Bit::from(k == 3), mra.slice::<24, 8>(), mux(Bit::from(k == 4), mra.slice::<16, 8>(), mux(Bit::from(k == 5), mra.slice::<8, 8>(), mux(Bit::from(k == 6), mra.slice::<0, 8>(), mux(Bit::from(k == 7), mrb.slice::<120, 8>(), mux(Bit::from(k == 8), mrb.slice::<112, 8>(), mux(Bit::from(k == 9), mrb.slice::<104, 8>(), mux(Bit::from(k == 10), mrb.slice::<96, 8>(), mux(Bit::from(k == 11), mrb.slice::<88, 8>(), mux(Bit::from(k == 12), mrb.slice::<80, 8>(), mux(Bit::from(k == 13), mrb.slice::<72, 8>(), mux(Bit::from(k == 14), mrb.slice::<64, 8>(), mux(Bit::from(k == 15), mrb.slice::<56, 8>(), mux(Bit::from(k == 16), mrb.slice::<48, 8>(), mux(Bit::from(k == 17), mrb.slice::<40, 8>(), mux(Bit::from(k == 18), mrb.slice::<32, 8>(), mux(Bit::from(k == 19), mrb.slice::<24, 8>(), mux(Bit::from(k == 20), mrb.slice::<16, 8>(), mux(Bit::from(k == 21), mrb.slice::<8, 8>(), mux(Bit::from(k == 22), mrb.slice::<0, 8>(), mux(Bit::from(k == 23), mrc.slice::<56, 8>(), mux(Bit::from(k == 24), mrc.slice::<48, 8>(), mux(Bit::from(k == 25), mrc.slice::<40, 8>(), mux(Bit::from(k == 26), mrc.slice::<32, 8>(), mux(Bit::from(k == 27), mrc.slice::<24, 8>(), mux(Bit::from(k == 28), mrc.slice::<16, 8>(), mux(Bit::from(k == 29), mrc.slice::<8, 8>(), mux(Bit::from(k == 30), mrc.slice::<0, 8>(), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 9 is image byte k + 9");
+            check!(!inv | Bit::from(ra.slice::<40, 8>() == mux(Bit::from(k == 0), mra.slice::<40, 8>(), mux(Bit::from(k == 1), mra.slice::<32, 8>(), mux(Bit::from(k == 2), mra.slice::<24, 8>(), mux(Bit::from(k == 3), mra.slice::<16, 8>(), mux(Bit::from(k == 4), mra.slice::<8, 8>(), mux(Bit::from(k == 5), mra.slice::<0, 8>(), mux(Bit::from(k == 6), mrb.slice::<120, 8>(), mux(Bit::from(k == 7), mrb.slice::<112, 8>(), mux(Bit::from(k == 8), mrb.slice::<104, 8>(), mux(Bit::from(k == 9), mrb.slice::<96, 8>(), mux(Bit::from(k == 10), mrb.slice::<88, 8>(), mux(Bit::from(k == 11), mrb.slice::<80, 8>(), mux(Bit::from(k == 12), mrb.slice::<72, 8>(), mux(Bit::from(k == 13), mrb.slice::<64, 8>(), mux(Bit::from(k == 14), mrb.slice::<56, 8>(), mux(Bit::from(k == 15), mrb.slice::<48, 8>(), mux(Bit::from(k == 16), mrb.slice::<40, 8>(), mux(Bit::from(k == 17), mrb.slice::<32, 8>(), mux(Bit::from(k == 18), mrb.slice::<24, 8>(), mux(Bit::from(k == 19), mrb.slice::<16, 8>(), mux(Bit::from(k == 20), mrb.slice::<8, 8>(), mux(Bit::from(k == 21), mrb.slice::<0, 8>(), mux(Bit::from(k == 22), mrc.slice::<56, 8>(), mux(Bit::from(k == 23), mrc.slice::<48, 8>(), mux(Bit::from(k == 24), mrc.slice::<40, 8>(), mux(Bit::from(k == 25), mrc.slice::<32, 8>(), mux(Bit::from(k == 26), mrc.slice::<24, 8>(), mux(Bit::from(k == 27), mrc.slice::<16, 8>(), mux(Bit::from(k == 28), mrc.slice::<8, 8>(), mux(Bit::from(k == 29), mrc.slice::<0, 8>(), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 10 is image byte k + 10");
+            check!(!inv | Bit::from(ra.slice::<32, 8>() == mux(Bit::from(k == 0), mra.slice::<32, 8>(), mux(Bit::from(k == 1), mra.slice::<24, 8>(), mux(Bit::from(k == 2), mra.slice::<16, 8>(), mux(Bit::from(k == 3), mra.slice::<8, 8>(), mux(Bit::from(k == 4), mra.slice::<0, 8>(), mux(Bit::from(k == 5), mrb.slice::<120, 8>(), mux(Bit::from(k == 6), mrb.slice::<112, 8>(), mux(Bit::from(k == 7), mrb.slice::<104, 8>(), mux(Bit::from(k == 8), mrb.slice::<96, 8>(), mux(Bit::from(k == 9), mrb.slice::<88, 8>(), mux(Bit::from(k == 10), mrb.slice::<80, 8>(), mux(Bit::from(k == 11), mrb.slice::<72, 8>(), mux(Bit::from(k == 12), mrb.slice::<64, 8>(), mux(Bit::from(k == 13), mrb.slice::<56, 8>(), mux(Bit::from(k == 14), mrb.slice::<48, 8>(), mux(Bit::from(k == 15), mrb.slice::<40, 8>(), mux(Bit::from(k == 16), mrb.slice::<32, 8>(), mux(Bit::from(k == 17), mrb.slice::<24, 8>(), mux(Bit::from(k == 18), mrb.slice::<16, 8>(), mux(Bit::from(k == 19), mrb.slice::<8, 8>(), mux(Bit::from(k == 20), mrb.slice::<0, 8>(), mux(Bit::from(k == 21), mrc.slice::<56, 8>(), mux(Bit::from(k == 22), mrc.slice::<48, 8>(), mux(Bit::from(k == 23), mrc.slice::<40, 8>(), mux(Bit::from(k == 24), mrc.slice::<32, 8>(), mux(Bit::from(k == 25), mrc.slice::<24, 8>(), mux(Bit::from(k == 26), mrc.slice::<16, 8>(), mux(Bit::from(k == 27), mrc.slice::<8, 8>(), mux(Bit::from(k == 28), mrc.slice::<0, 8>(), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 11 is image byte k + 11");
+            check!(!inv | Bit::from(ra.slice::<24, 8>() == mux(Bit::from(k == 0), mra.slice::<24, 8>(), mux(Bit::from(k == 1), mra.slice::<16, 8>(), mux(Bit::from(k == 2), mra.slice::<8, 8>(), mux(Bit::from(k == 3), mra.slice::<0, 8>(), mux(Bit::from(k == 4), mrb.slice::<120, 8>(), mux(Bit::from(k == 5), mrb.slice::<112, 8>(), mux(Bit::from(k == 6), mrb.slice::<104, 8>(), mux(Bit::from(k == 7), mrb.slice::<96, 8>(), mux(Bit::from(k == 8), mrb.slice::<88, 8>(), mux(Bit::from(k == 9), mrb.slice::<80, 8>(), mux(Bit::from(k == 10), mrb.slice::<72, 8>(), mux(Bit::from(k == 11), mrb.slice::<64, 8>(), mux(Bit::from(k == 12), mrb.slice::<56, 8>(), mux(Bit::from(k == 13), mrb.slice::<48, 8>(), mux(Bit::from(k == 14), mrb.slice::<40, 8>(), mux(Bit::from(k == 15), mrb.slice::<32, 8>(), mux(Bit::from(k == 16), mrb.slice::<24, 8>(), mux(Bit::from(k == 17), mrb.slice::<16, 8>(), mux(Bit::from(k == 18), mrb.slice::<8, 8>(), mux(Bit::from(k == 19), mrb.slice::<0, 8>(), mux(Bit::from(k == 20), mrc.slice::<56, 8>(), mux(Bit::from(k == 21), mrc.slice::<48, 8>(), mux(Bit::from(k == 22), mrc.slice::<40, 8>(), mux(Bit::from(k == 23), mrc.slice::<32, 8>(), mux(Bit::from(k == 24), mrc.slice::<24, 8>(), mux(Bit::from(k == 25), mrc.slice::<16, 8>(), mux(Bit::from(k == 26), mrc.slice::<8, 8>(), mux(Bit::from(k == 27), mrc.slice::<0, 8>(), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 12 is image byte k + 12");
+            check!(!inv | Bit::from(ra.slice::<16, 8>() == mux(Bit::from(k == 0), mra.slice::<16, 8>(), mux(Bit::from(k == 1), mra.slice::<8, 8>(), mux(Bit::from(k == 2), mra.slice::<0, 8>(), mux(Bit::from(k == 3), mrb.slice::<120, 8>(), mux(Bit::from(k == 4), mrb.slice::<112, 8>(), mux(Bit::from(k == 5), mrb.slice::<104, 8>(), mux(Bit::from(k == 6), mrb.slice::<96, 8>(), mux(Bit::from(k == 7), mrb.slice::<88, 8>(), mux(Bit::from(k == 8), mrb.slice::<80, 8>(), mux(Bit::from(k == 9), mrb.slice::<72, 8>(), mux(Bit::from(k == 10), mrb.slice::<64, 8>(), mux(Bit::from(k == 11), mrb.slice::<56, 8>(), mux(Bit::from(k == 12), mrb.slice::<48, 8>(), mux(Bit::from(k == 13), mrb.slice::<40, 8>(), mux(Bit::from(k == 14), mrb.slice::<32, 8>(), mux(Bit::from(k == 15), mrb.slice::<24, 8>(), mux(Bit::from(k == 16), mrb.slice::<16, 8>(), mux(Bit::from(k == 17), mrb.slice::<8, 8>(), mux(Bit::from(k == 18), mrb.slice::<0, 8>(), mux(Bit::from(k == 19), mrc.slice::<56, 8>(), mux(Bit::from(k == 20), mrc.slice::<48, 8>(), mux(Bit::from(k == 21), mrc.slice::<40, 8>(), mux(Bit::from(k == 22), mrc.slice::<32, 8>(), mux(Bit::from(k == 23), mrc.slice::<24, 8>(), mux(Bit::from(k == 24), mrc.slice::<16, 8>(), mux(Bit::from(k == 25), mrc.slice::<8, 8>(), mux(Bit::from(k == 26), mrc.slice::<0, 8>(), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 13 is image byte k + 13");
+            check!(!inv | Bit::from(ra.slice::<8, 8>() == mux(Bit::from(k == 0), mra.slice::<8, 8>(), mux(Bit::from(k == 1), mra.slice::<0, 8>(), mux(Bit::from(k == 2), mrb.slice::<120, 8>(), mux(Bit::from(k == 3), mrb.slice::<112, 8>(), mux(Bit::from(k == 4), mrb.slice::<104, 8>(), mux(Bit::from(k == 5), mrb.slice::<96, 8>(), mux(Bit::from(k == 6), mrb.slice::<88, 8>(), mux(Bit::from(k == 7), mrb.slice::<80, 8>(), mux(Bit::from(k == 8), mrb.slice::<72, 8>(), mux(Bit::from(k == 9), mrb.slice::<64, 8>(), mux(Bit::from(k == 10), mrb.slice::<56, 8>(), mux(Bit::from(k == 11), mrb.slice::<48, 8>(), mux(Bit::from(k == 12), mrb.slice::<40, 8>(), mux(Bit::from(k == 13), mrb.slice::<32, 8>(), mux(Bit::from(k == 14), mrb.slice::<24, 8>(), mux(Bit::from(k == 15), mrb.slice::<16, 8>(), mux(Bit::from(k == 16), mrb.slice::<8, 8>(), mux(Bit::from(k == 17), mrb.slice::<0, 8>(), mux(Bit::from(k == 18), mrc.slice::<56, 8>(), mux(Bit::from(k == 19), mrc.slice::<48, 8>(), mux(Bit::from(k == 20), mrc.slice::<40, 8>(), mux(Bit::from(k == 21), mrc.slice::<32, 8>(), mux(Bit::from(k == 22), mrc.slice::<24, 8>(), mux(Bit::from(k == 23), mrc.slice::<16, 8>(), mux(Bit::from(k == 24), mrc.slice::<8, 8>(), mux(Bit::from(k == 25), mrc.slice::<0, 8>(), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 14 is image byte k + 14");
+            check!(!inv | Bit::from(ra.slice::<0, 8>() == mux(Bit::from(k == 0), mra.slice::<0, 8>(), mux(Bit::from(k == 1), mrb.slice::<120, 8>(), mux(Bit::from(k == 2), mrb.slice::<112, 8>(), mux(Bit::from(k == 3), mrb.slice::<104, 8>(), mux(Bit::from(k == 4), mrb.slice::<96, 8>(), mux(Bit::from(k == 5), mrb.slice::<88, 8>(), mux(Bit::from(k == 6), mrb.slice::<80, 8>(), mux(Bit::from(k == 7), mrb.slice::<72, 8>(), mux(Bit::from(k == 8), mrb.slice::<64, 8>(), mux(Bit::from(k == 9), mrb.slice::<56, 8>(), mux(Bit::from(k == 10), mrb.slice::<48, 8>(), mux(Bit::from(k == 11), mrb.slice::<40, 8>(), mux(Bit::from(k == 12), mrb.slice::<32, 8>(), mux(Bit::from(k == 13), mrb.slice::<24, 8>(), mux(Bit::from(k == 14), mrb.slice::<16, 8>(), mux(Bit::from(k == 15), mrb.slice::<8, 8>(), mux(Bit::from(k == 16), mrb.slice::<0, 8>(), mux(Bit::from(k == 17), mrc.slice::<56, 8>(), mux(Bit::from(k == 18), mrc.slice::<48, 8>(), mux(Bit::from(k == 19), mrc.slice::<40, 8>(), mux(Bit::from(k == 20), mrc.slice::<32, 8>(), mux(Bit::from(k == 21), mrc.slice::<24, 8>(), mux(Bit::from(k == 22), mrc.slice::<16, 8>(), mux(Bit::from(k == 23), mrc.slice::<8, 8>(), mux(Bit::from(k == 24), mrc.slice::<0, 8>(), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 15 is image byte k + 15");
+            check!(!inv | Bit::from(rb.slice::<120, 8>() == mux(Bit::from(k == 0), mrb.slice::<120, 8>(), mux(Bit::from(k == 1), mrb.slice::<112, 8>(), mux(Bit::from(k == 2), mrb.slice::<104, 8>(), mux(Bit::from(k == 3), mrb.slice::<96, 8>(), mux(Bit::from(k == 4), mrb.slice::<88, 8>(), mux(Bit::from(k == 5), mrb.slice::<80, 8>(), mux(Bit::from(k == 6), mrb.slice::<72, 8>(), mux(Bit::from(k == 7), mrb.slice::<64, 8>(), mux(Bit::from(k == 8), mrb.slice::<56, 8>(), mux(Bit::from(k == 9), mrb.slice::<48, 8>(), mux(Bit::from(k == 10), mrb.slice::<40, 8>(), mux(Bit::from(k == 11), mrb.slice::<32, 8>(), mux(Bit::from(k == 12), mrb.slice::<24, 8>(), mux(Bit::from(k == 13), mrb.slice::<16, 8>(), mux(Bit::from(k == 14), mrb.slice::<8, 8>(), mux(Bit::from(k == 15), mrb.slice::<0, 8>(), mux(Bit::from(k == 16), mrc.slice::<56, 8>(), mux(Bit::from(k == 17), mrc.slice::<48, 8>(), mux(Bit::from(k == 18), mrc.slice::<40, 8>(), mux(Bit::from(k == 19), mrc.slice::<32, 8>(), mux(Bit::from(k == 20), mrc.slice::<24, 8>(), mux(Bit::from(k == 21), mrc.slice::<16, 8>(), mux(Bit::from(k == 22), mrc.slice::<8, 8>(), mux(Bit::from(k == 23), mrc.slice::<0, 8>(), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 16 is image byte k + 16");
+            check!(!inv | Bit::from(rb.slice::<112, 8>() == mux(Bit::from(k == 0), mrb.slice::<112, 8>(), mux(Bit::from(k == 1), mrb.slice::<104, 8>(), mux(Bit::from(k == 2), mrb.slice::<96, 8>(), mux(Bit::from(k == 3), mrb.slice::<88, 8>(), mux(Bit::from(k == 4), mrb.slice::<80, 8>(), mux(Bit::from(k == 5), mrb.slice::<72, 8>(), mux(Bit::from(k == 6), mrb.slice::<64, 8>(), mux(Bit::from(k == 7), mrb.slice::<56, 8>(), mux(Bit::from(k == 8), mrb.slice::<48, 8>(), mux(Bit::from(k == 9), mrb.slice::<40, 8>(), mux(Bit::from(k == 10), mrb.slice::<32, 8>(), mux(Bit::from(k == 11), mrb.slice::<24, 8>(), mux(Bit::from(k == 12), mrb.slice::<16, 8>(), mux(Bit::from(k == 13), mrb.slice::<8, 8>(), mux(Bit::from(k == 14), mrb.slice::<0, 8>(), mux(Bit::from(k == 15), mrc.slice::<56, 8>(), mux(Bit::from(k == 16), mrc.slice::<48, 8>(), mux(Bit::from(k == 17), mrc.slice::<40, 8>(), mux(Bit::from(k == 18), mrc.slice::<32, 8>(), mux(Bit::from(k == 19), mrc.slice::<24, 8>(), mux(Bit::from(k == 20), mrc.slice::<16, 8>(), mux(Bit::from(k == 21), mrc.slice::<8, 8>(), mux(Bit::from(k == 22), mrc.slice::<0, 8>(), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 17 is image byte k + 17");
+            check!(!inv | Bit::from(rb.slice::<104, 8>() == mux(Bit::from(k == 0), mrb.slice::<104, 8>(), mux(Bit::from(k == 1), mrb.slice::<96, 8>(), mux(Bit::from(k == 2), mrb.slice::<88, 8>(), mux(Bit::from(k == 3), mrb.slice::<80, 8>(), mux(Bit::from(k == 4), mrb.slice::<72, 8>(), mux(Bit::from(k == 5), mrb.slice::<64, 8>(), mux(Bit::from(k == 6), mrb.slice::<56, 8>(), mux(Bit::from(k == 7), mrb.slice::<48, 8>(), mux(Bit::from(k == 8), mrb.slice::<40, 8>(), mux(Bit::from(k == 9), mrb.slice::<32, 8>(), mux(Bit::from(k == 10), mrb.slice::<24, 8>(), mux(Bit::from(k == 11), mrb.slice::<16, 8>(), mux(Bit::from(k == 12), mrb.slice::<8, 8>(), mux(Bit::from(k == 13), mrb.slice::<0, 8>(), mux(Bit::from(k == 14), mrc.slice::<56, 8>(), mux(Bit::from(k == 15), mrc.slice::<48, 8>(), mux(Bit::from(k == 16), mrc.slice::<40, 8>(), mux(Bit::from(k == 17), mrc.slice::<32, 8>(), mux(Bit::from(k == 18), mrc.slice::<24, 8>(), mux(Bit::from(k == 19), mrc.slice::<16, 8>(), mux(Bit::from(k == 20), mrc.slice::<8, 8>(), mux(Bit::from(k == 21), mrc.slice::<0, 8>(), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 18 is image byte k + 18");
+            check!(!inv | Bit::from(rb.slice::<96, 8>() == mux(Bit::from(k == 0), mrb.slice::<96, 8>(), mux(Bit::from(k == 1), mrb.slice::<88, 8>(), mux(Bit::from(k == 2), mrb.slice::<80, 8>(), mux(Bit::from(k == 3), mrb.slice::<72, 8>(), mux(Bit::from(k == 4), mrb.slice::<64, 8>(), mux(Bit::from(k == 5), mrb.slice::<56, 8>(), mux(Bit::from(k == 6), mrb.slice::<48, 8>(), mux(Bit::from(k == 7), mrb.slice::<40, 8>(), mux(Bit::from(k == 8), mrb.slice::<32, 8>(), mux(Bit::from(k == 9), mrb.slice::<24, 8>(), mux(Bit::from(k == 10), mrb.slice::<16, 8>(), mux(Bit::from(k == 11), mrb.slice::<8, 8>(), mux(Bit::from(k == 12), mrb.slice::<0, 8>(), mux(Bit::from(k == 13), mrc.slice::<56, 8>(), mux(Bit::from(k == 14), mrc.slice::<48, 8>(), mux(Bit::from(k == 15), mrc.slice::<40, 8>(), mux(Bit::from(k == 16), mrc.slice::<32, 8>(), mux(Bit::from(k == 17), mrc.slice::<24, 8>(), mux(Bit::from(k == 18), mrc.slice::<16, 8>(), mux(Bit::from(k == 19), mrc.slice::<8, 8>(), mux(Bit::from(k == 20), mrc.slice::<0, 8>(), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 19 is image byte k + 19");
+            check!(!inv | Bit::from(rb.slice::<88, 8>() == mux(Bit::from(k == 0), mrb.slice::<88, 8>(), mux(Bit::from(k == 1), mrb.slice::<80, 8>(), mux(Bit::from(k == 2), mrb.slice::<72, 8>(), mux(Bit::from(k == 3), mrb.slice::<64, 8>(), mux(Bit::from(k == 4), mrb.slice::<56, 8>(), mux(Bit::from(k == 5), mrb.slice::<48, 8>(), mux(Bit::from(k == 6), mrb.slice::<40, 8>(), mux(Bit::from(k == 7), mrb.slice::<32, 8>(), mux(Bit::from(k == 8), mrb.slice::<24, 8>(), mux(Bit::from(k == 9), mrb.slice::<16, 8>(), mux(Bit::from(k == 10), mrb.slice::<8, 8>(), mux(Bit::from(k == 11), mrb.slice::<0, 8>(), mux(Bit::from(k == 12), mrc.slice::<56, 8>(), mux(Bit::from(k == 13), mrc.slice::<48, 8>(), mux(Bit::from(k == 14), mrc.slice::<40, 8>(), mux(Bit::from(k == 15), mrc.slice::<32, 8>(), mux(Bit::from(k == 16), mrc.slice::<24, 8>(), mux(Bit::from(k == 17), mrc.slice::<16, 8>(), mux(Bit::from(k == 18), mrc.slice::<8, 8>(), mux(Bit::from(k == 19), mrc.slice::<0, 8>(), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 20 is image byte k + 20");
+            check!(!inv | Bit::from(rb.slice::<80, 8>() == mux(Bit::from(k == 0), mrb.slice::<80, 8>(), mux(Bit::from(k == 1), mrb.slice::<72, 8>(), mux(Bit::from(k == 2), mrb.slice::<64, 8>(), mux(Bit::from(k == 3), mrb.slice::<56, 8>(), mux(Bit::from(k == 4), mrb.slice::<48, 8>(), mux(Bit::from(k == 5), mrb.slice::<40, 8>(), mux(Bit::from(k == 6), mrb.slice::<32, 8>(), mux(Bit::from(k == 7), mrb.slice::<24, 8>(), mux(Bit::from(k == 8), mrb.slice::<16, 8>(), mux(Bit::from(k == 9), mrb.slice::<8, 8>(), mux(Bit::from(k == 10), mrb.slice::<0, 8>(), mux(Bit::from(k == 11), mrc.slice::<56, 8>(), mux(Bit::from(k == 12), mrc.slice::<48, 8>(), mux(Bit::from(k == 13), mrc.slice::<40, 8>(), mux(Bit::from(k == 14), mrc.slice::<32, 8>(), mux(Bit::from(k == 15), mrc.slice::<24, 8>(), mux(Bit::from(k == 16), mrc.slice::<16, 8>(), mux(Bit::from(k == 17), mrc.slice::<8, 8>(), mux(Bit::from(k == 18), mrc.slice::<0, 8>(), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 21 is image byte k + 21");
+            check!(!inv | Bit::from(rb.slice::<72, 8>() == mux(Bit::from(k == 0), mrb.slice::<72, 8>(), mux(Bit::from(k == 1), mrb.slice::<64, 8>(), mux(Bit::from(k == 2), mrb.slice::<56, 8>(), mux(Bit::from(k == 3), mrb.slice::<48, 8>(), mux(Bit::from(k == 4), mrb.slice::<40, 8>(), mux(Bit::from(k == 5), mrb.slice::<32, 8>(), mux(Bit::from(k == 6), mrb.slice::<24, 8>(), mux(Bit::from(k == 7), mrb.slice::<16, 8>(), mux(Bit::from(k == 8), mrb.slice::<8, 8>(), mux(Bit::from(k == 9), mrb.slice::<0, 8>(), mux(Bit::from(k == 10), mrc.slice::<56, 8>(), mux(Bit::from(k == 11), mrc.slice::<48, 8>(), mux(Bit::from(k == 12), mrc.slice::<40, 8>(), mux(Bit::from(k == 13), mrc.slice::<32, 8>(), mux(Bit::from(k == 14), mrc.slice::<24, 8>(), mux(Bit::from(k == 15), mrc.slice::<16, 8>(), mux(Bit::from(k == 16), mrc.slice::<8, 8>(), mux(Bit::from(k == 17), mrc.slice::<0, 8>(), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 22 is image byte k + 22");
+            check!(!inv | Bit::from(rb.slice::<64, 8>() == mux(Bit::from(k == 0), mrb.slice::<64, 8>(), mux(Bit::from(k == 1), mrb.slice::<56, 8>(), mux(Bit::from(k == 2), mrb.slice::<48, 8>(), mux(Bit::from(k == 3), mrb.slice::<40, 8>(), mux(Bit::from(k == 4), mrb.slice::<32, 8>(), mux(Bit::from(k == 5), mrb.slice::<24, 8>(), mux(Bit::from(k == 6), mrb.slice::<16, 8>(), mux(Bit::from(k == 7), mrb.slice::<8, 8>(), mux(Bit::from(k == 8), mrb.slice::<0, 8>(), mux(Bit::from(k == 9), mrc.slice::<56, 8>(), mux(Bit::from(k == 10), mrc.slice::<48, 8>(), mux(Bit::from(k == 11), mrc.slice::<40, 8>(), mux(Bit::from(k == 12), mrc.slice::<32, 8>(), mux(Bit::from(k == 13), mrc.slice::<24, 8>(), mux(Bit::from(k == 14), mrc.slice::<16, 8>(), mux(Bit::from(k == 15), mrc.slice::<8, 8>(), mux(Bit::from(k == 16), mrc.slice::<0, 8>(), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 23 is image byte k + 23");
+            check!(!inv | Bit::from(rb.slice::<56, 8>() == mux(Bit::from(k == 0), mrb.slice::<56, 8>(), mux(Bit::from(k == 1), mrb.slice::<48, 8>(), mux(Bit::from(k == 2), mrb.slice::<40, 8>(), mux(Bit::from(k == 3), mrb.slice::<32, 8>(), mux(Bit::from(k == 4), mrb.slice::<24, 8>(), mux(Bit::from(k == 5), mrb.slice::<16, 8>(), mux(Bit::from(k == 6), mrb.slice::<8, 8>(), mux(Bit::from(k == 7), mrb.slice::<0, 8>(), mux(Bit::from(k == 8), mrc.slice::<56, 8>(), mux(Bit::from(k == 9), mrc.slice::<48, 8>(), mux(Bit::from(k == 10), mrc.slice::<40, 8>(), mux(Bit::from(k == 11), mrc.slice::<32, 8>(), mux(Bit::from(k == 12), mrc.slice::<24, 8>(), mux(Bit::from(k == 13), mrc.slice::<16, 8>(), mux(Bit::from(k == 14), mrc.slice::<8, 8>(), mux(Bit::from(k == 15), mrc.slice::<0, 8>(), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 24 is image byte k + 24");
+            check!(!inv | Bit::from(rb.slice::<48, 8>() == mux(Bit::from(k == 0), mrb.slice::<48, 8>(), mux(Bit::from(k == 1), mrb.slice::<40, 8>(), mux(Bit::from(k == 2), mrb.slice::<32, 8>(), mux(Bit::from(k == 3), mrb.slice::<24, 8>(), mux(Bit::from(k == 4), mrb.slice::<16, 8>(), mux(Bit::from(k == 5), mrb.slice::<8, 8>(), mux(Bit::from(k == 6), mrb.slice::<0, 8>(), mux(Bit::from(k == 7), mrc.slice::<56, 8>(), mux(Bit::from(k == 8), mrc.slice::<48, 8>(), mux(Bit::from(k == 9), mrc.slice::<40, 8>(), mux(Bit::from(k == 10), mrc.slice::<32, 8>(), mux(Bit::from(k == 11), mrc.slice::<24, 8>(), mux(Bit::from(k == 12), mrc.slice::<16, 8>(), mux(Bit::from(k == 13), mrc.slice::<8, 8>(), mux(Bit::from(k == 14), mrc.slice::<0, 8>(), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 25 is image byte k + 25");
+            check!(!inv | Bit::from(rb.slice::<40, 8>() == mux(Bit::from(k == 0), mrb.slice::<40, 8>(), mux(Bit::from(k == 1), mrb.slice::<32, 8>(), mux(Bit::from(k == 2), mrb.slice::<24, 8>(), mux(Bit::from(k == 3), mrb.slice::<16, 8>(), mux(Bit::from(k == 4), mrb.slice::<8, 8>(), mux(Bit::from(k == 5), mrb.slice::<0, 8>(), mux(Bit::from(k == 6), mrc.slice::<56, 8>(), mux(Bit::from(k == 7), mrc.slice::<48, 8>(), mux(Bit::from(k == 8), mrc.slice::<40, 8>(), mux(Bit::from(k == 9), mrc.slice::<32, 8>(), mux(Bit::from(k == 10), mrc.slice::<24, 8>(), mux(Bit::from(k == 11), mrc.slice::<16, 8>(), mux(Bit::from(k == 12), mrc.slice::<8, 8>(), mux(Bit::from(k == 13), mrc.slice::<0, 8>(), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 26 is image byte k + 26");
+            check!(!inv | Bit::from(rb.slice::<32, 8>() == mux(Bit::from(k == 0), mrb.slice::<32, 8>(), mux(Bit::from(k == 1), mrb.slice::<24, 8>(), mux(Bit::from(k == 2), mrb.slice::<16, 8>(), mux(Bit::from(k == 3), mrb.slice::<8, 8>(), mux(Bit::from(k == 4), mrb.slice::<0, 8>(), mux(Bit::from(k == 5), mrc.slice::<56, 8>(), mux(Bit::from(k == 6), mrc.slice::<48, 8>(), mux(Bit::from(k == 7), mrc.slice::<40, 8>(), mux(Bit::from(k == 8), mrc.slice::<32, 8>(), mux(Bit::from(k == 9), mrc.slice::<24, 8>(), mux(Bit::from(k == 10), mrc.slice::<16, 8>(), mux(Bit::from(k == 11), mrc.slice::<8, 8>(), mux(Bit::from(k == 12), mrc.slice::<0, 8>(), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 27 is image byte k + 27");
+            check!(!inv | Bit::from(rb.slice::<24, 8>() == mux(Bit::from(k == 0), mrb.slice::<24, 8>(), mux(Bit::from(k == 1), mrb.slice::<16, 8>(), mux(Bit::from(k == 2), mrb.slice::<8, 8>(), mux(Bit::from(k == 3), mrb.slice::<0, 8>(), mux(Bit::from(k == 4), mrc.slice::<56, 8>(), mux(Bit::from(k == 5), mrc.slice::<48, 8>(), mux(Bit::from(k == 6), mrc.slice::<40, 8>(), mux(Bit::from(k == 7), mrc.slice::<32, 8>(), mux(Bit::from(k == 8), mrc.slice::<24, 8>(), mux(Bit::from(k == 9), mrc.slice::<16, 8>(), mux(Bit::from(k == 10), mrc.slice::<8, 8>(), mux(Bit::from(k == 11), mrc.slice::<0, 8>(), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 28 is image byte k + 28");
+            check!(!inv | Bit::from(rb.slice::<16, 8>() == mux(Bit::from(k == 0), mrb.slice::<16, 8>(), mux(Bit::from(k == 1), mrb.slice::<8, 8>(), mux(Bit::from(k == 2), mrb.slice::<0, 8>(), mux(Bit::from(k == 3), mrc.slice::<56, 8>(), mux(Bit::from(k == 4), mrc.slice::<48, 8>(), mux(Bit::from(k == 5), mrc.slice::<40, 8>(), mux(Bit::from(k == 6), mrc.slice::<32, 8>(), mux(Bit::from(k == 7), mrc.slice::<24, 8>(), mux(Bit::from(k == 8), mrc.slice::<16, 8>(), mux(Bit::from(k == 9), mrc.slice::<8, 8>(), mux(Bit::from(k == 10), mrc.slice::<0, 8>(), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 29 is image byte k + 29");
+            check!(!inv | Bit::from(rb.slice::<8, 8>() == mux(Bit::from(k == 0), mrb.slice::<8, 8>(), mux(Bit::from(k == 1), mrb.slice::<0, 8>(), mux(Bit::from(k == 2), mrc.slice::<56, 8>(), mux(Bit::from(k == 3), mrc.slice::<48, 8>(), mux(Bit::from(k == 4), mrc.slice::<40, 8>(), mux(Bit::from(k == 5), mrc.slice::<32, 8>(), mux(Bit::from(k == 6), mrc.slice::<24, 8>(), mux(Bit::from(k == 7), mrc.slice::<16, 8>(), mux(Bit::from(k == 8), mrc.slice::<8, 8>(), mux(Bit::from(k == 9), mrc.slice::<0, 8>(), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 30 is image byte k + 30");
+            check!(!inv | Bit::from(rb.slice::<0, 8>() == mux(Bit::from(k == 0), mrb.slice::<0, 8>(), mux(Bit::from(k == 1), mrc.slice::<56, 8>(), mux(Bit::from(k == 2), mrc.slice::<48, 8>(), mux(Bit::from(k == 3), mrc.slice::<40, 8>(), mux(Bit::from(k == 4), mrc.slice::<32, 8>(), mux(Bit::from(k == 5), mrc.slice::<24, 8>(), mux(Bit::from(k == 6), mrc.slice::<16, 8>(), mux(Bit::from(k == 7), mrc.slice::<8, 8>(), mux(Bit::from(k == 8), mrc.slice::<0, 8>(), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 31 is image byte k + 31");
+            check!(!inv | Bit::from(rc.slice::<56, 8>() == mux(Bit::from(k == 0), mrc.slice::<56, 8>(), mux(Bit::from(k == 1), mrc.slice::<48, 8>(), mux(Bit::from(k == 2), mrc.slice::<40, 8>(), mux(Bit::from(k == 3), mrc.slice::<32, 8>(), mux(Bit::from(k == 4), mrc.slice::<24, 8>(), mux(Bit::from(k == 5), mrc.slice::<16, 8>(), mux(Bit::from(k == 6), mrc.slice::<8, 8>(), mux(Bit::from(k == 7), mrc.slice::<0, 8>(), mux(Bit::from(k == 8), U::<8>::from(0u8), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 32 is image byte k + 32");
+            check!(!inv | Bit::from(rc.slice::<48, 8>() == mux(Bit::from(k == 0), mrc.slice::<48, 8>(), mux(Bit::from(k == 1), mrc.slice::<40, 8>(), mux(Bit::from(k == 2), mrc.slice::<32, 8>(), mux(Bit::from(k == 3), mrc.slice::<24, 8>(), mux(Bit::from(k == 4), mrc.slice::<16, 8>(), mux(Bit::from(k == 5), mrc.slice::<8, 8>(), mux(Bit::from(k == 6), mrc.slice::<0, 8>(), mux(Bit::from(k == 7), U::<8>::from(0u8), mux(Bit::from(k == 8), U::<8>::from(0u8), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 33 is image byte k + 33");
+            check!(!inv | Bit::from(rc.slice::<40, 8>() == mux(Bit::from(k == 0), mrc.slice::<40, 8>(), mux(Bit::from(k == 1), mrc.slice::<32, 8>(), mux(Bit::from(k == 2), mrc.slice::<24, 8>(), mux(Bit::from(k == 3), mrc.slice::<16, 8>(), mux(Bit::from(k == 4), mrc.slice::<8, 8>(), mux(Bit::from(k == 5), mrc.slice::<0, 8>(), mux(Bit::from(k == 6), U::<8>::from(0u8), mux(Bit::from(k == 7), U::<8>::from(0u8), mux(Bit::from(k == 8), U::<8>::from(0u8), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 34 is image byte k + 34");
+            check!(!inv | Bit::from(rc.slice::<32, 8>() == mux(Bit::from(k == 0), mrc.slice::<32, 8>(), mux(Bit::from(k == 1), mrc.slice::<24, 8>(), mux(Bit::from(k == 2), mrc.slice::<16, 8>(), mux(Bit::from(k == 3), mrc.slice::<8, 8>(), mux(Bit::from(k == 4), mrc.slice::<0, 8>(), mux(Bit::from(k == 5), U::<8>::from(0u8), mux(Bit::from(k == 6), U::<8>::from(0u8), mux(Bit::from(k == 7), U::<8>::from(0u8), mux(Bit::from(k == 8), U::<8>::from(0u8), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 35 is image byte k + 35");
+            check!(!inv | Bit::from(rc.slice::<24, 8>() == mux(Bit::from(k == 0), mrc.slice::<24, 8>(), mux(Bit::from(k == 1), mrc.slice::<16, 8>(), mux(Bit::from(k == 2), mrc.slice::<8, 8>(), mux(Bit::from(k == 3), mrc.slice::<0, 8>(), mux(Bit::from(k == 4), U::<8>::from(0u8), mux(Bit::from(k == 5), U::<8>::from(0u8), mux(Bit::from(k == 6), U::<8>::from(0u8), mux(Bit::from(k == 7), U::<8>::from(0u8), mux(Bit::from(k == 8), U::<8>::from(0u8), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 36 is image byte k + 36");
+            check!(!inv | Bit::from(rc.slice::<16, 8>() == mux(Bit::from(k == 0), mrc.slice::<16, 8>(), mux(Bit::from(k == 1), mrc.slice::<8, 8>(), mux(Bit::from(k == 2), mrc.slice::<0, 8>(), mux(Bit::from(k == 3), U::<8>::from(0u8), mux(Bit::from(k == 4), U::<8>::from(0u8), mux(Bit::from(k == 5), U::<8>::from(0u8), mux(Bit::from(k == 6), U::<8>::from(0u8), mux(Bit::from(k == 7), U::<8>::from(0u8), mux(Bit::from(k == 8), U::<8>::from(0u8), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 37 is image byte k + 37");
+            check!(!inv | Bit::from(rc.slice::<8, 8>() == mux(Bit::from(k == 0), mrc.slice::<8, 8>(), mux(Bit::from(k == 1), mrc.slice::<0, 8>(), mux(Bit::from(k == 2), U::<8>::from(0u8), mux(Bit::from(k == 3), U::<8>::from(0u8), mux(Bit::from(k == 4), U::<8>::from(0u8), mux(Bit::from(k == 5), U::<8>::from(0u8), mux(Bit::from(k == 6), U::<8>::from(0u8), mux(Bit::from(k == 7), U::<8>::from(0u8), mux(Bit::from(k == 8), U::<8>::from(0u8), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 38 is image byte k + 38");
+            check!(!inv | Bit::from(rc.slice::<0, 8>() == mux(Bit::from(k == 0), mrc.slice::<0, 8>(), mux(Bit::from(k == 1), U::<8>::from(0u8), mux(Bit::from(k == 2), U::<8>::from(0u8), mux(Bit::from(k == 3), U::<8>::from(0u8), mux(Bit::from(k == 4), U::<8>::from(0u8), mux(Bit::from(k == 5), U::<8>::from(0u8), mux(Bit::from(k == 6), U::<8>::from(0u8), mux(Bit::from(k == 7), U::<8>::from(0u8), mux(Bit::from(k == 8), U::<8>::from(0u8), mux(Bit::from(k == 9), U::<8>::from(0u8), mux(Bit::from(k == 10), U::<8>::from(0u8), mux(Bit::from(k == 11), U::<8>::from(0u8), mux(Bit::from(k == 12), U::<8>::from(0u8), mux(Bit::from(k == 13), U::<8>::from(0u8), mux(Bit::from(k == 14), U::<8>::from(0u8), mux(Bit::from(k == 15), U::<8>::from(0u8), mux(Bit::from(k == 16), U::<8>::from(0u8), mux(Bit::from(k == 17), U::<8>::from(0u8), mux(Bit::from(k == 18), U::<8>::from(0u8), mux(Bit::from(k == 19), U::<8>::from(0u8), mux(Bit::from(k == 20), U::<8>::from(0u8), mux(Bit::from(k == 21), U::<8>::from(0u8), mux(Bit::from(k == 22), U::<8>::from(0u8), mux(Bit::from(k == 23), U::<8>::from(0u8), mux(Bit::from(k == 24), U::<8>::from(0u8), mux(Bit::from(k == 25), U::<8>::from(0u8), mux(Bit::from(k == 26), U::<8>::from(0u8), mux(Bit::from(k == 27), U::<8>::from(0u8), mux(Bit::from(k == 28), U::<8>::from(0u8), mux(Bit::from(k == 29), U::<8>::from(0u8), mux(Bit::from(k == 30), U::<8>::from(0u8), mux(Bit::from(k == 31), U::<8>::from(0u8), mux(Bit::from(k == 32), U::<8>::from(0u8), mux(Bit::from(k == 33), U::<8>::from(0u8), mux(Bit::from(k == 34), U::<8>::from(0u8), mux(Bit::from(k == 35), U::<8>::from(0u8), mux(Bit::from(k == 36), U::<8>::from(0u8), mux(Bit::from(k == 37), U::<8>::from(0u8), mux(Bit::from(k == 38), U::<8>::from(0u8), mux(Bit::from(k == 39), U::<8>::from(0u8), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "shift register byte 39 is image byte k + 39");
+            check!(!(send_o & Bit::from(k < 40)) | Bit::from(data_o == mux(Bit::from(k == 0), mra.slice::<120, 8>(), mux(Bit::from(k == 1), mra.slice::<112, 8>(), mux(Bit::from(k == 2), mra.slice::<104, 8>(), mux(Bit::from(k == 3), mra.slice::<96, 8>(), mux(Bit::from(k == 4), mra.slice::<88, 8>(), mux(Bit::from(k == 5), mra.slice::<80, 8>(), mux(Bit::from(k == 6), mra.slice::<72, 8>(), mux(Bit::from(k == 7), mra.slice::<64, 8>(), mux(Bit::from(k == 8), mra.slice::<56, 8>(), mux(Bit::from(k == 9), mra.slice::<48, 8>(), mux(Bit::from(k == 10), mra.slice::<40, 8>(), mux(Bit::from(k == 11), mra.slice::<32, 8>(), mux(Bit::from(k == 12), mra.slice::<24, 8>(), mux(Bit::from(k == 13), mra.slice::<16, 8>(), mux(Bit::from(k == 14), mra.slice::<8, 8>(), mux(Bit::from(k == 15), mra.slice::<0, 8>(), mux(Bit::from(k == 16), mrb.slice::<120, 8>(), mux(Bit::from(k == 17), mrb.slice::<112, 8>(), mux(Bit::from(k == 18), mrb.slice::<104, 8>(), mux(Bit::from(k == 19), mrb.slice::<96, 8>(), mux(Bit::from(k == 20), mrb.slice::<88, 8>(), mux(Bit::from(k == 21), mrb.slice::<80, 8>(), mux(Bit::from(k == 22), mrb.slice::<72, 8>(), mux(Bit::from(k == 23), mrb.slice::<64, 8>(), mux(Bit::from(k == 24), mrb.slice::<56, 8>(), mux(Bit::from(k == 25), mrb.slice::<48, 8>(), mux(Bit::from(k == 26), mrb.slice::<40, 8>(), mux(Bit::from(k == 27), mrb.slice::<32, 8>(), mux(Bit::from(k == 28), mrb.slice::<24, 8>(), mux(Bit::from(k == 29), mrb.slice::<16, 8>(), mux(Bit::from(k == 30), mrb.slice::<8, 8>(), mux(Bit::from(k == 31), mrb.slice::<0, 8>(), mux(Bit::from(k == 32), mrc.slice::<56, 8>(), mux(Bit::from(k == 33), mrc.slice::<48, 8>(), mux(Bit::from(k == 34), mrc.slice::<40, 8>(), mux(Bit::from(k == 35), mrc.slice::<32, 8>(), mux(Bit::from(k == 36), mrc.slice::<24, 8>(), mux(Bit::from(k == 37), mrc.slice::<16, 8>(), mux(Bit::from(k == 38), mrc.slice::<8, 8>(), mux(Bit::from(k == 39), mrc.slice::<0, 8>(), mux(Bit::from(k == 40), U::<8>::from(0u8), U::<8>::from(0u8))))))))))))))))))))))))))))))))))))))))))), "reply byte k (k < 40) is byte k of the image");
+            check!(!(is_out & Bit::from(k >= 40)) | (Bit::from(rb == 0u8) & Bit::from(rc == 0u8)), "after byte 39 nothing but T3 is left to shift out");
+            check!(!(is_out & Bit::from(k == 41)) | Bit::from(ra == (self.m_t3.get().zext::<128>() << 72u32)), "after byte 40 the shift register holds the rest of T3 (1)");
+            check!(!(send_o & Bit::from(k == 41)) | Bit::from(data_o == self.m_t3.get().slice::<48, 8>()), "reply byte 41 is byte 1 of T3");
+            check!(!(is_out & Bit::from(k == 42)) | Bit::from(ra == (self.m_t3.get().zext::<128>() << 80u32)), "after byte 40 the shift register holds the rest of T3 (2)");
+            check!(!(send_o & Bit::from(k == 42)) | Bit::from(data_o == self.m_t3.get().slice::<40, 8>()), "reply byte 42 is byte 2 of T3");
+            check!(!(is_out & Bit::from(k == 43)) | Bit::from(ra == (self.m_t3.get().zext::<128>() << 88u32)), "after byte 40 the shift register holds the rest of T3 (3)");
+            check!(!(send_o & Bit::from(k == 43)) | Bit::from(data_o == self.m_t3.get().slice::<32, 8>()), "reply byte 43 is byte 3 of T3");
+            check!(!(is_out & Bit::from(k == 44)) | Bit::from(ra == (self.m_t3.get().zext::<128>() << 96u32)), "after byte 40 the shift register holds the rest of T3 (4)");
+            check!(!(send_o & Bit::from(k == 44)) | Bit::from(data_o == self.m_t3.get().slice::<24, 8>()), "reply byte 44 is byte 4 of T3");
+            check!(!(is_out & Bit::from(k == 45)) | Bit::from(ra == (self.m_t3.get().zext::<128>() << 104u32)), "after byte 40 the shift register holds the rest of T3 (5)");
+            check!(!(send_o & Bit::from(k == 45)) | Bit::from(data_o == self.m_t3.get().slice::<16, 8>()), "reply byte 45 is byte 5 of T3");
+            check!(!(is_out & Bit::from(k == 46)) | Bit::from(ra == (self.m_t3.get().zext::<128>() << 112u32)), "after byte 40 the shift register holds the rest of T3 (6)");
+            check!(!(send_o & Bit::from(k == 46)) | Bit::from(data_o == self.m_t3.get().slice::<8, 8>()), "reply byte 46 is byte 6 of T3");
+            check!(!(is_out & Bit::from(k == 47)) | Bit::from(ra == (self.m_t3.get().zext::<128>() << 120u32)), "after byte 40 the shift register holds the rest of T3 (7)");
+            check!(!(send_o & Bit::from(k == 47)) | Bit::from(data_o == self.m_t3.get().slice::<0, 8>()), "reply byte 47 is byte 7 of T3");
+            cover!(done & go_n, "a normal reply is built");
+            cover!(done & go_k, "a KoD is built");
+            cover!(done & !go & valid, "a limited request gets silence");
+            cover!(done & !valid & Bit::from(pos >= 47), "an invalid request is ignored");
+            cover!(send_o & o_last, "a reply is completed");
+            cover!(done & go_n & !sync, "an unsynchronised reply is built");
+            cover!(send_o & at40 & Bit::from(t3p < self.m_rxts.get()) & !kod, "the receive stamp clamps T3");
+
+            with!(self <= {
+                t3p: now.slice::<32, 64>() + tx_latency.get(),
+                take_m ? {
+                    st: U::<2>::from(RECV),
+                    sel6: pick6,
+                    rr: pick6,
+                    pos: U::<6>::from(0u8),
+                    ok0: Bit::Zero,
+                    m_src: n_src,
+                    m_dst: n_dst,
+                    m_sport: n_sport,
+                    m_esrc: n_esrc,
+                    m_rxts: n_rxts,
+                    hx: key,
+                    hm: h_a,
+                    hacc: h_b,
+                    hs: U::<6>::from(0u8),
+                },
+                h_run ? {
+                    hx: hx >> 2u32,
+                    hm: hm << 2u32,
+                    hacc: hacc_n,
+                    hs: hs + U::<6>::from(1u8),
+                    bix: bix_n,
+                },
+                Bit::One ? {
+                    rng_x: rng_n,
+                    rng_w: rw_ + U::<64>::from(RNG_WEYL),
+                },
+                take & Bit::from(pos < 48) ? pos: pos + U::<6>::from(1u8),
+                take & Bit::from(pos == 0) ? m_b0: data,
+                done ? m_go: go,
+                send_o & at40 ? m_t3: t3,
+                done ? { m_ra: n_ra, m_rb: n_rb, m_rc: n_rc },
+                take & Bit::from(pos == 0) ? {
+                    ok0: hdr_ok,
+                    vn: vn,
+                },
+                take & Bit::from(pos == 2) ? poll: data,
+                take & in_ts ? org: org_sh,
+                done & valid ? rl.at(bucket): word_n,
+                done ? {
+                    st: mux(go, U::<2>::from(META), U::<2>::from(IDLE)),
+                    kod: go_k,
+                    ra: n_ra,
+                    rb: n_rb,
+                    rc: n_rc,
+                },
+                send_m ? {
+                    st: U::<2>::from(OUT),
+                    k: U::<6>::from(0u8),
+                },
+                send_o ? {
+                    k: k + U::<6>::from(1u8),
+                    ra: ra_n,
+                    rb: rb_sh,
+                    rc: rc << 8u32,
+                },
+                send_o & o_last ? st: U::<2>::from(IDLE),
+            });
+        }
+    }
+}

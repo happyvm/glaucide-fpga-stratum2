@@ -1,0 +1,355 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Tests of the FCS checker (T1.12).
+use ntp_fpga::fcs_check::FcsCheck;
+use ntp_fpga::stream::{FrameByte, Ts};
+use txhdl::comp::{chan, signal, DefaultClock, Running, Unit};
+use txhdl::types::U;
+
+/// Independent bitwise CRC-32 (reflected, poly 0xEDB88320), complemented.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0xFFFF_FFFFu32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+fn body(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i * 7 + 3) as u8).collect()
+}
+
+/// Payload followed by its FCS, little endian.
+fn with_fcs(d: &[u8]) -> Vec<u8> {
+    let mut v = d.to_vec();
+    v.extend_from_slice(&crc32(d).to_le_bytes());
+    v
+}
+
+/// Raw frame to the input byte list, `err` on the last byte if asked.
+fn bytes(raw: &[u8], err: bool) -> Vec<FrameByte> {
+    let n = raw.len();
+    raw.iter()
+        .enumerate()
+        .map(|(i, &b)| FrameByte::new(b, i + 1 == n, err && i + 1 == n))
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Got {
+    data: u8,
+    last: bool,
+    err: bool,
+}
+
+/// Feed `input`, one byte per cycle when the unit is ready; the consumer
+/// accepts at cycle `t` when `take(t)`. Returns the output bytes.
+fn run(input: &[FrameByte], take: impl Fn(usize) -> bool) -> Vec<Got> {
+    run_pick(input, take, 0)
+}
+
+/// Same, with the formal witness input `pick` (the symbolic position `p`
+/// the proof quantifies over) held at `pick`: the in-simulation `check!`s of
+/// the delay line run for that position too.
+fn run_pick(input: &[FrameByte], take: impl Fn(usize) -> bool, pick: u16) -> Vec<Got> {
+    run_full(input, take, pick).0
+}
+
+/// Stamp of the `k`-th raw frame of a test stream.
+fn stamp(k: usize) -> u64 {
+    0xA5A5_0000_0000_0000 | ((k as u64) << 8) | 0x5c
+}
+
+/// Same, one stamp per raw frame fed on `stamps_in` (one per cycle, ahead of
+/// the bytes of its frame); returns the output bytes and `stamps_out`.
+fn run_full(
+    input: &[FrameByte],
+    take: impl Fn(usize) -> bool,
+    pick: u16,
+) -> (Vec<Got>, Vec<u64>) {
+    let n_frames = input.iter().filter(|b| b.last.to_bool()).count();
+    let (stx, srx) = chan::<Ts, DefaultClock>();
+    let (sotx, sorx) = chan::<Ts, DefaultClock>();
+    let mut stamps_out = Vec::new();
+    let mut next_stamp = 0;
+    let (tx, rx) = chan::<FrameByte, DefaultClock>();
+    let (otx, orx) = chan::<FrameByte, DefaultClock>();
+    let (pick_out, pick_in) = signal::<U<11>, DefaultClock>();
+    pick_out.set(U::<11>::from(pick));
+    let mut m = FcsCheck::default();
+    let mut sim = Running::new(m.run((rx, pick_in, srx), (otx, sotx)));
+    let mut next = 0;
+    let mut out = Vec::new();
+    for t in 0..input.len() * 4 + 30 {
+        if next_stamp < n_frames && stx.ready().to_bool() {
+            stx.send(Ts::from(stamp(next_stamp)));
+            next_stamp += 1;
+        }
+        if let Some(s) = sorx.recv() {
+            stamps_out.push(s.raw() as u64);
+        }
+        if next < input.len() && tx.ready().to_bool() {
+            tx.send(input[next]);
+            next += 1;
+        }
+        if take(t) {
+            if let Some(b) = orx.recv() {
+                out.push(Got {
+                    data: b.data.raw() as u8,
+                    last: b.last.to_bool(),
+                    err: b.err.to_bool(),
+                });
+            }
+        }
+        sim.cycle();
+    }
+    assert_eq!(next, input.len(), "all input bytes were accepted");
+    (out, stamps_out)
+}
+
+/// Stream contract on the output: err only with last, one last per frame
+/// at the end. Returns the frames.
+fn frames(o: &[Got]) -> Vec<Vec<Got>> {
+    let mut all = vec![];
+    let mut cur = vec![];
+    for b in o {
+        assert!(!b.err || b.last, "err without last: {b:?}");
+        cur.push(b.clone());
+        if b.last {
+            all.push(std::mem::take(&mut cur));
+        }
+    }
+    assert!(cur.is_empty(), "bytes after the last last");
+    all
+}
+
+fn data(f: &[Got]) -> Vec<u8> {
+    f.iter().map(|g| g.data).collect()
+}
+
+fn one_frame(raw: &[u8], err: bool, expect_err: bool) {
+    let o = run(&bytes(raw, err), |_| true);
+    let f = frames(&o);
+    assert_eq!(f.len(), 1, "one frame out for {} raw bytes", raw.len());
+    assert_eq!(
+        f[0].len(),
+        raw.len() - 4,
+        "output length is input length - 4"
+    );
+    assert_eq!(data(&f[0]), raw[..raw.len() - 4].to_vec());
+    assert_eq!(f[0].last().unwrap().err, expect_err);
+}
+
+#[test]
+fn bitwise_crc_matches_python_zlib() {
+    // Vectors from python3 zlib.crc32; FCS bytes little endian.
+    assert_eq!(crc32(&body(60)), 0x7fb0bee4);
+    assert_eq!(crc32(&body(46)), 0x825b4540);
+    let d: Vec<u8> = (0..20).collect();
+    assert_eq!(crc32(&d), 0x3bddffa4);
+    assert_eq!(crc32(b"123456789"), 0xCBF43926);
+}
+
+#[test]
+fn good_frames_from_python_vectors() {
+    let mut f60 = body(60);
+    f60.extend_from_slice(&[0xe4, 0xbe, 0xb0, 0x7f]);
+    one_frame(&f60, false, false);
+    let mut f46 = body(46);
+    f46.extend_from_slice(&[0x40, 0x45, 0x5b, 0x82]);
+    one_frame(&f46, false, false);
+    let mut f20: Vec<u8> = (0..20).collect();
+    f20.extend_from_slice(&[0xa4, 0xff, 0xdd, 0x3b]);
+    one_frame(&f20, false, false);
+}
+
+#[test]
+fn good_64_byte_frame() {
+    let raw = with_fcs(&body(60));
+    assert_eq!(raw.len(), 64);
+    one_frame(&raw, false, false);
+}
+
+#[test]
+fn bit_flip_in_every_region() {
+    let raw = with_fcs(&body(60));
+    // Header, payload, each FCS byte.
+    for pos in [0, 5, 13, 14, 30, 59, 60, 61, 62, 63] {
+        for bit in [0, 7] {
+            let mut bad = raw.clone();
+            bad[pos] ^= 1 << bit;
+            let o = run(&bytes(&bad, false), |_| true);
+            let f = frames(&o);
+            assert_eq!(f.len(), 1);
+            assert_eq!(f[0].len(), 60, "pos {pos}");
+            assert!(
+                f[0].last().unwrap().err,
+                "flip at {pos} bit {bit} is flagged"
+            );
+            assert!(f[0][..59].iter().all(|g| !g.err));
+        }
+    }
+}
+
+#[test]
+fn max_frame_1518() {
+    let raw = with_fcs(&body(1514));
+    assert_eq!(raw.len(), 1518);
+    one_frame(&raw, false, false);
+    let mut bad = raw.clone();
+    bad[700] ^= 0x10;
+    one_frame(&bad, false, true);
+}
+
+#[test]
+fn five_byte_frame_emits_one_byte() {
+    let raw = with_fcs(&[0x42]);
+    assert_eq!(raw.len(), 5);
+    one_frame(&raw, false, false);
+    let mut bad = raw.clone();
+    bad[0] ^= 1;
+    one_frame(&bad, false, true);
+}
+
+#[test]
+fn runts_emit_nothing() {
+    for n in 1..=4 {
+        let raw = with_fcs(&body(n))[..n].to_vec();
+        assert!(
+            run(&bytes(&raw, false), |_| true).is_empty(),
+            "{n} raw bytes"
+        );
+        assert!(
+            run(&bytes(&raw, true), |_| true).is_empty(),
+            "{n} raw bytes, err"
+        );
+    }
+    // A good FCS alone (4 bytes) emits nothing either.
+    let raw = with_fcs(&[]);
+    assert_eq!(raw.len(), 4);
+    assert!(run(&bytes(&raw, false), |_| true).is_empty());
+}
+
+#[test]
+fn input_err_is_carried() {
+    // Good FCS but err on last: flagged. Bad FCS and err: flagged.
+    one_frame(&with_fcs(&body(60)), true, true);
+    let mut bad = with_fcs(&body(60));
+    bad[3] ^= 4;
+    one_frame(&bad, true, true);
+}
+
+#[test]
+fn back_to_back_frames_are_independent() {
+    let good = with_fcs(&body(60));
+    let mut bad = with_fcs(&body(40));
+    bad[10] ^= 1;
+    let runt = with_fcs(&body(3))[..3].to_vec();
+    let mut input = bytes(&good, false);
+    input.extend(bytes(&bad, false));
+    input.extend(bytes(&runt, false));
+    input.extend(bytes(&good, false));
+    input.extend(bytes(&with_fcs(&body(1)), true));
+    input.extend(bytes(&good, false));
+    let f = frames(&run(&input, |_| true));
+    assert_eq!(f.len(), 5);
+    assert_eq!(data(&f[0]), body(60));
+    assert!(!f[0].last().unwrap().err);
+    assert_eq!(
+        data(&f[1]),
+        body(40)
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| if i == 10 { b ^ 1 } else { b })
+            .collect::<Vec<_>>()
+    );
+    assert!(f[1].last().unwrap().err);
+    assert!(!f[2].last().unwrap().err, "the runt left no residue behind");
+    assert_eq!(f[2].len(), 60);
+    assert_eq!(f[3].len(), 1);
+    assert!(f[3].last().unwrap().err);
+    assert!(!f[4].last().unwrap().err);
+    assert_eq!(f[4].len(), 60);
+}
+
+#[test]
+fn backpressure_keeps_bytes_and_order() {
+    let mut input = bytes(&with_fcs(&body(60)), false);
+    let mut bad = with_fcs(&body(30));
+    bad[2] ^= 0x80;
+    input.extend(bytes(&bad, false));
+    let patterns: [&dyn Fn(usize) -> bool; 3] = [&|t| t % 3 == 0, &|t| t % 7 < 2, &|t| t > 100];
+    for p in patterns {
+        let f = frames(&run(&input, p));
+        assert_eq!(f.len(), 2);
+        assert_eq!(data(&f[0]), body(60));
+        assert!(!f[0].last().unwrap().err);
+        assert_eq!(f[1].len(), 30);
+        assert!(f[1].last().unwrap().err);
+    }
+}
+
+#[test]
+fn output_length_is_input_length_minus_four() {
+    for n in 5..=80 {
+        let raw = with_fcs(&body(n - 4));
+        let f = frames(&run(&bytes(&raw, false), |t| t % 2 == 0));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].len(), n - 4);
+    }
+}
+
+/// The symbolic-position checks hold for every position in simulation too.
+#[test]
+fn delay_line_checks_hold_for_every_position() {
+    let raw = with_fcs(&body(66));
+    for pick in 0..80u16 {
+        let out = run_pick(&bytes(&raw, false), |_| true, pick);
+        assert_eq!(data(&out), raw[..raw.len() - 4].to_vec(), "pick {pick}");
+    }
+}
+
+/// One stamp out per emitted frame, in order, each the stamp of ITS frame:
+/// runts (raw length < 5) drop their stamp with them.
+#[test]
+fn stamps_follow_emitted_frames_only() {
+    // (payload length without FCS, or raw length of a runt), kind.
+    // Frame k of the stream gets `stamp(k)`.
+    let kinds: [(usize, bool); 9] = [
+        (60, false),
+        (3, true),
+        (30, false),
+        (1, true),
+        (0, true), // raw frame of 4 bytes is built below as a runt of 4
+        (46, false),
+        (2, true),
+        (20, false),
+        (4, true),
+    ];
+    let mut input = Vec::new();
+    let mut expect = Vec::new();
+    for (k, &(n, runt)) in kinds.iter().enumerate() {
+        let raw = if runt {
+            // Runts: 1..=4 raw bytes (n = 0 stands for 4 bytes).
+            body(if n == 0 { 4 } else { n.min(4) })
+        } else {
+            with_fcs(&body(n))
+        };
+        input.extend(bytes(&raw, false));
+        if !runt {
+            expect.push(stamp(k));
+        }
+    }
+    let patterns: [&dyn Fn(usize) -> bool; 3] = [&|_| true, &|t| t % 3 == 0, &|t| t % 7 < 2];
+    for p in patterns {
+        let (o, st) = run_full(&input, p, 0);
+        assert_eq!(frames(&o).len(), expect.len(), "one frame per non-runt");
+        assert_eq!(st, expect, "one stamp per emitted frame, in order");
+    }
+}

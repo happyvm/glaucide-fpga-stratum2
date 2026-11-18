@@ -1,0 +1,9 @@
+[package]
+name = "txhdl"
+version = "0.0.0"
+edition = "2021"
+[lib]
+path = "../../../third_party/hdl-txhdl/lib/src/lib.rs"
+[dependencies]
+fst-writer = "0.3.1"
+txhdl_macros = { path = "../txhdl_macros" }

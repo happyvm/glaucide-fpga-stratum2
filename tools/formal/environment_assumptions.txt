@@ -1,0 +1,19 @@
+# Environment assumptions accepted by tools/formal/contracts.py (rule a(ii)).
+#
+# Format: one entry per line, the message exactly as written in the assume!
+# statement, then " # " and the reason / guarantor. An assume! whose message is
+# checked by a check! in another unit does not need an entry here.
+#
+# Stream-contract assumptions (rtl/src/stream.rs) are monitored by task F0.5.
+# The configuration assumption is guaranteed by the configuration module T4.1
+# (docs/formal.md, "Registre des hypothèses de configuration").
+# Entries marked UNREVIEWED must be reviewed by a human.
+
+payload: err only together with last (stream contract 2) # stream contract, F0.5 (rtl/src/eth_tx.rs, rtl/src/tx_arb.rs)
+a frame has at most 1518 bytes (stream contract 3) # stream contract, F0.5 (rtl/src/fcs_check.rs)
+the step is nought, one or two # toolchain smoke-test unit (formal_smoke): input constraint of a toy unit, no link with the NTP design (reviewed)
+a stream has at most 1518 bytes (stream contract 3) # stream contract, F0.5 (rtl/src/csum.rs; same rule as fcs_check, wording to harmonise)
+local_ip is constant (configuration wire) # static configuration: ConfigSet::LOCAL_IP4 is a constant (rtl/src/config.rs), wired as a constant by top.rs; the unit compares it with registered copies
+a channel holds its head until it is taken # channel protocol (valid/ready registered channel of TxHDL, rtl/src/stream.rs netlist note): a pending transaction is not withdrawn or changed
+local_ll, local_gua, gua_valid and sn_low are constant (configuration wires) # static configuration: ConfigSet constants (rtl/src/config.rs), wired as constants by top.rs; the unit compares them with registered copies
+local_ll, local_gua, gua_valid and local_mac are constant (configuration wires) # static configuration: ConfigSet constants (rtl/src/config.rs), wired as constants by top.rs; the unit compares them with registered copies

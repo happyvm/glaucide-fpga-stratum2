@@ -1,0 +1,8 @@
+[package]
+name = "ntp_fpga"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+txhdl = { path = "../tools/cargo/txhdl" }
+txhdl_macros = { path = "../tools/cargo/txhdl_macros" }
+txhdl_parts = { path = "../tools/cargo/txhdl_parts" }

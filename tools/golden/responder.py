@@ -1,0 +1,339 @@
+"""Behavioural reference of the server: respond(frame, config) -> list of frames to send.
+
+Frames are Ethernet without FCS. Input frames may carry Ethernet padding; output
+frames are NOT padded (they are the Ethernet builder output, `eth_tx` pads/adds FCS).
+Anything not explicitly accepted by a rule below yields [] (silence).
+"""
+import ipaddress
+from dataclasses import dataclass
+from typing import List, Optional
+
+from . import arp, eth, icmp, icmpv6, ipv4, ipv6, ntp, udp
+from .errors import ParseError
+
+NTP_PORT = 123
+REPLY_TTL = 64        # RFC 1122 section 3.2.1.7 / RFC 8200: any sensible default
+REPLY_HOP_LIMIT = 64  # echo and UDP replies; NDP uses 255 (RFC 4861 section 7.1)
+ALL_NODES = ipv6.addr("ff02::1")
+# UDP source ports a NTP request is never answered from (rule N1b, security finding F8):
+# 0 is reserved (no valid sender); 7 echo, 13 daytime, 17 qotd, 19 chargen, 37 time are the
+# classic small services that reflect or answer text back (RFC 862, 867, 865, 864, 868),
+# and so can form a loop with us or turn a spoofed request into a reflection.
+DENIED_SOURCE_PORTS = frozenset({0, 7, 13, 17, 19, 37})
+
+
+def source_port_ok(sport: int) -> bool:
+    """N1b: a request from this UDP source port may be answered."""
+    return sport not in DENIED_SOURCE_PORTS
+
+
+@dataclass
+class Config:
+    mac: bytes
+    ipv4: bytes
+    ipv6_ll: bytes
+    ipv6_global: Optional[bytes] = None
+    stratum: int = 2
+    ref_id: bytes = b"\xc0\x00\x02\x63"      # IPv4 reference ID (family rule, see ntp.py)
+    ref_id_v6: Optional[bytes] = None          # reference ID in IPv6 replies; None = ref_id
+    precision: int = -24
+    root_delay: int = 0                         # raw 16.16
+    root_dispersion: int = 0                    # raw 16.16
+    ref_ts: int = 0                             # reference timestamp (last update)
+    recv_ts: int = 0                            # T2: timestamp of the request's arrival
+    xmit_ts: int = 0                            # T3: timestamp of the reply's departure
+    synchronised: bool = True
+
+    def v6_addresses(self):
+        return [a for a in (self.ipv6_ll, self.ipv6_global) if a is not None]
+
+
+def respond(frame: bytes, cfg: Config) -> List[bytes]:
+    try:
+        return _respond(frame, cfg)
+    except ParseError:
+        return []  # every malformed input is dropped silently
+
+
+def _respond(frame: bytes, cfg: Config) -> List[bytes]:
+    f = eth.EthFrame.parse(frame)  # runt (< 14 bytes) -> ParseError -> silence
+    # Rule E1 (IEEE 802.3): a source address with the group bit set is illegal -> drop.
+    if eth.is_multicast(f.src):
+        return []
+    if f.ethertype == eth.ETHERTYPE_ARP:
+        return _arp(f, cfg)
+    if f.ethertype == eth.ETHERTYPE_IPV4:
+        return _ipv4(f, cfg)
+    if f.ethertype == eth.ETHERTYPE_IPV6:
+        return _ipv6(f, cfg)
+    return []  # Rule E2: other EtherTypes are ignored
+
+
+# ---------------------------------------------------------------- ARP
+
+def _arp(f: eth.EthFrame, cfg: Config) -> List[bytes]:
+    # Rule A1 (RFC 826): the frame goes to broadcast or to us.
+    if f.dst not in (eth.BROADCAST, cfg.mac):
+        return []
+    p = arp.ArpPacket.parse(f.payload)  # A2: htype/ptype/hlen/plen must be Ethernet/IPv4
+    # A3: only requests for OUR address are answered (never unsolicited, never replies).
+    if p.oper != arp.OP_REQUEST or p.tpa != cfg.ipv4:
+        return []
+    # A4: sender hardware address must be unicast (a reply to a group address is meaningless).
+    if eth.is_multicast(p.sha):
+        return []
+    # A5 (RFC 826 "Packet Reception"): swap sender/target, put our MAC/IP as sender, oper=2.
+    rep = arp.ArpPacket(arp.OP_REPLY, cfg.mac, cfg.ipv4, p.sha, p.spa)
+    return [eth.EthFrame(p.sha, cfg.mac, eth.ETHERTYPE_ARP, rep.build()).build()]
+
+
+# ---------------------------------------------------------------- IPv4
+
+def _ipv4(f: eth.EthFrame, cfg: Config) -> List[bytes]:
+    # Rule I0: unicast to our MAC only (no answer to broadcast/multicast frames).
+    if f.dst != cfg.mac:
+        return []
+    # I1 (RFC 791): version 4, IHL >= 5, total length consistent, header checksum ok.
+    p = ipv4.IPv4Packet.parse(f.payload)
+    # I2: options (IHL != 5) are not handled -> drop.
+    if p.options:
+        return []
+    # I3 (RFC 791 section 3.2): fragments (MF or offset != 0) are not reassembled -> drop.
+    if p.is_fragment:
+        return []
+    # I4 (RFC 791 / RFC 1812 section 5.3.1): TTL 0 must not be accepted.
+    if p.ttl == 0:
+        return []
+    # I5: destination is exactly our unicast address.
+    if p.dst != cfg.ipv4:
+        return []
+    # I6 (RFC 1122 section 3.2.1.3, RFC 6890; F8): the source must be a valid unicast host address: never
+    # 0.0.0.0/8, 127.0.0.0/8 (loopback), 224.0.0.0/4 (multicast), 240.0.0.0/4 (class E, includes
+    # 255.255.255.255) or our own address. Link-local 169.254/16, private and documentation prefixes are
+    # allowed. The subnet-directed broadcast is not known to the RTL (no netmask): not filtered.
+    if p.src[0] in (0, 127) or p.src[0] >= 224 or p.src == cfg.ipv4:
+        return []
+    if p.proto == ipv4.PROTO_ICMP:
+        return _icmp4(f, p, cfg)
+    if p.proto == ipv4.PROTO_UDP:
+        return _udp(f, p.src, p.dst, p.payload, cfg, v6=False)
+    return []
+
+
+def _icmp4(f, p, cfg) -> List[bytes]:
+    e = icmp.IcmpEcho.parse(p.payload)  # J0: checksum verified
+    # J1 (RFC 792): only Echo Request, code 0, is answered.
+    if e.type != icmp.TYPE_ECHO_REQUEST or e.code != 0:
+        return []
+    # J2 (RFC 792): reply = type 0, same identifier, sequence and data; checksum recomputed.
+    rep = icmp.IcmpEcho(icmp.TYPE_ECHO_REPLY, e.ident, e.seq, e.data).build()
+    ip = ipv4.IPv4Packet(cfg.ipv4, p.src, ipv4.PROTO_ICMP, rep, ttl=REPLY_TTL, ident=0, df=True)
+    return [eth.EthFrame(f.src, cfg.mac, eth.ETHERTYPE_IPV4, ip.build()).build()]
+
+
+# ---------------------------------------------------------------- UDP / NTP (both families)
+
+def _udp(f, src_ip: bytes, dst_ip: bytes, payload: bytes, cfg: Config, v6: bool) -> List[bytes]:
+    # U1 (RFC 768, RFC 8200 section 8.1): length consistent; checksum correct, or 0 accepted
+    # in IPv4 only; mandatory in IPv6. Violations raise ParseError.
+    d = udp.UdpDatagram.parse(src_ip, dst_ip, payload)
+    # U2: only destination port 123 is served.
+    if d.dport != NTP_PORT:
+        return []
+    # N1b (F8): impossible or reflecting source ports are not answered.
+    if not source_port_ok(d.sport):
+        return []
+    # N1 (RFC 5905 section 7.3): at least the 48-byte header (extension fields tolerated).
+    req = ntp.NtpPacket.parse(d.payload)
+    # N2 (RFC 5905 section 9.1 / 7.3): only client mode (3) requests are answered; modes 1, 2,
+    # 4, 5, 6, 7 are ignored (symmetric, broadcast, control... are out of scope).
+    if req.mode != ntp.MODE_CLIENT:
+        return []
+    # N3: versions 3 and 4 accepted (RFC 5905 section 7.3 compat with RFC 1305); others dropped.
+    if req.vn not in (3, 4):
+        return []
+    sync = cfg.synchronised
+    rep = ntp.NtpPacket(
+        # N4 (RFC 5905 section 7.3 "li"): LI 3 (alarm) iff not synchronised, else 0.
+        li=ntp.LI_NONE if sync else ntp.LI_UNSYNC,
+        # N5: version echoed, capped at 4 (our own).
+        vn=min(req.vn, 4),
+        mode=ntp.MODE_SERVER,
+        # N6: stratum from config when synchronised, 16 (unsynchronised) otherwise; never 0.
+        stratum=cfg.stratum if sync else 16,
+        # N7 (RFC 5905 fast_xmit): poll copied from the request.
+        poll=req.poll,
+        precision=cfg.precision,
+        root_delay=cfg.root_delay,
+        root_dispersion=cfg.root_dispersion,
+        # N8: Reference ID per address family of the request.
+        ref_id=(cfg.ref_id_v6 or cfg.ref_id) if v6 else cfg.ref_id,
+        ref_ts=cfg.ref_ts,
+        # N9 (RFC 5905 section 8): origin = client's transmit timestamp, copied verbatim.
+        orig_ts=req.xmit_ts,
+        recv_ts=cfg.recv_ts,   # T2
+        xmit_ts=cfg.xmit_ts,   # T3
+        # N10: exactly 48 bytes, no extensions echoed (also bounds the amplification factor).
+    )
+    # U3: ports swapped, checksum recomputed (v6 always, v4 always non-zero).
+    out = udp.UdpDatagram(d.dport, d.sport, rep.build()).build(dst_ip, src_ip)
+    # Reply goes back to the sender's MAC, from our MAC, addresses swapped.
+    if v6:
+        pkt = ipv6.IPv6Packet(dst_ip, src_ip, ipv6.NH_UDP, out, hop_limit=REPLY_HOP_LIMIT).build()
+        et = eth.ETHERTYPE_IPV6
+    else:
+        pkt = ipv4.IPv4Packet(dst_ip, src_ip, ipv4.PROTO_UDP, out, ttl=REPLY_TTL, ident=0, df=True).build()
+        et = eth.ETHERTYPE_IPV4
+    return [eth.EthFrame(f.src, cfg.mac, et, pkt).build()]
+
+
+# ---------------------------------------------------------------- IPv6
+
+def _ipv6(f: eth.EthFrame, cfg: Config) -> List[bytes]:
+    # G1 (RFC 8200 section 3): version 6, payload length consistent with the frame.
+    p = ipv6.IPv6Packet.parse(f.payload)
+    # G2 (RFC 8200 section 4): extension headers are not handled; only UDP/ICMPv6 directly.
+    if p.next_header in ipv6.EXTENSION_HEADERS or p.next_header not in (ipv6.NH_UDP, ipv6.NH_ICMPV6):
+        return []
+    # G3 (RFC 8200 section 3): hop limit 0 is dropped (NDP needs exactly 255, checked later).
+    if p.hop_limit == 0:
+        return []
+    # G4 (RFC 4291 section 2.7): a multicast source address is illegal.
+    if p.src[0] == 0xFF:
+        return []
+    ours = cfg.v6_addresses()
+    is_ns_dest = any(p.dst == ipv6.solicited_node(a) for a in ours)
+    if p.dst in ours:
+        # G5: unicast to us must arrive on our MAC.
+        if f.dst != cfg.mac:
+            return []
+    elif is_ns_dest:
+        # G6 (RFC 2464 section 7): solicited-node multicast must use 33:33:ff:xx:xx:xx.
+        if f.dst != ipv6.multicast_mac(p.dst):
+            return []
+    else:
+        return []  # G7: not for us
+    if p.next_header == ipv6.NH_UDP:
+        if p.dst not in ours:
+            return []  # G8: NTP only over unicast
+        # G9 (RFC 4291 sections 2.5.2/2.5.3/2.5.5, RFC 6890; F8): UDP (NTP) is never answered to the
+        # unspecified address `::`, the loopback `::1`, an IPv4-mapped address `::ffff:0:0/96` or one of our
+        # own addresses (multicast sources are already dropped by G4). ICMPv6 is not affected: a DAD
+        # Neighbor Solicitation legitimately comes from `::`.
+        if (p.src == bytes(16) or p.src == bytes(15) + b"\x01" or p.src[:12] == bytes(10) + b"\xff\xff"
+                or p.src in ours):
+            return []
+        return _udp(f, p.src, p.dst, p.payload, cfg, v6=True)
+    return _icmp6(f, p, cfg, is_ns_dest and p.dst not in ours)
+
+
+def _icmp6(f, p, cfg, to_solicited_node: bool) -> List[bytes]:
+    t = p.payload[0] if p.payload else None
+    if t == icmpv6.T_ECHO_REQUEST:
+        # K1 (RFC 4443 section 4.1): echo to a unicast address of ours (not multicast).
+        if to_solicited_node:
+            return []
+        e = icmpv6.Icmpv6Echo.parse(p.src, p.dst, p.payload)  # checksum verified
+        # K2 (RFC 4443 section 4.2): reply type 129, same id/seq/data, src = request's dst.
+        body = icmpv6.Icmpv6Echo(icmpv6.T_ECHO_REPLY, e.ident, e.seq, e.data).build(p.dst, p.src)
+        return [_ip6_frame(cfg.mac, f.src, p.dst, p.src, body, REPLY_HOP_LIMIT)]
+    if t == icmpv6.T_NS:
+        # M1 (RFC 4861 section 7.1.1): hop limit must be 255 (proves on-link origin).
+        if p.hop_limit != 255:
+            return []
+        ns = icmpv6.NeighborSolicitation.parse(p.src, p.dst, p.payload)  # code 0, len>=24, cksum
+        # M2: target not multicast, and one of OUR addresses.
+        if ns.target[0] == 0xFF or ns.target not in cfg.v6_addresses():
+            return []
+        # M3: destination is the target itself (NUD) or its solicited-node multicast address.
+        if p.dst != ns.target and p.dst != ipv6.solicited_node(ns.target):
+            return []
+        slla = [v for (ot, v) in ns.options if ot == icmpv6.OPT_SLLA]
+        unspecified = p.src == bytes(16)
+        if unspecified:
+            # M4 (RFC 4861 section 7.1.1): DAD probe: dst must be solicited-node multicast and no
+            # source link-layer option is allowed.
+            if p.dst == ns.target or slla:
+                return []
+            # M5 (RFC 4861 section 7.2.4): answer to all-nodes ff02::1, S=0, MAC 33:33:00:00:00:01.
+            na = icmpv6.NeighborAdvertisement(ns.target, False, False, True,
+                                              [(icmpv6.OPT_TLLA, cfg.mac)])
+            body = na.build(ns.target, ALL_NODES)
+            return [_ip6_frame(cfg.mac, ipv6.multicast_mac(ALL_NODES), ns.target, ALL_NODES, body, 255)]
+        if len(slla) > 1 or (slla and len(slla[0]) != 6):
+            return []
+        # M6 (RFC 4861 section 7.2.4): solicited NA: R=0 (host), S=1, O=1 (we are the owner),
+        # target link-layer address option = our MAC, hop limit 255, src = target,
+        # unicast to the solicitation's source at the link address in SLLA (else Ethernet src).
+        na = icmpv6.NeighborAdvertisement(ns.target, False, True, True, [(icmpv6.OPT_TLLA, cfg.mac)])
+        body = na.build(ns.target, p.src)
+        return [_ip6_frame(cfg.mac, slla[0] if slla else f.src, ns.target, p.src, body, 255)]
+    # M7: Router Advertisements are consumed by the SLAAC logic (T3.5), nothing is sent;
+    # every other ICMPv6 type is ignored.
+    return []
+
+
+def _ip6_frame(src_mac, dst_mac, src, dst, icmp_body, hop_limit) -> bytes:
+    pkt = ipv6.IPv6Packet(src, dst, ipv6.NH_ICMPV6, icmp_body, hop_limit=hop_limit).build()
+    return eth.EthFrame(dst_mac, src_mac, eth.ETHERTYPE_IPV6, pkt).build()
+
+
+# ---------------------------------------------------------------- IPv6 neighbor discovery, initiator side (T3.6)
+# Added functions only; `respond` is unchanged. Rules:
+#   N1 (RFC 4861 section 7.2.2): to resolve target T send an NS to the solicited-node multicast address of T
+#      (Ethernet 33:33:ff:xx:xx:xx), target T, Source Link-Layer Address option = our MAC, hop limit 255.
+#   N2 (RFC 4861 section 7.2.2 / 7.2.3): source address = our link-local if T is link-local (fe80::/10),
+#      else our global address when we have one, else our link-local.
+#   N3: a resolution of one of our own addresses is not sent.
+#   N4 (RFC 4861 sections 7.1.2 / 7.2.5, security finding F5): a valid NA (type 136, code 0, hop limit 255,
+#      length >= 24, good checksum, well-formed options, non-multicast target, at most one Target LLA option
+#      of length 1) teaches (target, TLLA or the Ethernet source) ONLY if it answers our outstanding
+#      solicitation: `resolving` (the target of our last NS, not yet answered or timed out) equals the NA's
+#      target, the S (solicited) flag is set and the IPv6 source equals the target. Unsolicited NAs, S = 0,
+#      other targets, spoofed sources, and NAs after the timeout (resolving = None) teach nothing.
+#   N5 (replaces the former "NS teaches its source"): an NS never teaches anything (RFC 4861 would create a
+#      STALE entry; we keep none). It is answered as before (M1-M6).
+def solicit(target: bytes, cfg: Config) -> Optional[bytes]:
+    """NS frame to resolve `target`, or None (own address)."""
+    if target in cfg.v6_addresses():
+        return None
+    link_local = target[0] == 0xFE and (target[1] & 0xC0) == 0x80
+    src = cfg.ipv6_ll if (link_local or cfg.ipv6_global is None) else cfg.ipv6_global
+    dst = ipv6.solicited_node(target)
+    ns = icmpv6.NeighborSolicitation(target, [(icmpv6.OPT_SLLA, cfg.mac)])
+    return _ip6_frame(cfg.mac, ipv6.multicast_mac(dst), src, dst, ns.build(src, dst), 255)
+
+
+def learn(frame: bytes, cfg: Config, resolving: Optional[bytes] = None):
+    """(ip, mac) the frame teaches, or None. Never produces output frames.
+
+    `resolving` is the target of our outstanding solicitation (None: none, nothing is learnt).
+    """
+    try:
+        f = eth.EthFrame.parse(frame)
+        if f.ethertype != eth.ETHERTYPE_IPV6:
+            return None
+        p = ipv6.IPv6Packet.parse(f.payload)
+        if p.next_header != ipv6.NH_ICMPV6 or p.hop_limit != 255 or p.src[0] == 0xFF:
+            return None
+        ours = cfg.v6_addresses()
+        if p.payload[:1] == bytes([icmpv6.T_NA]):
+            if p.dst in ours:
+                if f.dst != cfg.mac:
+                    return None
+            elif p.dst != ALL_NODES:
+                return None
+            na = icmpv6.NeighborAdvertisement.parse(p.src, p.dst, p.payload)
+            if na.target[0] == 0xFF:
+                return None
+            # N4: must answer our solicitation (F5).
+            if resolving is None or na.target != resolving or not na.solicited or p.src != na.target:
+                return None
+            tlla = [v for (ot, v) in na.options if ot == icmpv6.OPT_TLLA]
+            if len(tlla) > 1 or (tlla and len(tlla[0]) != 6):
+                return None
+            return na.target, (tlla[0] if tlla else f.src)
+        # N5: an NS never teaches anything.
+    except ParseError:
+        return None
+    return None

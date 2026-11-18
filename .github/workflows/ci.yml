@@ -1,0 +1,99 @@
+# CI : build, tests Rust et Python, génération Verilog, puis lint (non bloquant).
+# Les preuves formelles sont dans formal.yml.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build, test, Verilog
+    runs-on: ubuntu-latest
+    # Debug-mode tests take several minutes; the build is cached by rust-cache.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Clones TxHDL at the pinned commit (needs outbound GitHub access).
+      - name: Fetch TxHDL
+        run: tools/setup.sh
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test ntp_fpga
+        run: cargo test -p ntp_fpga
+
+      - name: Golden model tests
+        run: python3 -m unittest discover tools/golden
+
+      - name: Generate Verilog
+        run: tools/gen_verilog.sh
+
+      - name: Upload Verilog
+        uses: actions/upload-artifact@v4
+        with:
+          name: verilog
+          path: out/*.v
+          if-no-files-found: error
+
+  fmt:
+    name: rustfmt (ntp_fpga, non blocking)
+    # The existing code is not rustfmt-clean yet, and the vendored TxHDL crates
+    # are not ours: only ntp_fpga is checked, and the result does not gate CI.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch TxHDL
+        run: tools/setup.sh
+
+      - name: Check formatting
+        run: cargo fmt -p ntp_fpga --check
+
+  clippy:
+    name: clippy (ntp_fpga, non blocking)
+    # Warnings are not denied (no -D warnings): existing code still has
+    # warnings, so this job reports them without gating CI.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch TxHDL
+        run: tools/setup.sh
+
+      - name: Clippy
+        run: cargo clippy -p ntp_fpga --all-targets
